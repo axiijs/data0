@@ -131,6 +131,30 @@ export function isPrimitiveAtom(r: unknown) {
     return typeof r === 'function' && Object.prototype.hasOwnProperty.call(r, PRIMITIVE_ATOM_VALUE)
 }
 
+// CAUTION 所有 primitive atom 共享同一个原型：raw 访问器、Symbol.toPrimitive、IS_ATOM 标记
+//  都放在原型上，每个 atom 实例只保留一个自有的值属性。
+//  旧实现对每个 atom 函数做 2 次 defineProperty + 2 次动态属性赋值，会把函数对象推进
+//  字典属性模式，每个 atom 多花约 3 倍内存；长列表里每行一个 atom 时是主要常驻开销之一。
+const primitiveAtomProto = Object.create(Function.prototype, {
+    raw: {
+        configurable: true,
+        enumerable: false,
+        get: getPrimitiveAtomRaw,
+    },
+    [Symbol.toPrimitive]: {
+        configurable: true,
+        writable: true,
+        enumerable: false,
+        value: primitiveAtomToPrimitive,
+    },
+    [ReactiveFlags.IS_ATOM]: {
+        configurable: false,
+        writable: false,
+        enumerable: false,
+        value: true,
+    },
+})
+
 function createPrimitiveAtom<T>(initValue: T, name?: string) {
     // CAUTION 只能这样写才能支持 arguments.length === 0 ，否则就永远不会 为 0
     const updater = function(newValue?: T): T | void {
@@ -146,19 +170,15 @@ function createPrimitiveAtom<T>(initValue: T, name?: string) {
         Notifier.instance.triggerPrimitiveAtomValue(updater, { key: 'value', newValue, oldValue})
     } as PrimitiveAtomUpdater<T>
 
+    // CAUTION setPrototypeOf 要在添加自有属性之前做，V8 对"先改原型再加属性"的对象
+    //  能保持 fast properties；值属性用普通赋值（symbol key，不污染 for...in/Object.keys）。
+    Object.setPrototypeOf(updater, primitiveAtomProto)
     updater[PRIMITIVE_ATOM_VALUE] = initValue
-    updater[Symbol.toPrimitive] = primitiveAtomToPrimitive
-    Object.defineProperty(updater, 'raw', {
-        configurable: true,
-        enumerable: false,
-        get: getPrimitiveAtomRaw
-    })
 
     if (name) {
         setDebugName(updater, name)
     }
 
-    def(updater, ReactiveFlags.IS_ATOM, true)
     return updater as unknown as Atom<T>
 }
 

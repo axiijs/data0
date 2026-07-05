@@ -11,8 +11,11 @@ import {
 
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
-    public active = true
-    public isRunningAsync = false
+    public active: boolean
+    // CAUTION isRunningAsync/useDepMarker/index/shouldCollectChild 的默认值放在原型上
+    //  （见 class 定义后的赋值），实例只在真正改写时才产生自有属性。
+    //  渲染框架里每个绑定都是一个 effect，这些"恒定默认值"的实例槽位在长列表下是可观的常驻内存。
+    declare public isRunningAsync: boolean
     private _eventToCallbacks?: Map<string, Set<Function>>
     private _asyncTracks?: Array<() => void>
     private _children?: ReactiveEffect[]
@@ -36,7 +39,8 @@ export class ReactiveEffect extends ManualCleanup {
             }
         }
 
-        delete effect.parent
+        // CAUTION 赋值 undefined 而不是 delete：delete 会把对象推进字典属性模式
+        if (effect.parent !== undefined) effect.parent = undefined
         if (!ignoreChildren) {
             effect.destroyChildren()
         } else if (effect._children) {
@@ -47,16 +51,22 @@ export class ReactiveEffect extends ManualCleanup {
 
     deps: Dep[] = []
     // 有增量计算的情况会 manual track dep，这时不要做 dep marker，因为不需要 finalize 自动对比的计算的过程。
-    useDepMarker = true
+    declare useDepMarker: boolean
     parent?: ReactiveEffect
-    index = 0
+    declare index: number
+    declare getter?: (...args: any[]) => any
     isAsync?:boolean
-    shouldCollectChild = true
-    constructor(public getter?: (...args: any[]) => any) {
+    declare shouldCollectChild: boolean
+    constructor(getter?: (...args: any[]) => any) {
         // 这是为了支持有的数据结构想写成 source/computed 都支持的情况，比如 RxList。它会继承 Computed
         super();
+        // CAUTION getter/isAsync 只在有 getter 时才写实例属性：
+        //  轻量绑定 effect（无 getter）不为用不到的字段付槽位
+        if (getter !== undefined) {
+            this.getter = getter
+            this.isAsync = isAsync(getter) || isGenerator(getter)
+        }
         this.active = !!getter
-        this.isAsync = this.getter && (isAsync(this.getter!) || isGenerator(this.getter!))
         if (this.active) trackRetainedReactiveEffectCreated(this)
 
         if (ReactiveEffect.activeScopes.length) {
@@ -97,10 +107,13 @@ export class ReactiveEffect extends ManualCleanup {
     queueAsyncTrack(track: () => void) {
         (this._asyncTracks ?? (this._asyncTracks = [])).push(track)
     }
-    pauseCollectChild = () => {
+    // CAUTION 原型方法而不是实例箭头函数：每个 effect 实例少 3 个闭包的常驻内存
+    //  （渲染框架里每个绑定就是一个 effect，长列表下这是可观的量）。
+    //  需要脱离 this 使用的地方（Computed.createGetterContext）自行 bind。
+    pauseCollectChild() {
         this.shouldCollectChild = false
     }
-    resumeCollectChild = () => {
+    resumeCollectChild() {
         this.shouldCollectChild = true
     }
 
@@ -118,7 +131,7 @@ export class ReactiveEffect extends ManualCleanup {
             callbacks.delete(callback)
         }
     }
-    dispatch = (event: string, ...args: any[]) => {
+    dispatch(event: string, ...args: any[]) {
         const callbacks = this._eventToCallbacks?.get(event)
         if (callbacks) {
             callbacks.forEach(callback => callback.call(this, ...args))
@@ -261,3 +274,9 @@ export class ReactiveEffect extends ManualCleanup {
         return lastYieldValue
     }
 }
+
+// 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（见类顶部 declare 说明）
+ReactiveEffect.prototype.isRunningAsync = false
+ReactiveEffect.prototype.useDepMarker = true
+ReactiveEffect.prototype.index = 0
+ReactiveEffect.prototype.shouldCollectChild = true

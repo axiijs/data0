@@ -91,7 +91,10 @@ export class RxList<T> extends Computed {
     /**
      * @internal
      */
-    indexKeyDeps = new Map<number, Dep>()
+    _indexKeyDeps?: Map<number, Dep>
+    get indexKeyDeps(): Map<number, Dep> {
+        return this._indexKeyDeps ?? (this._indexKeyDeps = new Map())
+    }
     /**
      * @internal
      */
@@ -130,7 +133,7 @@ export class RxList<T> extends Computed {
     clear() {
         const length = this.data.length
         if (length === 0) return []
-        const hasIndexKeyDeps = this.indexKeyDeps?.size > 0
+        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
         const hasAtomIndexes = !!this.atomIndexes
         if (length === 1 || hasIndexKeyDeps || hasAtomIndexes) return this.splice(0, length)
 
@@ -157,7 +160,7 @@ export class RxList<T> extends Computed {
 
         const originLength = this.data.length
         const deleteItemsCount = Math.min(deleteCount, originLength - start)
-        const hasIndexKeyDeps = this.indexKeyDeps?.size > 0
+        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
         const hasAtomIndexes = !!this.atomIndexes
         const canUseMetadataFastPath = !hasIndexKeyDeps && !hasAtomIndexes
         const isPureAppend = start === originLength && deleteCount === 0
@@ -236,7 +239,7 @@ export class RxList<T> extends Computed {
         const originItemsInNewIndexes = newIndexes.map(index => this.data[index])
         newIndexes.forEach((newIndex, i) => {
             this.data[newIndex]= originItems[i]
-            if (this.indexKeyDeps?.size) {
+            if (this._indexKeyDeps?.size) {
                 this.trigger(this, TriggerOpTypes.SET, { key: newIndex, newValue: originItems[i], oldValue: originItemsInNewIndexes[i]})
             }
             if (oldIndexAtoms) {
@@ -1154,7 +1157,7 @@ export class RxList<T> extends Computed {
             this.destroyEffect(frame)
           })
         })
-        this.indexKeyDeps.clear()
+        this._indexKeyDeps?.clear()
         this.atomIndexes = undefined
     }
 

@@ -112,15 +112,32 @@ export class Computed extends ReactiveEffect {
     asyncStatus?: Atom<null | boolean | string>
     status: Atom<StatusType>
 
-    // status: Atom<StatusType> = atom(STATUS_CLEAN)
-    triggerInfos: TriggerInfo[] = []
+    // CAUTION 下面的集合/atom 字段全部惰性分配：一个 Computed（以及继承它的 RxList/RxMap/RxSet）
+    //  原来无条件预分配 3 个数组、2 个 Set、1 个 WeakMap、1 个 Map、1 个 updatedAt atom，
+    //  每实例 ~1KB 的常驻内存，多数场景根本用不到。
+    _triggerInfos?: TriggerInfo[]
+    get triggerInfos(): TriggerInfo[] {
+        return this._triggerInfos ?? (this._triggerInfos = [])
+    }
     scheduleRecompute?: DirtyCallback
     // 用来 patch 模式下，收集新增和删除是产生的 effectFrames
-    effectFramesArray: ReactiveEffect[][] = []
-    keyToEffectFrames: WeakMap<any, ReactiveEffect[]> = new WeakMap()
+    _effectFramesArray?: ReactiveEffect[][]
+    get effectFramesArray(): ReactiveEffect[][] {
+        return this._effectFramesArray ?? (this._effectFramesArray = [])
+    }
+    _keyToEffectFrames?: WeakMap<any, ReactiveEffect[]>
+    get keyToEffectFrames(): WeakMap<any, ReactiveEffect[]> {
+        return this._keyToEffectFrames ?? (this._keyToEffectFrames = new WeakMap())
+    }
     manualTracking = false
-    public dirtyFromDeps= new Set<Computed>()
-    public markedDirtyEffects: Set<Computed> = new Set()
+    _dirtyFromDeps?: Set<Computed>
+    public get dirtyFromDeps(): Set<Computed> {
+        return this._dirtyFromDeps ?? (this._dirtyFromDeps = new Set())
+    }
+    _markedDirtyEffects?: Set<Computed>
+    public get markedDirtyEffects(): Set<Computed> {
+        return this._markedDirtyEffects ?? (this._markedDirtyEffects = new Set())
+    }
     // TODO 需要一个更好的约定
     public get debugName() {
         return getDebugName(this.data)
@@ -131,7 +148,16 @@ export class Computed extends ReactiveEffect {
     public isGeneratorGetter: boolean = false
     public isAsyncPatch: boolean = false
     public isGeneratorPatch: boolean = false
-    public updatedAt: Atom<number|undefined> = atom(undefined)
+    // updatedAt 惰性化：时间戳先记在普通字段上，只有真正被读（想要响应式订阅）时才创建 atom
+    _updatedAtTime?: number
+    _updatedAt?: Atom<number|undefined>
+    public get updatedAt(): Atom<number|undefined> {
+        return this._updatedAt ?? (this._updatedAt = atom(this._updatedAtTime))
+    }
+    setUpdatedAt(time: number) {
+        this._updatedAtTime = time
+        if (this._updatedAt) this._updatedAt(time)
+    }
     constructor(
         public getter?: GetterType,
         public applyPatch?: ApplyPatchType,
@@ -220,7 +246,7 @@ export class Computed extends ReactiveEffect {
         this.completeTracking(true)
         return result
     }
-    callGeneratorGetter = (id:string) => {
+    callGeneratorGetter(id:string) {
         const runEffectId = id
         const getterContext = this.createGetterContext()
         return this.runGenerator(
@@ -248,12 +274,14 @@ export class Computed extends ReactiveEffect {
     }
 
     createGetterContext(): GetterContext | undefined {
+        // pauseCollectChild/resumeCollectChild 是原型方法，传给 context 时要 bind；
+        // 只有 getter 声明了参数才会走到这里，绑定成本只有用 context 的 computed 才付。
         return (this.getter && this.getter?.length > 0) ? {
             lastValue: this.data,
             onCleanup: (fn: () => any) => this.lastCleanupFn = fn,
             asyncStatus: this.asyncStatus!,
-            pauseCollectChild: this.pauseCollectChild,
-            resumeCollectChild: this.resumeCollectChild,
+            pauseCollectChild: this.pauseCollectChild.bind(this),
+            resumeCollectChild: this.resumeCollectChild.bind(this),
         } : undefined
     }
 
@@ -264,7 +292,11 @@ export class Computed extends ReactiveEffect {
 
 
     // 这是传递给外部 scheduleRecompute 的，用来代理 notify 上的 recursiveMarkDirty
-    recursiveMarkDirty = () => {
+    _boundRecursiveMarkDirty?: () => void
+    get boundRecursiveMarkDirty() {
+        return this._boundRecursiveMarkDirty ?? (this._boundRecursiveMarkDirty = () => this.recursiveMarkDirty())
+    }
+    recursiveMarkDirty() {
         // CAUTION Notifier.instance.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
         const depEffects = Notifier.instance.getDepEffects(this.trackClassInstance ? this: this.data)
         if (!depEffects) return
@@ -340,8 +372,8 @@ export class Computed extends ReactiveEffect {
             //  例如在 autorun/once 里面可能会既依赖 computed, 产生了 computed 变化，用户自己系统通过这种方式达到一个平衡状态。
             //   例如 不断将一个 pending list 中的数据取出来变成 processing。
             //   这时候的第一次 run 会变成 clean，所以 schedule 的 recompute 一定要是 forceRecompute 才能继续执行。
-            const recompute = (this.status.raw > STATUS_DIRTY && !this.isAsync) ? () => this.recompute(true) : this.recompute
-            this.scheduleRecompute!(recompute, this.recursiveMarkDirty, [...this.triggerInfos])
+            const recompute = (this.status.raw > STATUS_DIRTY && !this.isAsync) ? () => this.recompute(true) : this.boundRecompute
+            this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, [...(this._triggerInfos ?? [])])
         }
 
         // 如果不是已经开始重算或者立刻开始计算，那么从标记为脏也要创建 cleanPromise
@@ -369,7 +401,7 @@ export class Computed extends ReactiveEffect {
         const recomputeId = ++this.recomputeId
         this.inPatch = false
         // 每次 full recompute 清空所有的 triggerInfos，这样才能使 patchable recompute 不错乱。
-        this.triggerInfos.length = 0
+        if (this._triggerInfos) this._triggerInfos.length = 0
 
         this.prepareRecompute()
         // 默认行为，重算并且重新收集依赖
@@ -397,7 +429,7 @@ export class Computed extends ReactiveEffect {
 
         this.replaceData(result)
         this.status(STATUS_CLEAN)
-        this.updatedAt(new Date().getTime())
+        this.setUpdatedAt(new Date().getTime())
 
         if (this.applyPatch) {
             this.phase = PATCH_PHASE
@@ -428,7 +460,7 @@ export class Computed extends ReactiveEffect {
         }
         // explicit return false 说明出现了无法 patch 的情况，表示一定要重算
         if (patchResult===false) {
-            this.triggerInfos.length = 0
+            if (this._triggerInfos) this._triggerInfos.length = 0
             this.inPatch = false
             if (this.isAsync) {
                 if (!this.cleanPromise) this.createCleanPromise()
@@ -449,18 +481,22 @@ export class Computed extends ReactiveEffect {
 
         this.inPatch = false
         this.status(STATUS_CLEAN)
-        this.updatedAt(new Date().getTime())
+        this.setUpdatedAt(new Date().getTime())
         this.sendTriggerInfos()
         this.dispatch('clean')
         this.resolveCleanPromise?.()
     }
-    savedTriggerInfos: Parameters<Notifier["trigger"]>[] = []
+    _savedTriggerInfos?: Parameters<Notifier["trigger"]>[]
+    get savedTriggerInfos(): Parameters<Notifier["trigger"]>[] {
+        return this._savedTriggerInfos ?? (this._savedTriggerInfos = [])
+    }
     trigger(...args: Parameters<Notifier["trigger"]>) {
         this.savedTriggerInfos.push(args)
     }
     sendTriggerInfos() {
-        const infos = [...this.savedTriggerInfos]
-        this.savedTriggerInfos.length = 0
+        if (!this._savedTriggerInfos?.length) return
+        const infos = [...this._savedTriggerInfos]
+        this._savedTriggerInfos.length = 0
         Notifier.instance.createEffectSession()
         for(const info of infos) {
             Notifier.instance.trigger(...info)
@@ -468,7 +504,12 @@ export class Computed extends ReactiveEffect {
         Notifier.instance.digestEffectSession()
     }
     // 由 this.run/onTrack/forceDirtyDepsRecompute 调用
-    recompute = async (forceRecompute = false): Promise<any> => {
+    // CAUTION 原型方法 + 惰性 bound 版本（scheduleRecompute 需要脱离 this 调用）
+    _boundRecompute?: (forceRecompute?: boolean) => Promise<any>
+    get boundRecompute() {
+        return this._boundRecompute ?? (this._boundRecompute = (forceRecompute?: boolean) => this.recompute(forceRecompute))
+    }
+    async recompute(forceRecompute = false): Promise<any> {
         if ((this.status.raw === STATUS_CLEAN && !forceRecompute) || !this.active) return
 
         // 四种类型计算：
@@ -567,7 +608,8 @@ export class Computed extends ReactiveEffect {
         return this.deps.length > 0
     }
     // 给继承者在 apply catch 中用的 工具函数
-    manualTrack = (target: object, type: TrackOpTypes, key: unknown) => {
+    // CAUTION 以下全部是原型方法（原来是每实例的箭头函数字段），调用点都是 this.xxx() 的方法调用
+    manualTrack(target: object, type: TrackOpTypes, key: unknown) {
         Notifier.instance.enableTracking()
         const dep = isPrimitiveAtom(target) && type === TrackOpTypes.ATOM && key === 'value'
             ? Notifier.instance.trackPrimitiveAtomValue(target)
@@ -575,13 +617,13 @@ export class Computed extends ReactiveEffect {
         Notifier.instance.resetTracking()
         return dep
     }
-    pauseAutoTrack = () => {
+    pauseAutoTrack() {
         Notifier.instance.pauseTracking()
     }
-    autoTrack = () => {
+    autoTrack() {
         Notifier.instance.enableTracking()
     }
-    resetAutoTrack = () => {
+    resetAutoTrack() {
         Notifier.instance.resetTracking()
     }
     destroy(ignoreChildren = false) {
@@ -590,14 +632,19 @@ export class Computed extends ReactiveEffect {
         delete this.lastCleanupFn
         super.destroy( ignoreChildren)
     }
-    collectEffect: () => () => CleanupFrame = ReactiveEffect.collectEffect
-    destroyEffect = (effect: ReactiveEffect) => {
+    collectEffect(): () => CleanupFrame {
+        return ReactiveEffect.collectEffect()
+    }
+    destroyEffect(effect: ReactiveEffect) {
         // 因为可能是 computed，destroy 和 ReactiveEffect 不一样，所以要调用它自己身的
         effect.destroy()
     }
-    cachedValues = new Map<any, any>()
+    _cachedValues?: Map<any, any>
+    get cachedValues(): Map<any, any> {
+        return this._cachedValues ?? (this._cachedValues = new Map())
+    }
     getCachedValue<T>(effect:any, createFn: () => T) : T{
-        let value = this.cachedValues.get(effect)
+        let value = this._cachedValues?.get(effect)
         if (!value) {
             this.cachedValues.set(effect, value = createFn())
         }

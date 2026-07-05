@@ -139,11 +139,9 @@ export class Notifier {
   getOrCreatePrimitiveAtomDep(target: object) {
     let dep = this.getPrimitiveAtomDep(target)
     if (!dep) {
-      Object.defineProperty(target, PRIMITIVE_ATOM_DEP, {
-        configurable: true,
-        enumerable: false,
-        value: dep = createCompactDep(),
-      })
+      // CAUTION 普通赋值而不是 defineProperty：defineProperty 会把 atom 函数对象推进
+      //  字典属性模式（每个被订阅的 atom 多 ~200B）。symbol key 不会污染 for...in/Object.keys。
+      ;(target as PrimitiveAtomDepTarget)[PRIMITIVE_ATOM_DEP] = dep = createCompactDep()
       trackRetainedPrimitiveAtomDepCreated(dep)
     }
     return dep
