@@ -133,7 +133,6 @@ export class RxList<T> extends Computed {
         if (this.getter) {
             this.run([], true)
         }
-        this.createComputedMetas()
     }
     /**
      * @internal
@@ -1158,22 +1157,25 @@ export class RxList<T> extends Computed {
             }
         )
     }
-    public length!: Atom<number>
-    createComputedMetas( ) {
-        // FIXME 目前不能用 cache 的方法在读时才创建。
-        //  因为如果是在 autorun 等  computed 中读的，会导致在cleanup 时把
-        //  相应的 computed 当做 children destroy 掉。
-        const source = this
-        this.length = computed(
-            function computation(this: Computed) {
-                this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return source.data!.length
-            },
-            function applyPatch(this: Computed, data: Atom<number>){
-                data(source.data.length)
-            }
-        )
-        setComputedRetainedDiagnosticSource(this.length, 'RxList.length')
+    // CAUTION length 惰性创建：每个 RxList（包括所有派生列表）无条件预建一个
+    //  length computed 曾是主要的固定开销之一。惰性创建以 createDetached 包裹，
+    //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
+    declare _length?: Atom<number>
+    get length(): Atom<number> {
+        return this._length ?? (this._length = ReactiveEffect.createDetached(() => {
+            const source = this
+            const length = computed(
+                function computation(this: Computed) {
+                    this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                    return source.data!.length
+                },
+                function applyPatch(this: Computed, data: Atom<number>){
+                    data(source.data.length)
+                }
+            )
+            setComputedRetainedDiagnosticSource(length, 'RxList.length')
+            return length
+        }))
     }
 
     // FIXME onUntrack 的时候要把 indexKeyDeps 里面的 dep 都删掉。因为 Effect 没管这种情况。
@@ -1184,7 +1186,8 @@ export class RxList<T> extends Computed {
 
     }
     destroy() {
-        destroyComputed(this.length)
+        // CAUTION 用 _length 判断：length 是惰性 getter，直接访问会先创建再销毁
+        if (this._length) destroyComputed(this._length)
         super.destroy()
         this.effectFramesArray?.forEach((frames) => {
           frames.forEach((frame) => {

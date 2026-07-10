@@ -90,6 +90,27 @@ export class ReactiveEffect extends ManualCleanup {
             }
         }
     }
+    /**
+     * 在"游离"上下文中创建响应式对象：临时屏蔽父 effect 的 children 收集与
+     * ManualCleanup 的 frame 收集。用于惰性创建生命周期由宿主自己管理的派生结构
+     * （RxList.length、RxMap.keys 等 meta）——否则在 autorun/computed 的 getter 里
+     * 首次访问这些 meta 时，它们会被当作该 effect 的 child，在下一次重算的
+     * cleanup 中被误销毁。
+     */
+    static createDetached<T>(create: () => T): T {
+        const scopes = ReactiveEffect.activeScopes
+        const top = scopes.length ? scopes[scopes.length - 1] : undefined
+        const prevShouldCollect = top ? top.shouldCollectChild : undefined
+        if (top) top.shouldCollectChild = false
+        // 压入一个丢弃 frame，创建过程中的 ManualCleanup 实例不会进入外层 frame
+        const stopCollect = ManualCleanup.collectEffect()
+        try {
+            return create()
+        } finally {
+            stopCollect()
+            if (top) top.shouldCollectChild = prevShouldCollect!
+        }
+    }
     get eventToCallbacks() {
         return this._eventToCallbacks ?? (this._eventToCallbacks = new Map())
     }

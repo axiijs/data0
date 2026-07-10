@@ -1,10 +1,31 @@
 import {describe, expect, test} from "vitest";
 import {RxMap} from "../src/RxMap.js";
 import {RxSet} from "../src/RxSet";
-import {computed, RxList} from "../src";
+import {autorun, computed, RxList} from "../src";
 
 
 describe('RxMap', () => {
+    test('lazy metas (keys/size) created inside autorun survive rerun cleanup', () => {
+        const map = new RxMap<string, number>({a: 1, b: 2})
+        let size = -1
+        let keyCount = -1
+        autorun(() => {
+            size = map.size()
+            keyCount = map.keys().length()
+        }, true)
+        expect(size).toBe(2)
+        expect(keyCount).toBe(2)
+
+        map.set('c', 3)
+        expect(size).toBe(3)
+        expect(keyCount).toBe(3)
+
+        // autorun 已重跑（cleanup 发生过），meta computed 必须仍然存活
+        map.delete('a')
+        expect(size).toBe(2)
+        expect(keyCount).toBe(2)
+    })
+
     test('get entries', () => {
         const map = new RxMap<string, number>({a: 1, b: 2, c: 3})
 

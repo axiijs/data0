@@ -41,17 +41,28 @@ describe('RxList', () => {
         expect(mapRuns).toBe(5)
     })
 
-    test('destroy releases length computed retained diagnostics', () => {
+    test('length computed is lazy and destroy releases it once created', () => {
         enableData0RetainedObjectDiagnostics({ reset: true })
         try {
             const list = new RxList<number>([1, 2, 3])
+            // length 惰性创建：构造 RxList 不再预建 length computed
             const afterCreate = getData0RetainedObjectDiagnosticsSnapshot()
-            expect(afterCreate.reactiveEffects.activeBySource['RxList.length']).toBe(1)
+            expect(afterCreate.reactiveEffects.activeBySource['RxList.length']).toBe(undefined)
+
+            expect(list.length()).toBe(3)
+            const afterRead = getData0RetainedObjectDiagnosticsSnapshot()
+            expect(afterRead.reactiveEffects.activeBySource['RxList.length']).toBe(1)
 
             list.destroy()
             const afterDestroy = getData0RetainedObjectDiagnosticsSnapshot()
             expect(afterDestroy.reactiveEffects.totalActive).toBe(0)
             expect(afterDestroy.reactiveEffects.destroyedBySource['RxList.length']).toBe(1)
+
+            // 从未读过 length 的列表，destroy 不应顺带创建它
+            const untouched = new RxList<number>([1])
+            untouched.destroy()
+            const afterUntouched = getData0RetainedObjectDiagnosticsSnapshot()
+            expect(afterUntouched.reactiveEffects.totalActive).toBe(0)
         } finally {
             disableData0RetainedObjectDiagnostics()
         }
@@ -730,6 +741,24 @@ describe('RxList', () => {
         // reorder 覆盖到订阅 index 时也要更新
         list.swap(500, 0)
         expect(value).toBe(-1)
+    })
+
+    test('lazy length meta created inside autorun survives the autorun rerun cleanup', () => {
+        // 旧实现不能惰性创建 meta 的原因：在 autorun/computed 中首次读取时会被
+        // 收集为该 effect 的 child，重跑 cleanup 时被误销毁。createDetached 修复后回归覆盖。
+        const list = new RxList<number>([1, 2, 3])
+        let len = -1
+        autorun(() => {
+            len = list.length()
+        }, true)
+        expect(len).toBe(3)
+
+        list.push(4)
+        expect(len).toBe(4)
+
+        // autorun 已经重跑过（cleanup 发生过），length computed 必须仍然存活
+        list.splice(0, 2)
+        expect(len).toBe(2)
     })
 
     test('index deps of unsubscribed effects are pruned so splice returns to the fast path', () => {
