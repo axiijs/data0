@@ -169,7 +169,8 @@ function createPrimitiveAtom<T>(initValue: T, name?: string) {
         if (Object.is(updater[PRIMITIVE_ATOM_VALUE], newValue)) return
         const oldValue = updater[PRIMITIVE_ATOM_VALUE]
         updater[PRIMITIVE_ATOM_VALUE] = newValue as T
-        notifier.triggerPrimitiveAtomValue(updater, { key: 'value', newValue, oldValue})
+        // 标量传参：atom 写路径不构造 info 对象（见 triggerPrimitiveAtomValue）
+        notifier.triggerPrimitiveAtomValue(updater, newValue, oldValue)
     } as PrimitiveAtomUpdater<T>
 
     // CAUTION setPrototypeOf 要在添加自有属性之前做，V8 对"先改原型再加属性"的对象

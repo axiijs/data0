@@ -1,9 +1,9 @@
 import {getDebugName,} from "./debug";
-import {Notifier, notifier, TriggerInfo} from './notify'
+import {InputTriggerInfo, Notifier, notifier, TriggerInfo} from './notify'
 import {assert, isAsync, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
-import {TrackOpTypes} from "./operations.js";
+import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {CleanupFrame} from "./manualCleanup";
 import {markRetainedReactiveEffectKind, setRetainedReactiveEffectSource} from "./retainedDiagnostics";
 
@@ -222,6 +222,10 @@ export class Computed extends ReactiveEffect {
             this.immediate = true
         }
 
+        // 只有 patch 型 computed（applyPatch 消费 triggerInfos）和要求 infos 的自定义
+        // 调度器需要 trigger 路径构造 info 对象；其余情况 notifier 走零分配路径。
+        if (this.applyPatch || this.scheduleNeedsInfos) this.needsTriggerInfo = true
+
         if (callbacks?.onDestroy) this.on('destroy', callbacks.onDestroy)
         if (callbacks?.onTrack) this.on('track', callbacks.onTrack)
         if (callbacks?.onRecompute) this.on('recompute', callbacks.onRecompute)
@@ -403,7 +407,25 @@ export class Computed extends ReactiveEffect {
         if (infos && infos.length) {
             this.triggerInfos.push(...infos)
         }
-
+        this.handleTriggered(immediate)
+    }
+    // trigger 热路径入口（见 ReactiveEffect.runFromTrigger 的说明）：
+    // info 只在本 computed 真正消费时才构造。
+    runFromTrigger(source: any, type: TriggerOpTypes, inputInfo?: InputTriggerInfo) {
+        if (this.skipIndicator?.skip) return
+        if (this.needsTriggerInfo) {
+            this.triggerInfos.push((inputInfo ? {...inputInfo, source, type} : {source, type}) as TriggerInfo)
+        }
+        this.handleTriggered(false)
+    }
+    runFromAtomTrigger(source: any, newValue?: unknown, oldValue?: unknown) {
+        if (this.skipIndicator?.skip) return
+        if (this.needsTriggerInfo) {
+            this.triggerInfos.push({source, type: TriggerOpTypes.ATOM, key: 'value', newValue, oldValue} as TriggerInfo)
+        }
+        this.handleTriggered(false)
+    }
+    private handleTriggered(immediate: boolean) {
         // markDirty, initial 状态不需要 mark dirty
         if (this._status === STATUS_CLEAN) {
             this.dispatch('dirty')

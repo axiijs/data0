@@ -76,7 +76,7 @@ describe('exception safety', () => {
         expect(() => batch(() => a(1))).toThrow('boom')
         expect(Notifier.instance.inEffectSession).toBe(false)
         expect(Notifier.instance.isDigesting).toBe(false)
-        expect(Notifier.instance.effectsInSession.size).toBe(0)
+        expect(Notifier.instance.sessionQueue.length).toBe(0)
 
         // batching still works afterwards
         const b = atom(1)

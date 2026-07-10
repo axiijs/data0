@@ -1,5 +1,7 @@
 import {Dep, finalizeDepMarkers, initDepMarkers} from "./dep.js";
 import {maxMarkerBits, Notifier, notifier} from "./notify.js";
+import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
+import type {TriggerOpTypes} from "./operations.js";
 import {ManualCleanup} from "./manualCleanup.js";
 import {isAsync, isGenerator} from "./util.js";
 import {
@@ -57,6 +59,16 @@ export class ReactiveEffect extends ManualCleanup {
     declare getter?: (...args: any[]) => any
     isAsync?:boolean
     declare shouldCollectChild: boolean
+    // CAUTION 触发协议（见 notify.ts triggerEffect）：
+    //  needsTriggerInfo 表示该 effect 会消费 TriggerInfo（patch 型 Computed / 声明了
+    //  第三个参数的自定义调度器）。为 false 时 trigger 路径完全不构造 info 对象——
+    //  渲染框架的轻量绑定 effect 都不读 info，这是 trigger 热路径零分配的关键。
+    //  默认值在原型上（Computed 构造器在需要时置 true）。
+    declare needsTriggerInfo: boolean
+    // effect session（batch）内的去重标记与待处理 info 队列，代替原来 notifier 上的
+    // Set + WeakMap（每次 batch 内触发省一次哈希查找与集合分配）。默认值在原型上。
+    declare _inSession: boolean
+    declare _sessionInfos?: TriggerInfo[]
     constructor(getter?: (...args: any[]) => any) {
         // 这是为了支持有的数据结构想写成 source/computed 都支持的情况，比如 RxList。它会继承 Computed
         super();
@@ -198,6 +210,16 @@ export class ReactiveEffect extends ManualCleanup {
             ReactiveEffect.activeScopes.pop()
         }
     }
+    // 依赖触发时由 notifier 调用（非 session 路径）。基类 effect 不消费 TriggerInfo，
+    // 直接重跑；Computed 覆写此方法，按 needsTriggerInfo 惰性组装 info。
+    runFromTrigger(_source?: any, _type?: TriggerOpTypes, _inputInfo?: InputTriggerInfo) {
+        this.run()
+    }
+    // primitive atom 写入的特化入口：newValue/oldValue 以标量传递，
+    // 让最热的 atom 写路径完全不构造 info 对象。
+    runFromAtomTrigger(_source?: any, _newValue?: unknown, _oldValue?: unknown) {
+        this.run()
+    }
     run(...args: any[]): any {
         // 一般用于调试
         if (!this.active) {
@@ -296,3 +318,5 @@ ReactiveEffect.prototype.isRunningAsync = false
 ReactiveEffect.prototype.useDepMarker = true
 ReactiveEffect.prototype.index = 0
 ReactiveEffect.prototype.shouldCollectChild = true
+ReactiveEffect.prototype.needsTriggerInfo = false
+ReactiveEffect.prototype._inSession = false
