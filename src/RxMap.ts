@@ -3,6 +3,7 @@ import {
     CallbacksType,
     computed,
     Computed,
+    destroyComputed,
     DirtyCallback,
     GetterType,
     SkipIndicator
@@ -204,5 +205,14 @@ export class RxMap<K, V> extends Computed{
                 data(source.data.size)
             }
         )
+    }
+    destroy() {
+        // CAUTION createComputedMetas 里创建的派生结构必须销毁，否则它们还挂在本 map 的 dep 上泄漏。
+        //  values/entries 派生自 keys，先销毁派生者。
+        this.values().destroy()
+        this.entries().destroy()
+        this.keys().destroy()
+        destroyComputed(this.size)
+        super.destroy()
     }
 }

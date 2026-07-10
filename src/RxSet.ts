@@ -1,4 +1,4 @@
-import {ApplyPatchType, CallbacksType, computed, Computed, DirtyCallback, GetterType} from "./computed.js";
+import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, GetterType} from "./computed.js";
 import {Atom} from "./atom.js";
 import {ITERATE_KEY, Notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
@@ -334,6 +334,11 @@ export class RxSet<T> extends Computed {
                 data(source.data.size)
             }
         )
+    }
+    destroy() {
+        // createComputedMetas 里创建的 size 必须一并销毁，否则泄漏
+        destroyComputed(this.size)
+        super.destroy()
     }
 }
 
