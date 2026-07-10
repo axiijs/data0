@@ -244,10 +244,14 @@ export class Notifier {
         })
       }
 
-      activeEffect!.dispatch('track', {
-        effect: activeEffect!,
-        ...debuggerEventExtraInfo!
-      })
+      // CAUTION 先判断监听者再构造 payload：track 是最热的路径之一，
+      //  无监听者时不能为派发分配对象。
+      if (activeEffect.hasListener('track')) {
+        activeEffect.dispatch('track', {
+          effect: activeEffect,
+          ...debuggerEventExtraInfo
+        })
+      }
     }
   }
   trigger(
@@ -430,7 +434,10 @@ export class Notifier {
     const activeEffect = ReactiveEffect.activeScopes.at(-1)
     if (activeEffect === effect) throw new Error('recursive effect call')
 
-    effect.dispatch('trigger', extend({ effect }, debuggerEventExtraInfo))
+    // 无监听者时不构造 payload（每次触发每个 effect 都会经过这里）
+    if (effect.hasListener('trigger')) {
+      effect.dispatch('trigger', extend({ effect }, debuggerEventExtraInfo))
+    }
 
     if (this.inEffectSession) {
       this.scheduleEffect(effect, info, debuggerEventExtraInfo)

@@ -131,10 +131,18 @@ export class ReactiveEffect extends ManualCleanup {
             callbacks.delete(callback)
         }
     }
-    dispatch(event: string, ...args: any[]) {
+    // CAUTION 热路径守卫：track/trigger 每次都会经过事件派发点，绝大多数 effect 没有监听者。
+    //  调用方先用它判断，再构造 payload，避免无监听者时的对象分配。
+    hasListener(event: string) {
+        const callbacks = this._eventToCallbacks?.get(event)
+        return callbacks !== undefined && callbacks.size > 0
+    }
+    // CAUTION 单参签名而不是 ...args：内部所有派发点最多只带一个参数，
+    //  rest 参数会让每次 dispatch 都分配一个数组（trigger/track/recompute 等热路径每次触发都要派发）。
+    dispatch(event: string, arg?: any) {
         const callbacks = this._eventToCallbacks?.get(event)
         if (callbacks) {
-            callbacks.forEach(callback => callback.call(this, ...args))
+            callbacks.forEach(callback => callback.call(this, arg))
         }
     }
     createGetterContext():any {
