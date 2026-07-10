@@ -216,15 +216,19 @@ export class RxList<T> extends Computed {
     }
     // 显式 set 某一个 index 的值
     set(index: number, value: T) {
+        // CAUTION 越界写会改变 length，走 splice 语义才能让 length/派生结构收到正确的增量信息。
+        //  注意判断必须在写入 data 之前做，写入后 length 已经被扩展了。
+        if (index > this.data.length - 1) {
+            const filler = new Array(index - this.data.length)
+            this.splice(this.data.length, 0, ...filler, value)
+            return undefined
+        }
+
         const oldValue = this.data[index]
         this.data[index] = value
 
         // 这里还是用 trigger TriggerOpTypes.SET，因为系统在处理 TriggerOpTypes.SET 的时候还会对 listLike 的数据 触发 ITERATE_KEY。
-        if (index > this.data.length - 1) {
-            this.trigger(this, TriggerOpTypes.ADD, { key: index, newValue: value, oldValue})
-        } else {
-            this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: value, oldValue})
-        }
+        this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: value, oldValue})
         this.trigger(this, TriggerOpTypes.EXPLICIT_KEY_CHANGE, { key: index, newValue: value, oldValue, methodResult: oldValue})
         this.sendTriggerInfos()
 
@@ -779,9 +783,11 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
 
-                triggerInfos.every((triggerInfo) => {
+                // CAUTION 用 for...of 而不是 every：every 的回调若不显式 return true 会提前终止，
+                //  导致一次 batch 里的多条 triggerInfo 只处理第一条。
+                for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, source: triggerSource } = triggerInfo
-                    assert(!!(method === 'splice' || key), 'trigger info has no method and key')
+                    assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     let startFindingIndex = Infinity
                     if (triggerSource === source ) {
@@ -797,8 +803,9 @@ export class RxList<T> extends Computed {
                             if (this.data.raw === key) {
                                 // 刚好把找到的弄没了
                                 startFindingIndex = key as number
-                            } else if((key as number) < this.data.raw) {
-                                // 快速验证 这一个是不是新的 match，如果是就替换，index 变小，如果不是就没影响。
+                            } else if(this.data.raw === -1 || (key as number) < this.data.raw) {
+                                // 当前没有匹配（-1）时任何位置的变化都可能产生新匹配；
+                                // 有匹配时只有更小的 index 才可能替换。快速验证这一个是不是新的 match。
                                 checkOne(key as number)
                             }
                         }
@@ -813,8 +820,8 @@ export class RxList<T> extends Computed {
                         //  一直到所有响应完还有没有找到的话，就继续 search。
                         // CAUTION 一定要切片，否则后面 matchAndRemember 会死循环
                         const itemCandidateSet = trackTargetToSearchItem.get(triggerSource)
-                        const itemCandidates = Array.from(itemCandidateSet??[])
-                        if (itemCandidates) {
+                        if (itemCandidateSet) {
+                            const itemCandidates = Array.from(itemCandidateSet)
 
                             let newIndex = -1
                             let lastMatchedChanged = false
@@ -847,12 +854,12 @@ export class RxList<T> extends Computed {
                                 }
                             }
                         } else {
+                            // 未知来源的变化，无法增量处理，提前结束并触发全量重算
                             patchSuccess = false
-                            // 提前结束
-                            return false
+                            break
                         }
                     }
-                })
+                }
                 // 显式 return false 触发重算
                 return patchSuccess
             },
@@ -941,7 +948,7 @@ export class RxList<T> extends Computed {
             function applyPatch(this: RxMap<any, RxList<T>>, _data, triggerInfos) {
                 triggerInfos.forEach((triggerInfo) => {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
-                    assert(!!(method === 'splice' || key), 'trigger info has no method and key')
+                    assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
@@ -987,7 +994,8 @@ export class RxList<T> extends Computed {
 
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // explicit key change
-                        if (oldValue) {
+                        // CAUTION 用 undefined 判断而不是 truthy，oldValue 可能是 0/''/false 等合法值
+                        if (oldValue !== undefined) {
                             const oldGroupKey = getKey(oldValue as T)
                             this.data.get(oldGroupKey)!.splice(this.data.get(oldGroupKey)!.data.indexOf(oldValue as T), 1)
                         }
@@ -1021,7 +1029,7 @@ export class RxList<T> extends Computed {
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
                 triggerInfos.forEach((triggerInfo) => {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
-                    assert(!!(method === 'splice' || key), 'trigger info has no method and key')
+                    assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
@@ -1069,7 +1077,7 @@ export class RxList<T> extends Computed {
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
                 triggerInfos.forEach((triggerInfo) => {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
-                    assert(!!(method === 'splice' || key), 'trigger info has no method and key')
+                    assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as [any, any][] || []
@@ -1103,7 +1111,7 @@ export class RxList<T> extends Computed {
             function applyPatch(this: RxSet<T>, _data, triggerInfos) {
                 triggerInfos.forEach((triggerInfo) => {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
-                    assert(!!(method === 'splice' || key), 'trigger info has no method and key')
+                    assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
@@ -1277,7 +1285,9 @@ export class RxList<T> extends Computed {
                 for(const info of triggerInfos) {
                     // ensure it's from this source
                     if (info.source !== source) return false
-                    debugger
+                    // reorder（sortSelf/reposition/swap）会改变区间内元素的相对顺序，
+                    // 无法用区间差量表达，直接全量重算。
+                    if (info.method === 'reorder') return false
                     const idxs = clampIndexes(source.data.length)
                     // 现在不合法了，清空
                     if (!idxs || !lastIndexes) {
@@ -1292,9 +1302,9 @@ export class RxList<T> extends Computed {
                         if (deletedItems.length === 0 && insertedItems.length === 0) return
 
                         const startArgv = argv![0]  as number
-                        const lastSourceLength = source.data.length - deletedItems.length + insertedItems.length
-                        // 如果 start 参数为负数且绝对值大于原始数组长度，会被修正为 0 开始，效果等价与修正成 lastSourceLength。我们这里这样写是为了计算方便。
-                        const spliceStart = startArgv! < 0 ? Math.max(0, lastSourceLength + end!) : Math.min(startArgv!, lastSourceLength)
+                        const lastSourceLength = source.data.length - insertedItems.length + deletedItems.length
+                        // 如果 start 参数为负数，按 splice 语义从末尾往前修正。
+                        const spliceStart = startArgv! < 0 ? Math.max(0, lastSourceLength + startArgv!) : Math.min(startArgv!, lastSourceLength)
                         const spliceEffectEnd = spliceStart + deletedItems.length
                         const lengthChange = insertedItems.length  - deletedItems.length
 
