@@ -666,6 +666,35 @@ describe('RxList', () => {
         expect([...list]).toMatchObject([100, 10, 3])
     })
 
+    test('replaceData/spliceArray handle very large batches (beyond spread argument limit)', () => {
+        // V8 的函数实参上限约 65k：spread 传参在大列表上会 RangeError
+        const SIZE = 100_000
+        const bigData = Array.from({length: SIZE}, (_, i) => i)
+
+        const list = new RxList<number>([1, 2, 3])
+        list.replaceData(bigData)
+        expect(list.data.length).toBe(SIZE)
+        expect(list.data[0]).toBe(0)
+        expect(list.data[SIZE - 1]).toBe(SIZE - 1)
+
+        // 非纯 append/clear 的慢路径（先建立一个 index dep）也要能处理大批量
+        const list2 = new RxList<number>([1, 2, 3])
+        let first = -1
+        autorun(() => { first = list2.at(0)! }, true)
+        list2.spliceArray(1, 1, bigData)
+        expect(list2.data.length).toBe(SIZE + 2)
+        expect(list2.data[1]).toBe(0)
+        expect(first).toBe(1)
+
+        // derived computed RxList 的全量重算走 replaceData，同样是大批量
+        const source = new RxList<number>(bigData)
+        const derived = source.map(v => v + 1)
+        expect(derived.data.length).toBe(SIZE)
+        expect(derived.data[SIZE - 1]).toBe(SIZE)
+        derived.destroy()
+        source.destroy()
+    })
+
     test('at() keeps fine-grained index dep: unrelated splice does not rerun', () => {
         const list = new RxList<number>([1, 2, 3, 4, 5])
         let runs = 0

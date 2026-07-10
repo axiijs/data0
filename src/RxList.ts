@@ -12,7 +12,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert} from "./util.js";
+import {assert, spliceMany} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -124,7 +124,8 @@ export class RxList<T> extends Computed {
      */
     replaceData(newData: any[]) {
         // 这里的 newData type 为 any[]，是为了让子类能覆写，实现 replaceData 的时候才进行数据转换。
-        this.splice(0, this.data.length, ...newData)
+        // CAUTION 数组参数版：spread 传参对大列表（>65k）会超出实参上限直接 RangeError。
+        this.spliceArray(0, this.data.length, newData)
     }
 
     push(...items: T[]) {
@@ -155,8 +156,12 @@ export class RxList<T> extends Computed {
         return this.splice(0, 0, ...items)
     }
     splice( start: number, deleteCount: number, ...items: T[]) {
+        return this.spliceArray(start, deleteCount, items)
+    }
+    // splice 的数组参数版：内部所有批量写入都走这里，规避 spread 实参上限
+    // （大列表 replaceData/concat 等场景 spread 会 RangeError）与 O(n) 实参拷贝。
+    spliceArray(start: number, deleteCount: number, items: T[] = []) {
         this.pauseAutoTrack()
-        // notifier.createEffectSession()
 
         const originLength = this.data.length
         const deleteItemsCount = Math.min(deleteCount, originLength - start)
@@ -167,7 +172,7 @@ export class RxList<T> extends Computed {
         const isPureClear = start === 0 && deleteCount >= originLength && items.length === 0
 
         if (canUseMetadataFastPath && (isPureAppend || isPureClear)) {
-            const result = this.data.splice(start, deleteCount, ...items)
+            const result = spliceMany(this.data, start, deleteCount, items)
             this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
             this.sendTriggerInfos()
             this.resetAutoTrack()
@@ -184,7 +189,7 @@ export class RxList<T> extends Computed {
                 oldValues![i] = this.data[i]
             }
         }
-        const result = this.data.splice(start, deleteCount, ...items)
+        const result = spliceMany(this.data, start, deleteCount, items)
 
 
         // CAUTION 无论有没有 indexKeyDeps 都要触发 Iterator_Key，
@@ -203,7 +208,7 @@ export class RxList<T> extends Computed {
         this.sendTriggerInfos()
 
         if (this.atomIndexes) {
-            this.atomIndexes.splice(start, deleteCount, ...items.map((_, index) => atom(index + start)))
+            spliceMany(this.atomIndexes, start, deleteCount, items.map((_, index) => atom(index + start)))
             for (let i = start; i <changedIndexEnd; i++) {
                 // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
                 this.atomIndexes[i]?.(i)
@@ -545,8 +550,8 @@ export class RxList<T> extends Computed {
                             }
                             return newItem!
                         })
-                        const deletedItems = this.splice(argv![0], argv![1], ...newItems)
-                        const deletedFrames = this.effectFramesArray!.splice(argv![0], argv![1], ...effectFrames)
+                        const deletedItems = this.spliceArray(argv![0], argv![1], newItems)
+                        const deletedFrames = spliceMany(this.effectFramesArray!, argv![0], argv![1], effectFrames)
                         deletedFrames.forEach((frame) => {
                             frame.forEach((effect) => {
                                 this.destroyEffect(effect)
@@ -556,7 +561,7 @@ export class RxList<T> extends Computed {
                         if (useContext && cleanupFns?.length) {
                             // CAUTION 这里要把删除的 effect 的 cleanup 都执行一遍
                             //  如果能从 return value 中进行销毁，应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能。
-                            const deletedCleanupFns = cleanupFns.splice(argv![0], argv![1], ...newCleanups)
+                            const deletedCleanupFns = spliceMany(cleanupFns, argv![0], argv![1], newCleanups)
                             deletedCleanupFns.forEach((fn) => {
                                 fn?.()
                             })
@@ -956,6 +961,7 @@ export class RxList<T> extends Computed {
                         if (argv![0] === 0) {
                             newItemsInArgs.reverse()
                         }
+                        const insertAtHead = argv![0] === 0
 
                         // 先分好组，再一次性操作，可以合并 info，还能间接提高 dom 操作性能。
                         const newGroupedItems = new Map<any, T[]>()
@@ -976,10 +982,11 @@ export class RxList<T> extends Computed {
                             if (!this.data.has(key)) {
                                 this.set(key, new RxList(group))
                             } else {
-                                if (argv![0] === 0) {
-                                    this.data.get(key)!.unshift(...group)
+                                const groupList = this.data.get(key)!
+                                if (insertAtHead) {
+                                    groupList.spliceArray(0, 0, group)
                                 } else {
-                                    this.data.get(key)!.push(...group)
+                                    groupList.spliceArray(groupList.data.length, 0, group)
                                 }
                             }
                         })
@@ -1181,10 +1188,12 @@ export class RxList<T> extends Computed {
                     this.manualTrack(src, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
                 })
 
-                // Full initial merge
+                // Full initial merge（逐项 push，规避大数组 spread 的实参上限）
                 const merged: T[] = []
                 sources.forEach(src => {
-                    merged.push(...src.data)
+                    for (const item of src.data) {
+                        merged.push(item)
+                    }
                 })
                 return merged
             },
@@ -1220,7 +1229,7 @@ export class RxList<T> extends Computed {
                         let insertPos = offset + (argv![0] as number)
                         // clamp insertPos if user spliced out-of-bounds
                         insertPos = Math.min(Math.max(insertPos, 0), this.data.length)
-                        this.splice(insertPos, 0, ...newItems)
+                        this.spliceArray(insertPos, 0, newItems)
                     } else {
                         // explicit key change
                         if (oldValue !== undefined) {
@@ -1328,13 +1337,13 @@ export class RxList<T> extends Computed {
                         }
 
                         if(oldStart! > idxs[0]) {
-                            this.unshift(...source.data.slice(idxs[0], oldStart))
+                            this.spliceArray(0, 0, source.data.slice(idxs[0], oldStart))
                         } else if(oldStart! < idxs[0]) {
                             this.splice(0, idxs[0]-oldStart!)
                         }
 
                         if (oldEnd! < idxs[1]) {
-                            this.push(...source.data.slice(oldEnd, idxs[1]))
+                            this.spliceArray(this.data.length, 0, source.data.slice(oldEnd, idxs[1]))
                         } else if(oldEnd! > idxs[1]) {
                             this.splice(idxs[1] - idxs[0], Infinity)
                         }
@@ -1476,7 +1485,7 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
             deleteItems.forEach((item) => {
                 inners.forEach(inner => inner.deleteIndicator(item))
             })
-            list.splice(argv![0], argv![1], ...newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
+            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
@@ -1548,7 +1557,7 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
         if (triggerInfo.method === 'splice') {
             const {  argv } = triggerInfo
             const newItemsInArgs = argv!.slice(2)
-            list.splice(argv![0], argv![1], ...newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
+            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
 
             const deleteCount = argv![1]
             const insertCount = newItemsInArgs.length
