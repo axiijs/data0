@@ -225,6 +225,8 @@ export class ReactiveEffect extends ManualCleanup {
 
             resultPromise.then(() => {
                 this.isRunningAsync = false
+            }, () => {
+                this.isRunningAsync = false
             })
 
             return resultPromise
@@ -265,9 +267,14 @@ export class ReactiveEffect extends ManualCleanup {
             isFirst = false
             if(implicitContinue === false) break
 
-            const {value, done} = generator.next(lastYieldValue)
-
-            afterRun(done)
+            let value: any
+            let done: boolean | undefined
+            // CAUTION generator.next（用户代码）抛异常时也必须执行 afterRun 复位追踪状态
+            try {
+                ({value, done} = generator.next(lastYieldValue))
+            } finally {
+                afterRun(done)
+            }
             lastYieldValue = value instanceof Promise ? await value : value
             if (done) break
         }
