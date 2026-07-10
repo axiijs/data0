@@ -1,6 +1,6 @@
 import {getDebugName,} from "./debug";
 import {Notifier, TriggerInfo} from './notify'
-import {assert, isAsync, isGenerator, nextTick, uuid, warn} from "./util";
+import {assert, isAsync, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes} from "./operations.js";
@@ -87,6 +87,10 @@ export const  FULL_RECOMPUTE_PHASE = 1
 export const  PATCH_PHASE = 2
 type Phase = typeof FULL_RECOMPUTE_PHASE | typeof PATCH_PHASE
 
+// async 重算的代次 id：只用于新旧比较，自增整数即可（旧实现用随机字符串 uuid，
+// 每次 async 重算分配一个字符串）
+let nextRunEffectId = 1
+
 /**
  * 计算和建立依赖过程。这里因为要支持 async / patch 模式，所以完全覆盖了 ReactiveEffect 的行为。
  * 1. 无 patch 模式，全量计算，每次都会重新收集依赖。
@@ -108,9 +112,23 @@ export class Computed extends ReactiveEffect {
     isPatchAsync? = false
     inPatch = false
     phase: Phase  = FULL_RECOMPUTE_PHASE
-    runtEffectId?: string
+    runtEffectId?: number
     asyncStatus?: Atom<null | boolean | string>
-    status: Atom<StatusType>
+    // CAUTION status 惰性 atom 化：内部状态机只读写 _status 数字字段。
+    //  一次重算要写 status 三次（DIRTY→RECOMPUTING→CLEAN），每次 atom 写都有
+    //  Object.is + trigger 调用 + info 对象分配；而绝大多数 Computed 从来没有人
+    //  响应式地读 status。只有外部真正访问 .status 时才创建 atom 并保持同步
+    //  （与 updatedAt 的惰性化同款手法）。
+    _status!: StatusType
+    declare _statusAtom?: Atom<StatusType>
+    get status(): Atom<StatusType> {
+        return this._statusAtom ?? (this._statusAtom = atom(this._status))
+    }
+    setStatus(next: StatusType) {
+        if (this._status === next) return
+        this._status = next
+        this._statusAtom?.(next)
+    }
 
     // CAUTION 下面的集合/atom 字段全部惰性分配：一个 Computed（以及继承它的 RxList/RxMap/RxSet）
     //  原来无条件预分配 3 个数组、2 个 Set、1 个 WeakMap、1 个 Map、1 个 updatedAt atom，
@@ -120,6 +138,9 @@ export class Computed extends ReactiveEffect {
         return this._triggerInfos ?? (this._triggerInfos = [])
     }
     scheduleRecompute?: DirtyCallback
+    // 自定义调度器是否声明了第三个参数（triggerInfos）。内置调度器不消费，
+    // 不声明就不做数组拷贝。默认值在原型上。
+    declare scheduleNeedsInfos: boolean
     // 用来 patch 模式下，收集新增和删除是产生的 effectFrames
     _effectFramesArray?: ReactiveEffect[][]
     get effectFramesArray(): ReactiveEffect[][] {
@@ -168,7 +189,7 @@ export class Computed extends ReactiveEffect {
     ) {
         super(getter)
         markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
-        this.status = atom(typeof getter === 'function' ? STATUS_DIRTY : STATUS_CLEAN)
+        this._status = typeof getter === 'function' ? STATUS_DIRTY : STATUS_CLEAN
 
         if (!getter) return
 
@@ -191,6 +212,9 @@ export class Computed extends ReactiveEffect {
 
         if (typeof scheduleRecompute === 'function') {
             this.scheduleRecompute = scheduleRecompute
+            // 内置调度器（scheduleNextMicroTask/scheduleNextTick）只声明两个参数，
+            // 只有声明了第三个参数的自定义调度器才需要 triggerInfos 拷贝
+            if (scheduleRecompute.length > 2) this.scheduleNeedsInfos = true
         } else if(this.isAsync && scheduleRecompute !== true) {
             // async 默认用 nextTick 来调度，但是可以通过传递 true 来强制立即执行。
             this.scheduleRecompute = scheduleNextMicroTask
@@ -208,12 +232,11 @@ export class Computed extends ReactiveEffect {
         const getterName = this.getter?.name
         return getterName ? `${constructorName}.${getterName}` : constructorName
     }
-    public cleanPromise?: Promise<any>
     runEffect() {
         let getterResult
 
         if (this.isAsync) {
-            const runEffectId = uuid()
+            const runEffectId = nextRunEffectId++
             this.runtEffectId = runEffectId
 
             // 说明上一次的还在执行中！，立即设为 false，再重新开始
@@ -252,7 +275,7 @@ export class Computed extends ReactiveEffect {
             this.completeTracking(true)
         }
     }
-    callGeneratorGetter(id:string) {
+    callGeneratorGetter(id:number) {
         const runEffectId = id
         const getterContext = this.createGetterContext()
         return this.runGenerator(
@@ -326,15 +349,41 @@ export class Computed extends ReactiveEffect {
         }
 
     }
+    // CAUTION cleanPromise 惰性化：每轮 dirty 都无条件创建 Promise + 闭包，
+    //  而绝大多数 computed 从来没有人 await。改为：进入"未完成的计算周期"时只置
+    //  一个布尔（_cleanExpected），真正的 Promise 在第一次读取 .cleanPromise 时才创建。
+    //  周期结束（resolve/reject）语义与旧实现一致。顺带修复旧实现的一个隐患：
+    //  无人持有 cleanPromise 时 async 出错会产生 unhandled rejection。
+    declare _cleanExpected: boolean
+    declare _cleanPromise?: Promise<any>
     resolveCleanPromise?: (value?: any) => any
     rejectCleanPromise?: (value?: any) => any
+    get cleanPromise(): Promise<any> | undefined {
+        if (this._cleanPromise) return this._cleanPromise
+        if (!this._cleanExpected) return undefined
+        this.createCleanPromise()
+        return this._cleanPromise
+    }
+    // 进入一个"将来会 settle"的计算周期。真正创建 Promise 推迟到读取时。
+    expectCleanPromise() {
+        this._cleanExpected = true
+    }
+    settleCleanPromise() {
+        this._cleanExpected = false
+        this.resolveCleanPromise?.()
+    }
+    settleCleanPromiseWithError(err: any) {
+        this._cleanExpected = false
+        this.rejectCleanPromise?.(err)
+    }
     createCleanPromise() {
+        this._cleanExpected = true
         const cleanAll = () => {
-            delete this.cleanPromise
+            delete this._cleanPromise
             delete this.resolveCleanPromise
             delete this.rejectCleanPromise
         }
-        this.cleanPromise = new Promise((res, rej) => {
+        this._cleanPromise = new Promise((res, rej) => {
             this.resolveCleanPromise = (value:any) => {
                 res(value)
                 cleanAll()
@@ -349,23 +398,23 @@ export class Computed extends ReactiveEffect {
     // 1. 没有 infos 和 immediate 说明是 markDirty，是否启动由自己决定
     // 2. 有 infos 说明是 dep trigger，是否启动由自己决定
     // 3. 没有 infos 但有 immediate 是 onTrack 的强制启动，可能是初始化时。
-    run(infos: TriggerInfo[] =[], immediate = false) {
+    run(infos?: TriggerInfo[], immediate = false) {
         if (this.skipIndicator?.skip) return
-        if (infos.length) {
+        if (infos && infos.length) {
             this.triggerInfos.push(...infos)
         }
 
         // markDirty, initial 状态不需要 mark dirty
-        if (this.status.raw === STATUS_CLEAN) {
+        if (this._status === STATUS_CLEAN) {
             this.dispatch('dirty')
-            this.status(STATUS_DIRTY)
+            this.setStatus(STATUS_DIRTY)
         }
 
 
         // 循环检测，是 sync computed 已经在重算中了又立刻重算，说明重算中又有触发依赖变更的代码。
         // 要么把依赖变更代码移出去，要么把 computed 用 schedule 延迟一下。
         assert(
-            !((immediate || this.immediate) && this.status.raw > STATUS_DIRTY && !this.isAsync),
+            !((immediate || this.immediate) && this._status > STATUS_DIRTY && !this.isAsync),
             'detect recompute triggerred in sync recompute, move trigger code to next tick or it may lead to infinite loop'
         )
 
@@ -375,26 +424,30 @@ export class Computed extends ReactiveEffect {
         //  只需要获取 info 就行了，不需要再次触发 recompute/schedule 了。
         // 2. 在 async 模式下，任何依赖都可以再触发 recompute。
         // (强制)立刻执行 或者 已经在 recompute 中的 async, 会立刻重算。
-        if (immediate || this.immediate || (this.status.raw > STATUS_DIRTY && this.isAsync)) {
+        if (immediate || this.immediate || (this._status > STATUS_DIRTY && this.isAsync)) {
             this.recompute()
         } else {
             // CAUTION 如果是在 sync 的 recompute 阶段触发的。
             //  例如在 autorun/once 里面可能会既依赖 computed, 产生了 computed 变化，用户自己系统通过这种方式达到一个平衡状态。
             //   例如 不断将一个 pending list 中的数据取出来变成 processing。
             //   这时候的第一次 run 会变成 clean，所以 schedule 的 recompute 一定要是 forceRecompute 才能继续执行。
-            const recompute = (this.status.raw > STATUS_DIRTY && !this.isAsync) ? () => this.recompute(true) : this.boundRecompute
-            this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, [...(this._triggerInfos ?? [])])
+            const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? () => this.recompute(true) : this.boundRecompute
+            if (this.scheduleNeedsInfos) {
+                this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, [...(this._triggerInfos ?? [])])
+            } else {
+                this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty)
+            }
         }
 
-        // 如果不是已经开始重算或者立刻开始计算，那么从标记为脏也要创建 cleanPromise
+        // 如果不是已经开始重算或者立刻开始计算，那么从标记为脏也要标记 cleanPromise 周期开始
         // 如果在 scheduleRecompute 或者 recompute 已经开始，那么由里面判断是否要建立 cleanPromise
-        if (this.status.raw === STATUS_DIRTY && !this.cleanPromise ) {
-            this.createCleanPromise()
+        if (this._status === STATUS_DIRTY) {
+            this.expectCleanPromise()
         }
     }
 
     prepareRecompute() {
-        this.status(STATUS_RECOMPUTING)
+        this.setStatus(STATUS_RECOMPUTING)
         // 可以用于清理一些用户自己的副作用。
         // 这里用了两个名字，onCleanup 是为了和 rxList 中的 api 一致。
         // onRecompute 可以用作 log 等其他副作用
@@ -411,8 +464,8 @@ export class Computed extends ReactiveEffect {
     // reject cleanPromise 让 await 方拿到错误，并派发 error 事件。
     handleRecomputeError(err: any) {
         this.inPatch = false
-        this.status(STATUS_DIRTY)
-        this.rejectCleanPromise?.(err)
+        this.setStatus(STATUS_DIRTY)
+        this.settleCleanPromiseWithError(err)
         this.dispatch('error', err)
     }
     finishFullRecompute(result: any) {
@@ -421,8 +474,8 @@ export class Computed extends ReactiveEffect {
         }
 
         this.replaceData(result)
-        this.status(STATUS_CLEAN)
-        this.setUpdatedAt(new Date().getTime())
+        this.setStatus(STATUS_CLEAN)
+        this.setUpdatedAt(Date.now())
 
         if (this.applyPatch) {
             this.phase = PATCH_PHASE
@@ -430,7 +483,7 @@ export class Computed extends ReactiveEffect {
         if (!this.preventEffectSession) {
             Notifier.instance.digestEffectSession()
         }
-        this.resolveCleanPromise?.()
+        this.settleCleanPromise()
         this.dispatch('clean')
     }
     // CAUTION 同步 computed 走完全同步的路径：这样用户 getter 的异常能同步抛到
@@ -445,7 +498,7 @@ export class Computed extends ReactiveEffect {
         // 默认行为，重算并且重新收集依赖
         // CAUTION 用户一定要自己保证在第一次 await 之前读取了所有依赖。
         if (this.isAsync) {
-            if (!this.cleanPromise) this.createCleanPromise()
+            this.expectCleanPromise()
 
             return Promise.resolve(this.runEffect()).then((result: any) => {
                 // 在 async fullRecompute 时，是有可能因为 dep 变化触发新的 trigger 的和新的 fullRecompute 的。
@@ -478,11 +531,11 @@ export class Computed extends ReactiveEffect {
         }
 
         this.inPatch = false
-        this.status(STATUS_CLEAN)
-        this.setUpdatedAt(new Date().getTime())
+        this.setStatus(STATUS_CLEAN)
+        this.setUpdatedAt(Date.now())
         this.sendTriggerInfos()
         this.dispatch('clean')
-        this.resolveCleanPromise?.()
+        this.settleCleanPromise()
     }
     patchRecompute(): any {
         this.inPatch = true
@@ -494,7 +547,7 @@ export class Computed extends ReactiveEffect {
         this.prepareRecompute()
 
         if (this.isPatchAsync) {
-            if (!this.cleanPromise) this.createCleanPromise()
+            this.expectCleanPromise()
 
             return Promise.resolve(this.runPatch()).then((patchResult: any) => {
                 // 虽然 patch 的 recompute 是串行的，但是有可能被用户强制的 fullRecompute 打断。
@@ -545,7 +598,7 @@ export class Computed extends ReactiveEffect {
     }
     // CAUTION 不能声明为 async：同步 computed 的重算（以及其中的用户异常）必须保持同步语义。
     recompute(forceRecompute = false): Promise<any> | undefined {
-        if ((this.status.raw === STATUS_CLEAN && !forceRecompute) || !this.active) return
+        if ((this._status === STATUS_CLEAN && !forceRecompute) || !this.active) return
 
         // 四种类型计算：
         // async/sync * full/patchable
@@ -675,11 +728,11 @@ export class Computed extends ReactiveEffect {
         Notifier.instance.resetTracking()
     }
     destroy(ignoreChildren = false) {
-        assert(ReactiveEffect.activeScopes.at(-1)!== this, 'cannot destroy an active effect inside self')
+        assert(ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1] !== this, 'cannot destroy an active effect inside self')
         this.lastCleanupFn?.()
         delete this.lastCleanupFn
         // 计算尚未完成就被销毁时，解除所有 await cleanPromise 的等待方
-        this.resolveCleanPromise?.()
+        this.settleCleanPromise()
         super.destroy( ignoreChildren)
     }
     collectEffect(): () => CleanupFrame {
@@ -701,6 +754,10 @@ export class Computed extends ReactiveEffect {
         return value
     }
 }
+
+// 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（同 ReactiveEffect 的做法）
+Computed.prototype.scheduleNeedsInfos = false
+Computed.prototype._cleanExpected = false
 
 /**
  * @category Basic
