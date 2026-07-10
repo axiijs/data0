@@ -57,9 +57,15 @@ export function once(fn:() => any, scheduleRerun: DirtyCallback|true = nextJob) 
  */
 export function oncePromise(fn:() => any, scheduleRerun: DirtyCallback|true = nextJob) {
     return new Promise((resolve, reject) => {
-        // TODO 出错？
         once(() => {
-            const result = fn()
+            // fn 抛异常时 reject 并停止监听，否则 promise 永远不会 settle
+            let result
+            try {
+                result = fn()
+            } catch (err) {
+                reject(err)
+                return true
+            }
             if (result) {
                 resolve(result)
             }

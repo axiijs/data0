@@ -77,8 +77,16 @@ export class LinkedList<T extends object> implements Iterable<ListNode<T>>{
         }
 
 
+        // 清理 itemToNode 中被移除的映射，避免 getNodeByItem 返回已脱链的节点
+        let current: ListNode<T>|undefined = startNode
+        while (current) {
+            this.itemToNode.delete(current.item)
+            if (current === endNode) break
+            current = current.next
+        }
+
         Notifier.instance.trigger(this, TriggerOpTypes.METHOD, { method:'removeBetween', argv: [startNode, endNode]})
-        Notifier.instance.trigger(this, TriggerOpTypes.ADD, { key: ITERATE_KEY})
+        Notifier.instance.trigger(this, TriggerOpTypes.DELETE, { key: ITERATE_KEY})
     }
 
     getNodeByItem(item: T){
