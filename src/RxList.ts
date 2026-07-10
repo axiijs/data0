@@ -215,15 +215,11 @@ export class RxList<T> extends Computed {
         return result
     }
     // 显式 set 某一个 index 的值
+    // CAUTION set 的契约是"替换已存在的稠密行"。越界/负数/非整数 key 属于 out-of-contract 用法：
+    //  行为与普通数组赋值一致（可能产生稀疏数组、length computed 不会更新），trigger 原样透传
+    //  key，由下游（axii/axle 等渲染框架）自行拒绝或归一化。不要在这里改走 splice 语义：
+    //  下游的结构化错误契约（以及 set(Infinity) 这类 key）都依赖透传行为。
     set(index: number, value: T) {
-        // CAUTION 越界写会改变 length，走 splice 语义才能让 length/派生结构收到正确的增量信息。
-        //  注意判断必须在写入 data 之前做，写入后 length 已经被扩展了。
-        if (index > this.data.length - 1) {
-            const filler = new Array(index - this.data.length)
-            this.splice(this.data.length, 0, ...filler, value)
-            return undefined
-        }
-
         const oldValue = this.data[index]
         this.data[index] = value
 

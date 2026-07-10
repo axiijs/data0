@@ -226,22 +226,34 @@ describe('slice with reorder', () => {
     })
 })
 
-describe('RxList.set out of bounds', () => {
-    test('length and iteration stay consistent', () => {
+describe('RxList.set out-of-contract keys pass through unchanged', () => {
+    // CAUTION 这是下游渲染框架（axii/axle）依赖的契约：越界/负数/非整数 key 的 set()
+    //  行为与普通数组赋值一致，triggerInfo 原样透传 key，由下游自行拒绝或归一化。
+    //  axii 的 fatalBugs13(F47) 与 axle 的 data0-contract/splice-normalization 测试都锁定了该行为。
+    test('out-of-range set behaves like plain array assignment and passes the raw key through', () => {
         const list = new RxList<number|undefined>([1])
-        const len = list.length
-        expect(len()).toBe(1)
-        list.set(3, 42)
-        expect(list.data.length).toBe(4)
-        expect(len()).toBe(4)
-        expect(list.data).toEqual([1, undefined, undefined, 42])
-    })
+        const receivedKeys: unknown[] = []
+        const derived = new RxList(
+            function computation(this: RxList<unknown>) {
+                this.manualTrack(list, 'method' as any, 'method' as any)
+                this.manualTrack(list, 'explicit_key_change' as any, 'explicit_key_change' as any)
+                return list.data.slice()
+            },
+            function applyPatch(_data, triggerInfos) {
+                triggerInfos.forEach(info => receivedKeys.push(info.key))
+            }
+        )
+        expect(derived.data).toEqual([1])
 
-    test('downstream map receives the extension', () => {
-        const list = new RxList<number>([1])
-        const mapped = list.map(item => (item ?? 0) * 10)
-        list.set(2, 5)
-        expect(mapped.data).toEqual([10, 0, 50])
+        list.set(3, 42)
+        // 与数组赋值语义一致：data 被扩展成稀疏形态
+        expect(list.data.length).toBe(4)
+        expect(list.data[3]).toBe(42)
+        // key 原样透传（EXPLICIT_KEY_CHANGE 订阅方收到一条）
+        expect(receivedKeys).toEqual([3])
+
+        list.set(-1, 9)
+        expect(receivedKeys.slice(1)).toEqual([-1])
     })
 })
 
