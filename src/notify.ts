@@ -1,7 +1,7 @@
 import {createCompactDep, createDep, Dep, newTracked, wasTracked} from "./dep";
 import {TrackOpTypes, TriggerOpTypes} from "./operations";
-import {Computed, getComputedInternal} from "./computed";
-import {assert, extend, isArray, isIntegerKey, isIntegerKeyQuick, toNumber} from "./util";
+import {Computed} from "./computed";
+import {assert, extend, isArray, isIntegerKey, toNumber} from "./util";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {
   trackRetainedDepEffectAdded,
@@ -79,7 +79,6 @@ export class Notifier {
   trackTargetFrames: any[][] = []
   // 被 track 的对象 {target -> key -> dep}
   targetMap= new WeakMap<any, KeyToDepMap>()
-  arrayExplicitKeyDepCount = new WeakMap<any, number>()
   shouldTrack = true
   effectTrackDepth = 0
   shouldTrigger: boolean = true
@@ -111,26 +110,38 @@ export class Notifier {
     if (this.sessionDepth > 0) return
 
     this.isDigesting = true
-    const effectItor = this.effectsInSession[Symbol.iterator]()
-    let effect: ReactiveEffect | undefined
-    while(effect = effectItor.next().value) {
-        const infos = this.effectsInSessionPayloads.get(effect)
-        effect.run(infos)
-        this.effectsInSession.delete(effect)
-        this.effectsInSessionPayloads.delete(effect)
+    // CAUTION try/finally：任何一个 effect 抛异常都必须复位 session 状态，
+    //  否则 notifier 永久卡在 session 中，后续所有 trigger 都会被吞掉。
+    try {
+        const effectItor = this.effectsInSession[Symbol.iterator]()
+        let effect: ReactiveEffect | undefined
+        while(effect = effectItor.next().value) {
+            const infos = this.effectsInSessionPayloads.get(effect)
+            effect.run(infos)
+            this.effectsInSession.delete(effect)
+            this.effectsInSessionPayloads.delete(effect)
+        }
+        if(__DEV__) {
+          assert(this.effectsInSession.size === 0, 'effectsInSession should be empty')
+        }
+    } finally {
+        if (this.effectsInSession.size) {
+            for(const effect of this.effectsInSession) {
+                this.effectsInSessionPayloads.delete(effect)
+            }
+            this.effectsInSession.clear()
+        }
+        this.inEffectSession = false
+        this.isDigesting = false
     }
-    if(__DEV__) {
-      assert(this.effectsInSession.size === 0, 'effectsInSession should be empty')
-    }
-    this.inEffectSession = false
-    this.isDigesting = false
   }
   collectTrackTarget() {
     const frame:any[] = []
     this.trackTargetFrames.push(frame)
     return () => {
       assert(frame === this.trackTargetFrames.at(-1), 'track target frame error.')
-      return frame
+      // CAUTION 必须弹栈，否则 frame 永久驻留并继续收集后续所有 track target（内存泄漏）。
+      return this.trackTargetFrames.pop()!
     }
   }
   getPrimitiveAtomDep(target: object) {
@@ -147,14 +158,7 @@ export class Notifier {
     return dep
   }
   trackPrimitiveAtomValue = (target: object) => {
-    // 为了触发 dirty computed 的 recompute
-    const computedInternal = getComputedInternal(target)
     const activeEffect = ReactiveEffect.activeScopes.at(-1)
-    if (computedInternal && computedInternal !== activeEffect) {
-      // CAUTION 这里即使没有 activeEffect 也要执行，因为 onTrack 要触发 computed 计算。
-      computedInternal.onTrack(activeEffect)
-    }
-
     if (!activeEffect || !this.shouldTrack) return
     if (__DEV__) {
       assert(!(activeEffect instanceof Computed && target === activeEffect.data), 'should not read self in computed')
@@ -172,14 +176,7 @@ export class Notifier {
     return dep
   }
   track = (target: object, type: TrackOpTypes, key: unknown) => {
-    // 为了触发 dirty computed 的 recompute
-    const computedInternal = target instanceof Computed ? target: getComputedInternal(target)
     const activeEffect = ReactiveEffect.activeScopes.at(-1)
-    if (computedInternal &&  computedInternal!== activeEffect) {
-      // CAUTION 这里即使没有 activeEffect 也要执行，因为 onTrack 要触发 computed 计算。
-      computedInternal.onTrack(activeEffect)
-    }
-
     if (!activeEffect || !this.shouldTrack) return
     // CAUTION 不能 track 自己。computed 在第二次执行的时候会有一个 replace 行为，会
     if (__DEV__) {
@@ -201,14 +198,6 @@ export class Notifier {
         ? { effect: activeEffect, target, type, key }
         : undefined
 
-
-    // CAUTION 这是为了优化 unshift 性能而记录的。因为 array 是有序索引
-    //  我们没有在重新计算的时候去 -count，因为目前的数据结构很难再重新 run 的时候拿到 target，我们目前只拿到了 target->key->dep
-    //  但是实际情况中，可能很少会有“有时显式监听key，有时又不得情况”，所以暂时这样也可行。
-    if (isArray(target) && isIntegerKeyQuick(key)) {
-        let count = this.arrayExplicitKeyDepCount.get(target) || 0
-        this.arrayExplicitKeyDepCount.set(target, ++count)
-    }
     // 手动收集的场景。
     this.trackTargetFrames.at(-1)?.push(target)
 
