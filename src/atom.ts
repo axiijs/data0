@@ -55,7 +55,8 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
         // } else {
         //     value = newValue
         // }
-        if (value === newValue) return
+        // CAUTION Object.is 而不是 ===：NaN 重复写入不应该反复触发
+        if (Object.is(value, newValue)) return
         const oldValue = value
         value = newValue
         Notifier.instance.trigger(finalProxy, TriggerOpTypes.ATOM, { key: 'value', newValue, oldValue})
@@ -164,7 +165,8 @@ function createPrimitiveAtom<T>(initValue: T, name?: string) {
         }
 
         // CAUTION 和 Proxy atom 保持一致，不再支持 newValue 为 function 的 updater 语义。
-        if (updater[PRIMITIVE_ATOM_VALUE] === newValue) return
+        // Object.is 而不是 ===：NaN 重复写入不应该反复触发
+        if (Object.is(updater[PRIMITIVE_ATOM_VALUE], newValue)) return
         const oldValue = updater[PRIMITIVE_ATOM_VALUE]
         updater[PRIMITIVE_ATOM_VALUE] = newValue as T
         Notifier.instance.triggerPrimitiveAtomValue(updater, { key: 'value', newValue, oldValue})
