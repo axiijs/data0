@@ -226,11 +226,13 @@ export function uuid() {
 export function replace(source: any, nextSourceValue: any) {
     const rawSource = source
     if (Array.isArray(source)) {
-        source.splice(0, Infinity, ...nextSourceValue)
+        spliceMany(source, 0, Infinity, nextSourceValue)
     } else if (isPlainObject(source)) {
-        const nextKeys = Object.keys(nextSourceValue)
-        const keysToDelete = Object.keys(rawSource).filter(k => !nextKeys.includes(k))
-        keysToDelete.forEach((k) => delete (source as { [k: string]: any })[k])
+        // Set 查找而不是 includes：对象 key 多时 filter+includes 是 O(n²)
+        const nextKeys = new Set(Object.keys(nextSourceValue))
+        for (const k of Object.keys(rawSource)) {
+            if (!nextKeys.has(k)) delete (source as { [k: string]: any })[k]
+        }
         Object.assign(source, nextSourceValue)
     } else if (source instanceof Map) {
 
@@ -263,4 +265,42 @@ export function replace(source: any, nextSourceValue: any) {
 
 export function nextTick(fn: () => any) {
     Promise.resolve().then(fn)
+}
+
+// 超过该数量的插入不再走 native splice 的 spread 传参。
+// V8 的实参上限约 65k，留足余量；小批量仍用 native splice（快于手动搬移）。
+const SPLICE_SPREAD_LIMIT = 8192
+
+/**
+ * 语义等同 `arr.splice(start, deleteCount, ...items)`，但 items 以数组传入：
+ * 大批量插入（如 10 万行 replaceData）用 spread 传实参会直接 RangeError 爆栈，
+ * 且实参传递本身是一次 O(n) 拷贝。大批量走 copyWithin 手动搬移。
+ */
+export function spliceMany<T>(arr: T[], start: number, deleteCount: number, items?: T[]): T[] {
+    const insertCount = items ? items.length : 0
+    if (insertCount === 0) {
+        return arr.splice(start, deleteCount)
+    }
+    if (insertCount <= SPLICE_SPREAD_LIMIT) {
+        return arr.splice(start, deleteCount, ...items!)
+    }
+
+    // 按 Array.prototype.splice 规范归一化 start/deleteCount
+    const len = arr.length
+    const s = start < 0 ? Math.max(len + start, 0) : Math.min(start, len)
+    const dc = Math.min(Math.max(deleteCount, 0), len - s)
+
+    const removed = arr.slice(s, s + dc)
+    const diff = insertCount - dc
+    if (diff > 0) {
+        arr.length = len + diff
+        arr.copyWithin(s + insertCount, s + dc, len)
+    } else if (diff < 0) {
+        arr.copyWithin(s + insertCount, s + dc, len)
+        arr.length = len + diff
+    }
+    for (let i = 0; i < insertCount; i++) {
+        arr[s + i] = items![i]
+    }
+    return removed
 }

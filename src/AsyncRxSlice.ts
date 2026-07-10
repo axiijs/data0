@@ -30,7 +30,7 @@ export class AsyncRxSlice<T> extends RxList<T>{
         this.loadError(null)
         return this.getRemoteData().then((data) => {
             if (this.fetchReceipt !== thisReceipt) return
-            this.splice(0, Infinity, ...data)
+            this.spliceArray(0, Infinity, data)
         }).catch(err => {
             if (this.fetchReceipt !== thisReceipt) return
             this.loadError(err)
@@ -47,12 +47,12 @@ export class AsyncRxSlice<T> extends RxList<T>{
             return
         }
         if (replace) {
-            this.splice(0, Infinity, ...newData)
+            this.spliceArray(0, Infinity, newData)
         } else {
             if (fetchBeforeCursor) {
-                this.unshift(...newData)
+                this.spliceArray(0, 0, newData)
             }else {
-                this.push(...newData)
+                this.spliceArray(this.data.length, 0, newData)
             }
         }
         this.isLoading(false)

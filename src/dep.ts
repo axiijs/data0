@@ -37,12 +37,17 @@ export const createDep = (effects?: ReactiveEffect[]): Dep => {
  * Most primitive atoms only have one subscriber in Axii's light binding path.
  * Keep that common case out of a native Set's backing storage, while preserving
  * the small Set-like surface used by the notifier.
+ *
+ * single/overflow are exposed (internal) so the notifier's trigger fast path can
+ * dispatch to a lone subscriber without creating a generator + array snapshot.
  */
-class CompactDep implements Dep {
+export class CompactDep implements Dep {
   w = 0
   n = 0
-  private single?: ReactiveEffect
-  private overflow?: Set<ReactiveEffect>
+  /** @internal 0/1 个订阅者时的存储；升级到 >=2 时迁入 overflow */
+  single?: ReactiveEffect
+  /** @internal */
+  overflow?: Set<ReactiveEffect>
 
   constructor(effects?: ReactiveEffect[]) {
     effects?.forEach(effect => this.add(effect))
@@ -94,6 +99,14 @@ class CompactDep implements Dep {
 }
 
 export const createCompactDep = (effects?: ReactiveEffect[]): Dep => new CompactDep(effects)
+
+// dep 是否已无任何订阅者（订阅者退订后 dep 对象本身还留在各处的记账 Map 里）
+export const isDepEmpty = (dep: Dep): boolean => {
+    if (dep instanceof CompactDep) {
+        return dep.single === undefined && (dep.overflow === undefined || dep.overflow.size === 0)
+    }
+    return (dep as unknown as Set<ReactiveEffect>).size === 0
+}
 
 export const wasTracked = (dep: Dep): boolean => (dep.w & Notifier.trackOpBit) > 0
 

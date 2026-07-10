@@ -6,13 +6,14 @@ import {
     destroyComputed,
     DirtyCallback,
     GetterType,
-    setComputedRetainedDiagnosticSource
+    setComputedRetainedDiagnosticSource,
+    STATUS_CLEAN
 } from "./computed.js";
 import {Atom, atom, isAtom} from "./atom.js";
-import {Dep} from "./dep.js";
-import {InputTriggerInfo, ITERATE_KEY, Notifier, TriggerInfo} from "./notify.js";
+import {Dep, isDepEmpty} from "./dep.js";
+import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert} from "./util.js";
+import {assert, spliceMany} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -31,9 +32,42 @@ type MapContext = {
     onCleanup: (fn: MapCleanupFn) => void
 }
 
-function shouldKeepMapItemEffect(effect: ReactiveEffect) {
-    return effect.deps.length > 0 || effect.hasChildren()
+/**
+ * RxList.map 的行级依赖探测 effect（每个 map 产物复用一个实例）。
+ *
+ * 旧实现为每一行 new 一个 Computed、run 一遍、再对（最常见的）无依赖行 destroy，
+ * 一行的固定成本是完整的 Computed 构造 + 重算状态机 + 销毁。探测方案下 mapFn 仍然
+ * 恰好执行一次（在 probe 的 tracking 作用域里），只有真正捕获到依赖/子 effect 的行
+ * 才升级为常驻的行级 Computed（订阅关系原样转移，见 transferCapturesTo），
+ * 无依赖行的成本只剩 prepareTracking/completeTracking 一对。
+ */
+class MapItemDependencyProbe extends ReactiveEffect {
+    fn?: () => any
+    constructor() {
+        super()
+        this.active = true
+    }
+    callGetter() {
+        return this.fn!()
+    }
+    probe(fn: () => any) {
+        // 上一次 mapFn 抛异常时 deps 可能残留，复用前防御性清理
+        if (this.deps.length) this.cleanup()
+        this.fn = fn
+        try {
+            return this.run()
+        } finally {
+            this.fn = undefined
+        }
+    }
+    hasCaptures() {
+        return this.deps.length > 0 || this.hasChildren()
+    }
 }
+
+// 无依赖行共享同一个 frozen 空 frame，长列表少一次每行的空数组分配；
+// freeze 保证未来误往共享 frame push 会立刻抛错而不是跨行污染。
+const EMPTY_ITEM_FRAME = Object.freeze([]) as unknown as ReactiveEffect[]
 
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
@@ -97,6 +131,22 @@ export class RxList<T> extends Computed {
     }
     /**
      * @internal
+     * 清扫已无订阅者的 index dep，返回是否仍有活跃订阅。
+     * CAUTION 悬崖修复：at() 建立的 index dep 在 effect 全部退订后 Map entry 仍在，
+     *  旧实现据此永久走 splice 的逐 index 触发慢路径（也是缓慢的内存增长）。
+     *  订阅者退订不会回调 RxList（Notifier 不知道 dep 的归属），所以在每次
+     *  结构变更入口做一次 O(订阅数) 的惰性清扫——这些 entry 本来也要被遍历。
+     */
+    pruneIndexKeyDeps(): boolean {
+        const indexDeps = this._indexKeyDeps
+        if (!indexDeps || indexDeps.size === 0) return false
+        for (const [index, dep] of indexDeps) {
+            if (isDepEmpty(dep)) indexDeps.delete(index)
+        }
+        return indexDeps.size > 0
+    }
+    /**
+     * @internal
      */
     atomIndexes? :Atom<number>[]
     /**
@@ -117,14 +167,14 @@ export class RxList<T> extends Computed {
         if (this.getter) {
             this.run([], true)
         }
-        this.createComputedMetas()
     }
     /**
      * @internal
      */
     replaceData(newData: any[]) {
         // 这里的 newData type 为 any[]，是为了让子类能覆写，实现 replaceData 的时候才进行数据转换。
-        this.splice(0, this.data.length, ...newData)
+        // CAUTION 数组参数版：spread 传参对大列表（>65k）会超出实参上限直接 RangeError。
+        this.spliceArray(0, this.data.length, newData)
     }
 
     push(...items: T[]) {
@@ -133,7 +183,7 @@ export class RxList<T> extends Computed {
     clear() {
         const length = this.data.length
         if (length === 0) return []
-        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         const hasAtomIndexes = !!this.atomIndexes
         if (length === 1 || hasIndexKeyDeps || hasAtomIndexes) return this.splice(0, length)
 
@@ -155,19 +205,24 @@ export class RxList<T> extends Computed {
         return this.splice(0, 0, ...items)
     }
     splice( start: number, deleteCount: number, ...items: T[]) {
+        return this.spliceArray(start, deleteCount, items)
+    }
+    // splice 的数组参数版：内部所有批量写入都走这里，规避 spread 实参上限
+    // （大列表 replaceData/concat 等场景 spread 会 RangeError）与 O(n) 实参拷贝。
+    spliceArray(start: number, deleteCount: number, items: T[] = []) {
         this.pauseAutoTrack()
-        // Notifier.instance.createEffectSession()
 
         const originLength = this.data.length
         const deleteItemsCount = Math.min(deleteCount, originLength - start)
-        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
+        // 清扫空 index dep：曾被 at() 订阅、现已全部退订的列表要能回到 fast path
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         const hasAtomIndexes = !!this.atomIndexes
         const canUseMetadataFastPath = !hasIndexKeyDeps && !hasAtomIndexes
         const isPureAppend = start === originLength && deleteCount === 0
         const isPureClear = start === 0 && deleteCount >= originLength && items.length === 0
 
         if (canUseMetadataFastPath && (isPureAppend || isPureClear)) {
-            const result = this.data.splice(start, deleteCount, ...items)
+            const result = spliceMany(this.data, start, deleteCount, items)
             this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
             this.sendTriggerInfos()
             this.resetAutoTrack()
@@ -178,38 +233,46 @@ export class RxList<T> extends Computed {
         // CAUTION 不需要触发 length 的变化，因为获取  length 的时候得到就已经是个 computed 了。
         const newLength = originLength - deleteItemsCount + items.length
         const changedIndexEnd = deleteItemsCount !== items.length ? newLength : start + items.length
-        const oldValues: T[] | undefined = hasIndexKeyDeps ? [] : undefined
+        // CAUTION 只对"实际有订阅者且落在受影响区间"的 index 记录 oldValue / 触发 SET：
+        //  旧实现对 [start, changedIndexEnd) 逐 index 触发，一次中段 splice 是 O(移动范围)
+        //  次 trigger；订阅通常是稀疏的（axii 每行订阅自己的 index），按订阅遍历后
+        //  复杂度变为 O(订阅数)。触发保持升序，与旧实现的可观察顺序一致。
+        let affected: [index: number, oldValue: T][] | undefined
         if (hasIndexKeyDeps) {
-            for (let i = start; i < changedIndexEnd; i++) {
-                oldValues![i] = this.data[i]
+            for (const index of this._indexKeyDeps!.keys()) {
+                if (index >= start && index < changedIndexEnd) {
+                    (affected ?? (affected = [])).push([index, this.data[index]])
+                }
+            }
+            if (affected && affected.length > 1) {
+                affected.sort((a, b) => a[0] - b[0])
             }
         }
-        const result = this.data.splice(start, deleteCount, ...items)
+        const result = spliceMany(this.data, start, deleteCount, items)
 
 
         // CAUTION 无论有没有 indexKeyDeps 都要触发 Iterator_Key，
         //  特别这里注意，我们利用传了 key 就会把对应 key 的 dep 拿出来的特性来 trigger ITERATE_KEY.
         //  CAUTION 一定先 trigger method，这样可能后面某些被删除的 atomIndexes 变化就不需要了。
         this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
-        // 只有当有 indexKeyDeps 的时候才需要手动查找 dep 和触发，这样效率更高
-        if (hasIndexKeyDeps){
-            for (let i = start; i < changedIndexEnd; i++) {
-                this.trigger(this, TriggerOpTypes.SET, { key: i, newValue: this.data[i], oldValue: oldValues![i]})
+        if (affected) {
+            for (const [index, oldValue] of affected) {
+                this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: this.data[index], oldValue })
             }
         }
 
         // CATION 特别注意这里 atomIndexes 的变化也要先 catch 住
-        Notifier.instance.createEffectSession()
+        notifier.createEffectSession()
         this.sendTriggerInfos()
 
         if (this.atomIndexes) {
-            this.atomIndexes.splice(start, deleteCount, ...items.map((_, index) => atom(index + start)))
+            spliceMany(this.atomIndexes, start, deleteCount, items.map((_, index) => atom(index + start)))
             for (let i = start; i <changedIndexEnd; i++) {
                 // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
                 this.atomIndexes[i]?.(i)
             }
         }
-        Notifier.instance.digestEffectSession()
+        notifier.digestEffectSession()
 
         this.resetAutoTrack()
         return result
@@ -237,9 +300,11 @@ export class RxList<T> extends Computed {
         // 要不要触发 set 语义呢？理论上是需要的
         const originItems = originIndexes.map(index => this.data[index])
         const originItemsInNewIndexes = newIndexes.map(index => this.data[index])
+        // 只对实际有订阅者的 index 触发 SET（清扫见 pruneIndexKeyDeps）
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         newIndexes.forEach((newIndex, i) => {
             this.data[newIndex]= originItems[i]
-            if (this._indexKeyDeps?.size) {
+            if (hasIndexKeyDeps && this._indexKeyDeps!.has(newIndex)) {
                 this.trigger(this, TriggerOpTypes.SET, { key: newIndex, newValue: originItems[i], oldValue: originItemsInNewIndexes[i]})
             }
             if (oldIndexAtoms) {
@@ -312,6 +377,29 @@ export class RxList<T> extends Computed {
         }
         return low
     }
+    // 在按 compare 有序的数组中定位与 item 引用相等的元素：
+    // 二分到相等区间后线性扫描（同序元素可能有多个）。找不到（比如元素的排序键
+    // 在删除前被外部改写、数组已不完全有序）返回 -1，调用方回退 indexOf 兜底。
+    private static binarySearchFind<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
+        let low = 0
+        let high = arr.length
+        while (low < high) {
+            const mid = (low + high) >>> 1
+            if (compare(arr[mid], item) < 0) {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        for (let i = low; i < arr.length && compare(arr[i], item) === 0; i++) {
+            if (arr[i] === item) return i
+        }
+        return -1
+    }
+    private static locateInSorted<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
+        const found = RxList.binarySearchFind(arr, item, compare)
+        return found !== -1 ? found : arr.indexOf(item)
+    }
 
     public toSorted(compare?: (a: T, b: T) => number): RxList<T> {
         const source = this
@@ -338,10 +426,10 @@ export class RxList<T> extends Computed {
                     const { method, argv, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
-                        // 1) remove items
+                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
                         const deletedItems = (methodResult as T[]) || []
                         deletedItems.forEach((item) => {
-                            const idx = this.data.indexOf(item)
+                            const idx = RxList.locateInSorted(this.data, item, compare!)
                             if (idx !== -1) {
                                 this.splice(idx, 1)
                             }
@@ -355,7 +443,7 @@ export class RxList<T> extends Computed {
                     } else {
                         // explicit key change: remove old, insert new
                         if (oldValue !== undefined) {
-                            const idx = this.data.indexOf(oldValue as T)
+                            const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
                             if (idx !== -1) {
                                 this.splice(idx, 1)
                             }
@@ -371,7 +459,7 @@ export class RxList<T> extends Computed {
     }
     // CAUTION 这里手动 track index dep 的变化，是为了在 splice 的时候能手动去根据订阅的 index dep 触发，而不是直接触发所有的 index key。
     at(index: number): T|undefined{
-        const dep = Notifier.instance.track(this, TrackOpTypes.GET, index)
+        const dep = notifier.track(this, TrackOpTypes.GET, index)
         if (dep && !this.indexKeyDeps.has(index)) {
             this.indexKeyDeps.set(index, dep)
         }
@@ -379,33 +467,27 @@ export class RxList<T> extends Computed {
         return this.data[index]
     }
 
+    // CAUTION 遍历型读取只 track ITERATE_KEY，不再为每个 index 建 dep：
+    //  所有变更路径都必然通知 ITERATE_KEY 订阅者（splice/reorder → METHOD(key=ITERATE_KEY)，
+    //  set → SET 会附带 ITERATE_KEY dep，见 notify.trigger 的 SET case），逐 index track
+    //  是纯冗余——一次 forEach 会建立 O(n) 个 index dep（重算时 O(n) 的 marker 双遍历），
+    //  并把列表永久推入 splice 的逐 index 触发慢路径。
+    //  index 级细粒度依赖仍由显式 at() 提供。
     forEach(handler: (item: T, index: number) => void) {
-        for (let i = 0; i < this.data.length; i++) {
-            // 转发到 at 上实现 track
-            handler(this.at(i)!, i)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        const data = this.data
+        for (let i = 0; i < data.length; i++) {
+            handler(data[i], i)
         }
-        // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
     }
     /**
      * @internal
      */
-    [Symbol.iterator]() {
-        let index = 0;
-        let data = this.data;
-        // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
-        return {
-            next: () => {
-                if (index < data.length) {
-                    // 转发到 at 上实现 track index
-                    const value = this.at(index)
-                    return { value, done: false };
-                } else {
-                    return { done: true };
-                }
-            }
-        };
+    [Symbol.iterator](): IterableIterator<T> {
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        // 直接用原生数组迭代器（引擎优化，不逐步分配 result 对象）。
+        // 旧的手写 iterator 从不递增 index，for...of 非空列表会死循环。
+        return this.data[Symbol.iterator]()
     }
     /**
      * @internal
@@ -427,7 +509,7 @@ export class RxList<T> extends Computed {
     // reactive methods and attr
     map<U>(mapFn: (item: T, index: Atom<number>, context:MapContext) => U, options?: MapOptions<U>) : RxList<U>{
         // CAUTION 生成数据结构的方法应该都不 track Iterable_Key。不然可能导致在 computed 里面的 map 方法被反复执行，这算是一种泄露了。
-        // Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        // notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
 
         const source = this
         const useIndex = mapFn.length>1 && !options?.ignoreIndex
@@ -442,6 +524,39 @@ export class RxList<T> extends Computed {
         // CAUTION cleanupFns 是用户自己用 context.onCleanup 收集的，因为可能用到 mapFn 中的局部变量
         //  如果可以直接从 mapFn return value 中来销毁副作用，那么应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能，不需要建立 cleanupFns 数组。
         let cleanupFns: MapCleanupFn[]|undefined
+        // 行级依赖探测 effect：整个 map 产物复用一个实例（说明见类定义处）。
+        // detached 创建：不能被 map computation 收集为 child。
+        let itemProbe: MapItemDependencyProbe | undefined
+
+        // 探测一行：mapFn 恰好执行一次；捕获到依赖/子 effect 时升级为常驻的行级
+        // Computed（探测期间建立的订阅原样转移），无依赖行零对象分配。
+        // 返回 [mapFn 返回值, 行级 effect frame]。
+        function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined): [U, ReactiveEffect[]] {
+            const probe = itemProbe ?? (itemProbe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe()))
+            const value = probe.probe(() => mapFn(item, source.atomIndexes?.[index]!, mapContext!)) as U
+            if (!probe.hasCaptures()) return [value, EMPTY_ITEM_FRAME]
+
+            // CAUTION 只有依赖变化需要重算的行才需要 index atom（重算时行的位置可能已变化）；
+            //  仅含子 effect 的行（作为 frame 容器）不会被 trigger，getter 不会执行。
+            let newItemIndex: Atom<number>|undefined
+            if (probe.deps.length > 0) {
+                if (!addedAtomIndexesDep) {
+                    source.addAtomIndexesDep()
+                    addedAtomIndexesDep = true
+                }
+                newItemIndex = source.atomIndexes![index]!
+            }
+            const rowComputed = new Computed(() => {
+                // CAUTION 特别注意这里面的变量，我们只希望 track 用户 mapFn 里面用到的外部 reactive 对象，不希望 track 到自己的 key/index。
+                if (newItemIndex) {
+                    list.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw], newItemIndex, mapContext!))
+                }
+            }, undefined, true)
+            probe.transferCapturesTo(rowComputed)
+            // 探测已经完成了首次计算，行级 Computed 从 CLEAN 开始（下次依赖触发时正常重算）
+            rowComputed._status = STATUS_CLEAN
+            return [value, [rowComputed]]
+        }
 
         return new RxList(
             function computation(this: RxList<U>) {
@@ -450,47 +565,23 @@ export class RxList<T> extends Computed {
                 cleanupFns = useContext ? [] : undefined
 
                 const result: U[] = []
-                source.data.forEach((_, i) => {
+                const sourceData = source.data
+                for (let i = 0; i < sourceData.length; i++) {
                     const mapContext: MapContext|undefined = useContext ? {
                         onCleanup(fn: MapCleanupFn) {
                             cleanupFns![i] = fn
                         }
                     } : undefined
 
-                    // 注意这里逻辑有点复杂。如果内部有依赖，会发生重新计算，那么重计算时就要用 itemIndex 去更新。因为 index 是可能变化的。
-                    let newItemIndex: Atom<number>|undefined
                     if (options?.skipItemEffect) {
-                        result[i] = mapFn(source.data[i], source.atomIndexes?.[i]!, mapContext!)
+                        result[i] = mapFn(sourceData[i], source.atomIndexes?.[i]!, mapContext!)
                         this.effectFramesArray![i] = []
                     } else {
-                        const newItemRun = new Computed(() => {
-                            //有依赖并且是冲计算，就一定有 newItemIndex。
-                            // CAUTION 特别注意这里面的变量，我们只希望  track 用户 mapFn 里面用到的外部  reactive 对象，不希望 track 到自己的 key/index。
-                            if(newItemIndex) {
-                                this.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw], newItemIndex, mapContext!))
-                            } else {
-                                result[i] = mapFn(source.data[i], source.atomIndexes?.[i]!, mapContext!)
-                            }
-                        }, undefined, true)
-
-                        newItemRun.run()
-
-                        if (newItemRun.hasDeps()) {
-                            if (!addedAtomIndexesDep) {
-                                source.addAtomIndexesDep()
-                                addedAtomIndexesDep = true
-                            }
-                            newItemIndex = source.atomIndexes![i]!
-                        }
-                        if (shouldKeepMapItemEffect(newItemRun)) {
-                            this.effectFramesArray![i] = [newItemRun] as ReactiveEffect[]
-                        } else {
-                            newItemRun.destroy()
-                            this.effectFramesArray![i] = []
-                        }
+                        const [value, frame] = runItemAndCollectEffect(this, sourceData[i], i, mapContext)
+                        result[i] = value
+                        this.effectFramesArray![i] = frame
                     }
-
-                })
+                }
 
                 return result
             },
@@ -498,13 +589,17 @@ export class RxList<T> extends Computed {
                 triggerInfos.forEach((triggerInfo) => {
 
                     const { method , argv  ,key } = triggerInfo
-                    assert((method === 'splice' || key !== undefined), 'trigger info has no method and key')
-                    assert(triggerInfo.source === source, 'unexpected triggerInfo source')
+                    if (__DEV__) {
+                        assert((method === 'splice' || key !== undefined), 'trigger info has no method and key')
+                        assert(triggerInfo.source === source, 'unexpected triggerInfo source')
+                    }
 
                     options?.beforePatch?.(triggerInfo)
 
                     if (method === 'splice') {
                         // CAUTION 这里重新从已经改变的  source 去读，才能重新被 reactive proxy 处理，和全量计算时收到的参数一样
+                        // CAUTION 第一次计算一定要使用 newItemsInArg 作为参数：有可能一批 triggerInfo 里
+                        //  有多次元素位置变化，此时很难从 source.data 推断元素的新位置。
                         const newItemsInArgs = argv!.slice(2)
                         const effectFrames: ReactiveEffect[][] = []
                         const newCleanups: MapCleanupFn[] = []
@@ -516,41 +611,18 @@ export class RxList<T> extends Computed {
                             } : undefined
                             let newItem: U
                             const newIndex = index + argv![0]!
-                            let newItemIndex: Atom<number>|undefined
                             if (options?.skipItemEffect) {
                                 newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
                                 effectFrames![index] = []
                             } else {
-                                const newItemRun = new Computed(() => {
-                                    // newItemIndex 是后面为每一个元素生成的，一开始是没有的。这里如果有，说明是内部有依赖变换发生的更新，已经不是第一次计算了。
-                                    if (newItemIndex) {
-                                        this.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw]!, newItemIndex, mapContext!))
-                                    } else {
-                                        // 第一次计算，一定要使用 newItemsInArg 作为参数。
-                                        // 因为有可能第一次计算就有多个 triggerInfo，里面多次元素位置变化，导致 source.data 很难知道元素的新位置。
-                                        newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
-                                    }
-                                }, undefined, true)
-                                newItemRun.run()
-
-                                if (newItemRun.hasDeps()) {
-                                    if (!addedAtomIndexesDep) {
-                                        source.addAtomIndexesDep()
-                                        addedAtomIndexesDep = true
-                                    }
-                                    newItemIndex = source.atomIndexes![newIndex]!
-                                }
-                                if (shouldKeepMapItemEffect(newItemRun)) {
-                                    effectFrames![index] = [newItemRun] as ReactiveEffect[]
-                                } else {
-                                    newItemRun.destroy()
-                                    effectFrames![index] = []
-                                }
+                                const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext)
+                                newItem = value
+                                effectFrames![index] = frame
                             }
                             return newItem!
                         })
-                        const deletedItems = this.splice(argv![0], argv![1], ...newItems)
-                        const deletedFrames = this.effectFramesArray!.splice(argv![0], argv![1], ...effectFrames)
+                        const deletedItems = this.spliceArray(argv![0], argv![1], newItems)
+                        const deletedFrames = spliceMany(this.effectFramesArray!, argv![0], argv![1], effectFrames)
                         deletedFrames.forEach((frame) => {
                             frame.forEach((effect) => {
                                 this.destroyEffect(effect)
@@ -560,7 +632,7 @@ export class RxList<T> extends Computed {
                         if (useContext && cleanupFns?.length) {
                             // CAUTION 这里要把删除的 effect 的 cleanup 都执行一遍
                             //  如果能从 return value 中进行销毁，应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能。
-                            const deletedCleanupFns = cleanupFns.splice(argv![0], argv![1], ...newCleanups)
+                            const deletedCleanupFns = spliceMany(cleanupFns, argv![0], argv![1], newCleanups)
                             deletedCleanupFns.forEach((fn) => {
                                 fn?.()
                             })
@@ -608,6 +680,8 @@ export class RxList<T> extends Computed {
             options?.scheduleRecompute,
             {
                 onDestroy(this: RxList<U>)  {
+                    itemProbe?.destroy()
+                    itemProbe = undefined
                     if (addedAtomIndexesDep) {
                         source.removeAtomIndexesDep()
                     }
@@ -743,7 +817,7 @@ export class RxList<T> extends Computed {
             }
             searchedItemAndIndexes[current] =currentItem
             resultComputed.autoTrack()
-            const getFrame = Notifier.instance.collectTrackTarget()
+            const getFrame = notifier.collectTrackTarget()
             const matchResult = matchFn(source.data[current])
             const trackTargets = getFrame()
             resultComputed.resetAutoTrack()
@@ -960,6 +1034,7 @@ export class RxList<T> extends Computed {
                         if (argv![0] === 0) {
                             newItemsInArgs.reverse()
                         }
+                        const insertAtHead = argv![0] === 0
 
                         // 先分好组，再一次性操作，可以合并 info，还能间接提高 dom 操作性能。
                         const newGroupedItems = new Map<any, T[]>()
@@ -980,10 +1055,11 @@ export class RxList<T> extends Computed {
                             if (!this.data.has(key)) {
                                 this.set(key, new RxList(group))
                             } else {
-                                if (argv![0] === 0) {
-                                    this.data.get(key)!.unshift(...group)
+                                const groupList = this.data.get(key)!
+                                if (insertAtHead) {
+                                    groupList.spliceArray(0, 0, group)
                                 } else {
-                                    this.data.get(key)!.push(...group)
+                                    groupList.spliceArray(groupList.data.length, 0, group)
                                 }
                             }
                         })
@@ -1053,7 +1129,7 @@ export class RxList<T> extends Computed {
         )
     }
     toArray() {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         return this.data
     }
     toMap() {
@@ -1128,22 +1204,25 @@ export class RxList<T> extends Computed {
             }
         )
     }
-    public length!: Atom<number>
-    createComputedMetas( ) {
-        // FIXME 目前不能用 cache 的方法在读时才创建。
-        //  因为如果是在 autorun 等  computed 中读的，会导致在cleanup 时把
-        //  相应的 computed 当做 children destroy 掉。
-        const source = this
-        this.length = computed(
-            function computation(this: Computed) {
-                this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return source.data!.length
-            },
-            function applyPatch(this: Computed, data: Atom<number>){
-                data(source.data.length)
-            }
-        )
-        setComputedRetainedDiagnosticSource(this.length, 'RxList.length')
+    // CAUTION length 惰性创建：每个 RxList（包括所有派生列表）无条件预建一个
+    //  length computed 曾是主要的固定开销之一。惰性创建以 createDetached 包裹，
+    //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
+    declare _length?: Atom<number>
+    get length(): Atom<number> {
+        return this._length ?? (this._length = ReactiveEffect.createDetached(() => {
+            const source = this
+            const length = computed(
+                function computation(this: Computed) {
+                    this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                    return source.data!.length
+                },
+                function applyPatch(this: Computed, data: Atom<number>){
+                    data(source.data.length)
+                }
+            )
+            setComputedRetainedDiagnosticSource(length, 'RxList.length')
+            return length
+        }))
     }
 
     // FIXME onUntrack 的时候要把 indexKeyDeps 里面的 dep 都删掉。因为 Effect 没管这种情况。
@@ -1154,7 +1233,8 @@ export class RxList<T> extends Computed {
 
     }
     destroy() {
-        destroyComputed(this.length)
+        // CAUTION 用 _length 判断：length 是惰性 getter，直接访问会先创建再销毁
+        if (this._length) destroyComputed(this._length)
         super.destroy()
         this.effectFramesArray?.forEach((frames) => {
           frames.forEach((frame) => {
@@ -1185,10 +1265,12 @@ export class RxList<T> extends Computed {
                     this.manualTrack(src, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
                 })
 
-                // Full initial merge
+                // Full initial merge（逐项 push，规避大数组 spread 的实参上限）
                 const merged: T[] = []
                 sources.forEach(src => {
-                    merged.push(...src.data)
+                    for (const item of src.data) {
+                        merged.push(item)
+                    }
                 })
                 return merged
             },
@@ -1224,7 +1306,7 @@ export class RxList<T> extends Computed {
                         let insertPos = offset + (argv![0] as number)
                         // clamp insertPos if user spliced out-of-bounds
                         insertPos = Math.min(Math.max(insertPos, 0), this.data.length)
-                        this.splice(insertPos, 0, ...newItems)
+                        this.spliceArray(insertPos, 0, newItems)
                     } else {
                         // explicit key change
                         if (oldValue !== undefined) {
@@ -1332,13 +1414,13 @@ export class RxList<T> extends Computed {
                         }
 
                         if(oldStart! > idxs[0]) {
-                            this.unshift(...source.data.slice(idxs[0], oldStart))
+                            this.spliceArray(0, 0, source.data.slice(idxs[0], oldStart))
                         } else if(oldStart! < idxs[0]) {
                             this.splice(0, idxs[0]-oldStart!)
                         }
 
                         if (oldEnd! < idxs[1]) {
-                            this.push(...source.data.slice(oldEnd, idxs[1]))
+                            this.spliceArray(this.data.length, 0, source.data.slice(oldEnd, idxs[1]))
                         } else if(oldEnd! > idxs[1]) {
                             this.splice(idxs[1] - idxs[0], Infinity)
                         }
@@ -1480,7 +1562,7 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
             deleteItems.forEach((item) => {
                 inners.forEach(inner => inner.deleteIndicator(item))
             })
-            list.splice(argv![0], argv![1], ...newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
+            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
@@ -1552,7 +1634,7 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
         if (triggerInfo.method === 'splice') {
             const {  argv } = triggerInfo
             const newItemsInArgs = argv!.slice(2)
-            list.splice(argv![0], argv![1], ...newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
+            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
 
             const deleteCount = argv![1]
             const insertCount = newItemsInArgs.length

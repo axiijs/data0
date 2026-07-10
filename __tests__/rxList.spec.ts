@@ -41,17 +41,28 @@ describe('RxList', () => {
         expect(mapRuns).toBe(5)
     })
 
-    test('destroy releases length computed retained diagnostics', () => {
+    test('length computed is lazy and destroy releases it once created', () => {
         enableData0RetainedObjectDiagnostics({ reset: true })
         try {
             const list = new RxList<number>([1, 2, 3])
+            // length 惰性创建：构造 RxList 不再预建 length computed
             const afterCreate = getData0RetainedObjectDiagnosticsSnapshot()
-            expect(afterCreate.reactiveEffects.activeBySource['RxList.length']).toBe(1)
+            expect(afterCreate.reactiveEffects.activeBySource['RxList.length']).toBe(undefined)
+
+            expect(list.length()).toBe(3)
+            const afterRead = getData0RetainedObjectDiagnosticsSnapshot()
+            expect(afterRead.reactiveEffects.activeBySource['RxList.length']).toBe(1)
 
             list.destroy()
             const afterDestroy = getData0RetainedObjectDiagnosticsSnapshot()
             expect(afterDestroy.reactiveEffects.totalActive).toBe(0)
             expect(afterDestroy.reactiveEffects.destroyedBySource['RxList.length']).toBe(1)
+
+            // 从未读过 length 的列表，destroy 不应顺带创建它
+            const untouched = new RxList<number>([1])
+            untouched.destroy()
+            const afterUntouched = getData0RetainedObjectDiagnosticsSnapshot()
+            expect(afterUntouched.reactiveEffects.totalActive).toBe(0)
         } finally {
             disableData0RetainedObjectDiagnostics()
         }
@@ -625,6 +636,167 @@ describe('RxList', () => {
 
         list.splice(1, 1)
         expect(forEachRuns).toBe(3)
+    })
+
+    test('forEach reruns on set() and does not create per-index deps', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const collected: number[][] = []
+        autorun(() => {
+            const current: number[] = []
+            list.forEach(item => current.push(item))
+            collected.push(current)
+        }, true)
+        expect(collected).toMatchObject([[1, 2, 3]])
+
+        // 遍历型读取只依赖 ITERATE_KEY，不应把列表推入 index dep 慢路径
+        expect(list._indexKeyDeps?.size ?? 0).toBe(0)
+
+        list.set(1, 20)
+        expect(collected).toMatchObject([[1, 2, 3], [1, 20, 3]])
+    })
+
+    test('for...of iterates and reacts to splice/set', () => {
+        // 旧实现的手写 iterator 从不递增 index，for...of 会死循环（回归覆盖）
+        const list = new RxList<number>([1, 2, 3])
+        const sums: number[] = []
+        autorun(() => {
+            let sum = 0
+            for (const item of list) {
+                sum += item
+            }
+            sums.push(sum)
+        }, true)
+        expect(sums).toMatchObject([6])
+
+        list.splice(1, 1, 10)
+        expect(sums).toMatchObject([6, 14])
+
+        list.set(0, 100)
+        expect(sums).toMatchObject([6, 14, 113])
+
+        expect([...list]).toMatchObject([100, 10, 3])
+    })
+
+    test('replaceData/spliceArray handle very large batches (beyond spread argument limit)', () => {
+        // V8 的函数实参上限约 65k：spread 传参在大列表上会 RangeError
+        const SIZE = 100_000
+        const bigData = Array.from({length: SIZE}, (_, i) => i)
+
+        const list = new RxList<number>([1, 2, 3])
+        list.replaceData(bigData)
+        expect(list.data.length).toBe(SIZE)
+        expect(list.data[0]).toBe(0)
+        expect(list.data[SIZE - 1]).toBe(SIZE - 1)
+
+        // 非纯 append/clear 的慢路径（先建立一个 index dep）也要能处理大批量
+        const list2 = new RxList<number>([1, 2, 3])
+        let first = -1
+        autorun(() => { first = list2.at(0)! }, true)
+        list2.spliceArray(1, 1, bigData)
+        expect(list2.data.length).toBe(SIZE + 2)
+        expect(list2.data[1]).toBe(0)
+        expect(first).toBe(1)
+
+        // derived computed RxList 的全量重算走 replaceData，同样是大批量
+        const source = new RxList<number>(bigData)
+        const derived = source.map(v => v + 1)
+        expect(derived.data.length).toBe(SIZE)
+        expect(derived.data[SIZE - 1]).toBe(SIZE)
+        derived.destroy()
+        source.destroy()
+    })
+
+    test('at() keeps fine-grained index dep: unrelated splice does not rerun', () => {
+        const list = new RxList<number>([1, 2, 3, 4, 5])
+        let runs = 0
+        autorun(() => {
+            runs++
+            list.at(1)
+        }, true)
+        expect(runs).toBe(1)
+
+        // 只订阅 index 1，修改 index 3 不应重跑
+        list.set(3, 40)
+        expect(runs).toBe(1)
+
+        // 影响 index 1 的 splice 要重跑
+        list.splice(1, 1, 20)
+        expect(runs).toBe(2)
+    })
+
+    test('subscribed index far from splice point still updates (sparse subscription)', () => {
+        const list = new RxList<number>(Array.from({length: 1000}, (_, i) => i))
+        let value = -1
+        autorun(() => { value = list.at(500)! }, true)
+        expect(value).toBe(500)
+
+        // 头部删除使整体前移，订阅的 index 500 必须收到新值
+        list.splice(0, 1)
+        expect(value).toBe(501)
+
+        // 头部插入使整体后移
+        list.splice(0, 0, -1)
+        expect(value).toBe(500)
+
+        // reorder 覆盖到订阅 index 时也要更新
+        list.swap(500, 0)
+        expect(value).toBe(-1)
+    })
+
+    test('map upgrades only rows whose mapFn actually read reactive data', () => {
+        // mapFn 按行条件读取响应式数据：只有读了的行升级为常驻行级 effect
+        const base = atom(10)
+        const list = new RxList<number>([1, 2, 3, 4])
+        const mapped = list.map(item => (item % 2 === 0 ? item + base() : item))
+        expect(mapped.toArray()).toMatchObject([1, 12, 3, 14])
+        // 奇数行无依赖不保留 effect，偶数行保留
+        expect(mapped.effectFramesArray!.map(f => f.length)).toMatchObject([0, 1, 0, 1])
+
+        // 依赖变化只重算有依赖的行
+        base(100)
+        expect(mapped.toArray()).toMatchObject([1, 102, 3, 104])
+
+        // 新增行同样按需升级（patch 路径）
+        list.push(5, 6)
+        expect(mapped.toArray()).toMatchObject([1, 102, 3, 104, 5, 106])
+        base(1000)
+        expect(mapped.toArray()).toMatchObject([1, 1002, 3, 1004, 5, 1006])
+
+        // 删除有依赖的行后，其 effect 被销毁，后续变更不再影响
+        list.splice(1, 1)
+        expect(mapped.toArray()).toMatchObject([1, 3, 1004, 5, 1006])
+
+        mapped.destroy()
+        list.destroy()
+    })
+
+    test('lazy length meta created inside autorun survives the autorun rerun cleanup', () => {
+        // 旧实现不能惰性创建 meta 的原因：在 autorun/computed 中首次读取时会被
+        // 收集为该 effect 的 child，重跑 cleanup 时被误销毁。createDetached 修复后回归覆盖。
+        const list = new RxList<number>([1, 2, 3])
+        let len = -1
+        autorun(() => {
+            len = list.length()
+        }, true)
+        expect(len).toBe(3)
+
+        list.push(4)
+        expect(len).toBe(4)
+
+        // autorun 已经重跑过（cleanup 发生过），length computed 必须仍然存活
+        list.splice(0, 2)
+        expect(len).toBe(2)
+    })
+
+    test('index deps of unsubscribed effects are pruned so splice returns to the fast path', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const stop = autorun(() => { list.at(0) }, true)
+        expect(list._indexKeyDeps!.size).toBe(1)
+
+        stop()
+        // 退订后 dep entry 惰性清扫：下一次结构变更时移除
+        list.push(4)
+        expect(list._indexKeyDeps!.size).toBe(0)
     })
 
 

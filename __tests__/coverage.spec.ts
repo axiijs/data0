@@ -720,11 +720,14 @@ describe('coverage helpers for core lifecycle APIs', () => {
 
     test('Notifier trigger branches cover collection, clear, length and pause guards', () => {
         const target: any[] = [1, 2, 3]
+        // trigger 协议：info 由 effect 侧按需组装（runFromTrigger），
+        // 这里显式组装以断言 trigger 分支派发了正确的 (type, inputInfo)
         class CapturingEffect extends ReactiveEffect {
             triggerInfos: any[] = []
-            run(infos: any[] = []) {
-                this.triggerInfos.push(...infos)
+            runFromTrigger(source: any, type: any, inputInfo?: any) {
+                this.triggerInfos.push({...inputInfo, source, type})
             }
+            run() {}
         }
         const effect = new CapturingEffect(() => undefined)
         Notifier.instance.targetMap.set(target, new Map([

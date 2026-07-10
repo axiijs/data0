@@ -8,10 +8,11 @@ import {
     GetterType,
     SkipIndicator
 } from "./computed.js";
-import {ITERATE_KEY, Notifier} from "./notify.js";
+import {ITERATE_KEY, notifier} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {Atom} from "./atom.js";
 import {RxList} from "./RxList.js";
+import {ReactiveEffect} from "./reactiveEffect.js";
 import {assert, isMap} from "./util.js";
 
 type EntryType = [any, any][]
@@ -40,7 +41,6 @@ export class RxMap<K, V> extends Computed{
         if (this.getter) {
             this.run([], true)
         }
-        this.createComputedMetas()
     }
     replace = (source: EntryType|PlainObjectType|Map<K,V>) => {
         let entries: EntryType
@@ -120,99 +120,90 @@ export class RxMap<K, V> extends Computed{
     // track methods
     get(key: K) {
         // 先执行 track 才会触发 recompute
-        Notifier.instance.track(this, TrackOpTypes.GET, key)
+        notifier.track(this, TrackOpTypes.GET, key)
         return this.data.get(key)
     }
     forEach(handler: (item: V, index: K) => void) {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
 
         for(let [key, value ] of this.data) {
             handler(value!, key)
         }
         // track iterator
     }
-    [Symbol.iterator]() {
-        let index = 0;
-        let data = this.data;
-        // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
-        const keys = Array.from(data.keys())
-        return {
-            next: () => {
-                if (index < keys.length) {
-                    // 转发到 at 上实现 track index
-                    const key = keys[index++]
-                    const value = this.get(key)
-                    return { value: [key, value], done: false };
-                } else {
-                    return { done: true };
-                }
-            }
-        };
+    [Symbol.iterator](): IterableIterator<[K, V]> {
+        // 与 forEach 一致：只 track ITERATE_KEY（set/delete/add 的变更路径都会通知它），
+        // 直接用原生 Map 迭代器，不再快照 keys 数组、也不逐 key track GET
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        return this.data[Symbol.iterator]()
     }
-    public keys!: () => RxList<K>
-    public entries!: () => RxList<[K, V]>
-    public values!: () => RxList<V>
-    public size!: Atom<number>
-    createComputedMetas() {
-        // FIXME 目前不能用 cache 的方法在读时才创建。
-        //  因为如果是在 autorun 等  computed 中读的，会导致在cleanup 时把
-        //  相应的 computed 当做 children destroy 掉。
-
-        const source = this
-        const keys = new RxList<K>(
-            function computation(this: RxList<K>) {
-                this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD);
-                return Array.from(source.data.keys())
-            },
-            function applyPatch(this: RxList<K>, data: Atom<K[]>, triggerInfos){
-                for(let info of triggerInfos) {
-                    if (info.type === TriggerOpTypes.METHOD) {
-                        if (info.method === 'clear' || info.method === 'replace') {
-                            return false
-                        } else if (info.method === 'set') {
-                            const [hasValue] = info.methodResult as [boolean, V]
-                            if (!hasValue) {
-                                this.push(info.argv![0]! as K)
+    // CAUTION keys/values/entries/size 全部惰性创建：旧实现每个 RxMap 构造时无条件
+    //  预建 1 个 keys RxList + 2 个 map 派生 RxList + 1 个 size computed（约 5 个
+    //  Computed 的固定成本），groupBy 这类每 group 一个 RxMap 的场景按倍数放大。
+    //  createDetached 解决旧注释里"在 autorun 中读会被当作 children 误销毁"的问题。
+    declare _keys?: RxList<K>
+    declare _values?: RxList<V>
+    declare _entries?: RxList<[K, V]>
+    declare _size?: Atom<number>
+    keys(): RxList<K> {
+        return this._keys ?? (this._keys = ReactiveEffect.createDetached(() => {
+            const source = this
+            return new RxList<K>(
+                function computation(this: RxList<K>) {
+                    this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD);
+                    return Array.from(source.data.keys())
+                },
+                function applyPatch(this: RxList<K>, data: Atom<K[]>, triggerInfos){
+                    for(let info of triggerInfos) {
+                        if (info.type === TriggerOpTypes.METHOD) {
+                            if (info.method === 'clear' || info.method === 'replace') {
+                                return false
+                            } else if (info.method === 'set') {
+                                const [hasValue] = info.methodResult as [boolean, V]
+                                if (!hasValue) {
+                                    this.push(info.argv![0]! as K)
+                                }
+                            } else if(info.method === 'delete') {
+                                const index = this.data.indexOf(info.argv![0] as K)
+                                this.splice(index, 1)
+                            } else {
+                                assert(false, 'unreachable')
                             }
-                        } else if(info.method === 'delete') {
-                            const index = this.data.indexOf(info.argv![0] as K)
-                            this.splice(index, 1)
                         } else {
                             assert(false, 'unreachable')
                         }
-                    } else {
-                        assert(false, 'unreachable')
                     }
                 }
-            }
-        )
-        this.keys = () => keys
-
-        const values = this.keys().map(key => this.get(key)!)
-        this.values = () => values
-
-        const entries = this.keys().map(key => [key, this.get(key)] as [K, V])
-        this.entries = () => entries
-
-
-        this.size = computed(
-            function computation(this: Computed) {
-                this.manualTrack(source, TrackOpTypes.ITERATE, ITERATE_KEY)
-                return source.data.size
-            },
-            function applyPatch(this: Computed, data: Atom<number>, triggerInfos) {
-                data(source.data.size)
-            }
-        )
+            )
+        }))
+    }
+    values(): RxList<V> {
+        return this._values ?? (this._values = ReactiveEffect.createDetached(() => this.keys().map(key => this.get(key)!)))
+    }
+    entries(): RxList<[K, V]> {
+        return this._entries ?? (this._entries = ReactiveEffect.createDetached(() => this.keys().map(key => [key, this.get(key)] as [K, V])))
+    }
+    get size(): Atom<number> {
+        return this._size ?? (this._size = ReactiveEffect.createDetached(() => {
+            const source = this
+            return computed(
+                function computation(this: Computed) {
+                    this.manualTrack(source, TrackOpTypes.ITERATE, ITERATE_KEY)
+                    return source.data.size
+                },
+                function applyPatch(this: Computed, data: Atom<number>) {
+                    data(source.data.size)
+                }
+            )
+        }))
     }
     destroy() {
-        // CAUTION createComputedMetas 里创建的派生结构必须销毁，否则它们还挂在本 map 的 dep 上泄漏。
+        // CAUTION 只销毁真正创建过的派生结构（getter 惰性，直接访问会先创建再销毁）。
         //  values/entries 派生自 keys，先销毁派生者。
-        this.values().destroy()
-        this.entries().destroy()
-        this.keys().destroy()
-        destroyComputed(this.size)
+        if (this._values) this._values.destroy()
+        if (this._entries) this._entries.destroy()
+        if (this._keys) this._keys.destroy()
+        if (this._size) destroyComputed(this._size)
         super.destroy()
     }
 }

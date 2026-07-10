@@ -1,8 +1,11 @@
 import {Dep, finalizeDepMarkers, initDepMarkers} from "./dep.js";
-import {maxMarkerBits, Notifier} from "./notify.js";
+import {maxMarkerBits, Notifier, notifier} from "./notify.js";
+import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
+import type {TriggerOpTypes} from "./operations.js";
 import {ManualCleanup} from "./manualCleanup.js";
 import {isAsync, isGenerator} from "./util.js";
 import {
+    trackRetainedDepEffectAdded,
     trackRetainedDepEffectRemoved,
     trackRetainedReactiveEffectCreated,
     trackRetainedReactiveEffectDestroyed
@@ -57,6 +60,16 @@ export class ReactiveEffect extends ManualCleanup {
     declare getter?: (...args: any[]) => any
     isAsync?:boolean
     declare shouldCollectChild: boolean
+    // CAUTION 触发协议（见 notify.ts triggerEffect）：
+    //  needsTriggerInfo 表示该 effect 会消费 TriggerInfo（patch 型 Computed / 声明了
+    //  第三个参数的自定义调度器）。为 false 时 trigger 路径完全不构造 info 对象——
+    //  渲染框架的轻量绑定 effect 都不读 info，这是 trigger 热路径零分配的关键。
+    //  默认值在原型上（Computed 构造器在需要时置 true）。
+    declare needsTriggerInfo: boolean
+    // effect session（batch）内的去重标记与待处理 info 队列，代替原来 notifier 上的
+    // Set + WeakMap（每次 batch 内触发省一次哈希查找与集合分配）。默认值在原型上。
+    declare _inSession: boolean
+    declare _sessionInfos?: TriggerInfo[]
     constructor(getter?: (...args: any[]) => any) {
         // 这是为了支持有的数据结构想写成 source/computed 都支持的情况，比如 RxList。它会继承 Computed
         super();
@@ -69,12 +82,34 @@ export class ReactiveEffect extends ManualCleanup {
         this.active = !!getter
         if (this.active) trackRetainedReactiveEffectCreated(this)
 
-        if (ReactiveEffect.activeScopes.length) {
-            const parent = ReactiveEffect.activeScopes.at(-1)
-            if (parent?.shouldCollectChild) {
+        const scopes = ReactiveEffect.activeScopes
+        if (scopes.length) {
+            const parent = scopes[scopes.length - 1]
+            if (parent.shouldCollectChild) {
                 this.parent = parent
                 this.index = parent.addChild(this)
             }
+        }
+    }
+    /**
+     * 在"游离"上下文中创建响应式对象：临时屏蔽父 effect 的 children 收集与
+     * ManualCleanup 的 frame 收集。用于惰性创建生命周期由宿主自己管理的派生结构
+     * （RxList.length、RxMap.keys 等 meta）——否则在 autorun/computed 的 getter 里
+     * 首次访问这些 meta 时，它们会被当作该 effect 的 child，在下一次重算的
+     * cleanup 中被误销毁。
+     */
+    static createDetached<T>(create: () => T): T {
+        const scopes = ReactiveEffect.activeScopes
+        const top = scopes.length ? scopes[scopes.length - 1] : undefined
+        const prevShouldCollect = top ? top.shouldCollectChild : undefined
+        if (top) top.shouldCollectChild = false
+        // 压入一个丢弃 frame，创建过程中的 ManualCleanup 实例不会进入外层 frame
+        const stopCollect = ManualCleanup.collectEffect()
+        try {
+            return create()
+        } finally {
+            stopCollect()
+            if (top) top.shouldCollectChild = prevShouldCollect!
         }
     }
     get eventToCallbacks() {
@@ -131,10 +166,18 @@ export class ReactiveEffect extends ManualCleanup {
             callbacks.delete(callback)
         }
     }
-    dispatch(event: string, ...args: any[]) {
+    // CAUTION 热路径守卫：track/trigger 每次都会经过事件派发点，绝大多数 effect 没有监听者。
+    //  调用方先用它判断，再构造 payload，避免无监听者时的对象分配。
+    hasListener(event: string) {
+        const callbacks = this._eventToCallbacks?.get(event)
+        return callbacks !== undefined && callbacks.size > 0
+    }
+    // CAUTION 单参签名而不是 ...args：内部所有派发点最多只带一个参数，
+    //  rest 参数会让每次 dispatch 都分配一个数组（trigger/track/recompute 等热路径每次触发都要派发）。
+    dispatch(event: string, arg?: any) {
         const callbacks = this._eventToCallbacks?.get(event)
         if (callbacks) {
-            callbacks.forEach(callback => callback.call(this, ...args))
+            callbacks.forEach(callback => callback.call(this, arg))
         }
     }
     createGetterContext():any {
@@ -146,10 +189,10 @@ export class ReactiveEffect extends ManualCleanup {
 
     prepareTracking(isFirst = false, isAsync = this.isAsync) {
         if (!isAsync) {
-            Notifier.trackOpBit = 1 << ++Notifier.instance.effectTrackDepth
+            Notifier.trackOpBit = 1 << ++notifier.effectTrackDepth
             ReactiveEffect.activeScopes.push(this)
 
-            if (this.useDepMarker && Notifier.instance.effectTrackDepth <= maxMarkerBits) {
+            if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 initDepMarkers(this)
             } else {
                 this.cleanup()
@@ -170,12 +213,12 @@ export class ReactiveEffect extends ManualCleanup {
 
     completeTracking(isLast = false, isAsync = this.isAsync) {
         if (!isAsync) {
-            if (this.useDepMarker && Notifier.instance.effectTrackDepth <= maxMarkerBits) {
+            if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 finalizeDepMarkers(this)
             }
 
             ReactiveEffect.activeScopes.pop()
-            Notifier.trackOpBit = 1 << --Notifier.instance.effectTrackDepth
+            Notifier.trackOpBit = 1 << --notifier.effectTrackDepth
 
         } else {
             if (isLast) {
@@ -188,6 +231,16 @@ export class ReactiveEffect extends ManualCleanup {
 
             ReactiveEffect.activeScopes.pop()
         }
+    }
+    // 依赖触发时由 notifier 调用（非 session 路径）。基类 effect 不消费 TriggerInfo，
+    // 直接重跑；Computed 覆写此方法，按 needsTriggerInfo 惰性组装 info。
+    runFromTrigger(_source?: any, _type?: TriggerOpTypes, _inputInfo?: InputTriggerInfo) {
+        this.run()
+    }
+    // primitive atom 写入的特化入口：newValue/oldValue 以标量传递，
+    // 让最热的 atom 写路径完全不构造 info 对象。
+    runFromAtomTrigger(_source?: any, _newValue?: unknown, _oldValue?: unknown) {
+        this.run()
     }
     run(...args: any[]): any {
         // 一般用于调试
@@ -205,10 +258,10 @@ export class ReactiveEffect extends ManualCleanup {
         if(!this.isAsync) {
             try {
                 this.prepareTracking()
-                Notifier.instance.enableTracking()
+                notifier.enableTracking()
                 return this.callGetter()
             } finally {
-                Notifier.instance.resetTracking()
+                notifier.resetTracking()
                 this.completeTracking()
             }
         } else {
@@ -217,9 +270,9 @@ export class ReactiveEffect extends ManualCleanup {
             const generator = this.callGetter() as Generator<any, string, boolean>
             const resultPromise = this.runGenerator(generator, (isFirst) => {
                 this.prepareTracking(isFirst)
-                Notifier.instance.enableTracking()
+                notifier.enableTracking()
             }, (isLast) => {
-                Notifier.instance.resetTracking()
+                notifier.resetTracking()
                 this.completeTracking()
             })
 
@@ -252,6 +305,41 @@ export class ReactiveEffect extends ManualCleanup {
                 if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
             }
             deps.length = 0
+        }
+    }
+    /**
+     * @internal
+     * 把本 effect 在一次探测运行中捕获的 deps 与 children 原样转移给 target，
+     * 自身清空。用于 RxList.map 的行级依赖探测：mapFn 只执行一次（在探测 effect 中），
+     * 发现有依赖后把订阅关系转交给真正的行级 Computed，避免重跑 mapFn 的副作用。
+     */
+    transferCapturesTo(target: ReactiveEffect) {
+        const deps = this.deps
+        if (deps.length) {
+            for (let i = 0; i < deps.length; i++) {
+                const dep = deps[i]
+                if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
+                dep.add(target)
+                trackRetainedDepEffectAdded(dep)
+                target.deps.push(dep)
+            }
+            deps.length = 0
+        }
+        const children = this._children
+        if (children && children.length) {
+            for (const child of children) {
+                child.parent = target
+            }
+            if (target._children && target._children.length) {
+                for (const child of children) {
+                    child.index = target._children.length
+                    target._children.push(child)
+                }
+            } else {
+                target._children = children
+                // index 保持原数组位置，无需修正
+            }
+            this._children = undefined
         }
     }
     destroy(ignoreChildren = false) {
@@ -287,3 +375,5 @@ ReactiveEffect.prototype.isRunningAsync = false
 ReactiveEffect.prototype.useDepMarker = true
 ReactiveEffect.prototype.index = 0
 ReactiveEffect.prototype.shouldCollectChild = true
+ReactiveEffect.prototype.needsTriggerInfo = false
+ReactiveEffect.prototype._inSession = false

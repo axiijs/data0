@@ -1,7 +1,8 @@
 import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, GetterType} from "./computed.js";
 import {Atom} from "./atom.js";
-import {ITERATE_KEY, Notifier, TriggerInfo} from "./notify.js";
+import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
+import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxList} from "./RxList";
 /**
  * @category Basic
@@ -21,7 +22,6 @@ export class RxSet<T> extends Computed {
         // 自己是 source
         this.data = source instanceof Set ? source : new Set(Array.isArray(source) ? source : [])
 
-        this.createComputedMetas()
         if (this.getter) {
             this.run([], true)
         }
@@ -82,7 +82,7 @@ export class RxSet<T> extends Computed {
         const base = this
         //  has 是 n(1) 的操作，所以不用 applyPatch 了。
         return computed(() => {
-            Notifier.instance.track(base, TrackOpTypes.ITERATE, ITERATE_KEY)
+            notifier.track(base, TrackOpTypes.ITERATE, ITERATE_KEY)
             return base.data.has(value)
         })
     }
@@ -94,7 +94,12 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => !other.data.has(x)))
+                // 直接迭代 Set，省去 [...] 的中间数组物化
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (!other.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({ methodResult, method, argv, newValue, source, result}) => {
@@ -141,7 +146,11 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => other.data.has(x)))
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (other.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({type, method, methodResult, argv, newValue, source, result}) => {
@@ -178,7 +187,14 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => !other.data.has(x)).concat([...other.data].filter(x => !base.data.has(x))))
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (!other.data.has(x)) result.add(x)
+                }
+                for (const x of other.data) {
+                    if (!base.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({methodResult, method, argv, newValue, source, result}) => {
@@ -221,7 +237,9 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data, ...other.data])
+                const result = new Set<T>(base.data)
+                for (const x of other.data) result.add(x)
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({methodResult, method, argv, newValue, source, result}) => {
@@ -281,7 +299,7 @@ export class RxSet<T> extends Computed {
     }
     forEach(handler: (item: T) => void) {
         this.data.forEach(handler)
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
     }
     toList(): RxList<T> {
         const base = this
@@ -316,28 +334,28 @@ export class RxSet<T> extends Computed {
         )
     }
     toArray() {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         return [...this.data]
     }
-    public size!: Atom<number>
-    createComputedMetas() {
-        // FIXME 目前不能用 cache 的方法在读时才创建。
-        //  因为如果是在 autorun 等  computed 中读的，会导致在cleanup 时把
-        //  相应的 computed 当做 children destroy 掉。
-        const source = this
-        this.size = computed(
-            function computation(this: Computed) {
-                this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return source.data.size
-            },
-            function applyPatch(this: Computed, data: Atom<number>){
-                data(source.data.size)
-            }
-        )
+    // CAUTION size 惰性创建（createDetached 说明见 RxMap 的同名注释）
+    declare _size?: Atom<number>
+    get size(): Atom<number> {
+        return this._size ?? (this._size = ReactiveEffect.createDetached(() => {
+            const source = this
+            return computed(
+                function computation(this: Computed) {
+                    this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                    return source.data.size
+                },
+                function applyPatch(this: Computed, data: Atom<number>){
+                    data(source.data.size)
+                }
+            )
+        }))
     }
     destroy() {
-        // createComputedMetas 里创建的 size 必须一并销毁，否则泄漏
-        destroyComputed(this.size)
+        // 只销毁真正创建过的 size（getter 惰性，直接访问会先创建再销毁）
+        if (this._size) destroyComputed(this._size)
         super.destroy()
     }
 }

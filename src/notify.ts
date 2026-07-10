@@ -1,4 +1,4 @@
-import {createCompactDep, createDep, Dep, newTracked, wasTracked} from "./dep";
+import {CompactDep, createCompactDep, createDep, Dep, newTracked, wasTracked} from "./dep";
 import {TrackOpTypes, TriggerOpTypes} from "./operations";
 import {Computed} from "./computed";
 import {assert, extend, isArray, isIntegerKey, toNumber} from "./util";
@@ -77,14 +77,19 @@ export class Notifier {
     return Notifier._instance || (Notifier._instance = new Notifier())
   }
   trackTargetFrames: any[][] = []
+  // 栈顶 frame 的直接引用：track 热路径上每次读 trackTargetFrames.at(-1) 是一次
+  // 通用方法调用，绝大多数时候栈是空的，用一个字段判空即可
+  currentTrackFrame?: any[]
   // 被 track 的对象 {target -> key -> dep}
   targetMap= new WeakMap<any, KeyToDepMap>()
   shouldTrack = true
   effectTrackDepth = 0
   shouldTrigger: boolean = true
   trackStack: boolean[] = []
-  effectsInSession: Set<ReactiveEffect> = new Set()
-  effectsInSessionPayloads = new WeakMap<ReactiveEffect, TriggerInfo[]>
+  // session（batch）队列：去重标记与待处理 info 放在 effect 实例字段上
+  // （_inSession/_sessionInfos），代替原来的 Set + WeakMap——batch 内每次触发
+  // 少一次哈希查找，digest 时顺序数组遍历也比 Set 迭代快。
+  sessionQueue: ReactiveEffect[] = []
   inEffectSession: boolean = false
   isDigesting: boolean = false
   sessionDepth = 0
@@ -93,43 +98,70 @@ export class Notifier {
     this.inEffectSession = true
     this.sessionDepth++
   }
-  scheduleEffect(effect: ReactiveEffect, info: TriggerInfo, debuggerEventExtraInfo?: DebuggerEventExtraInfo) {
+  scheduleEffect(effect: ReactiveEffect, source: any, type: TriggerOpTypes, inputInfo?: InputTriggerInfo) {
     if (__DEV__) {
       assert(this.inEffectSession, 'should be in effect session')
     }
-    this.effectsInSession.add(effect)
-    let effectInfos = this.effectsInSessionPayloads.get(effect)
-    if (!effectInfos) {
-      this.effectsInSessionPayloads.set(effect, effectInfos = [])
+    if (!effect._inSession) {
+      effect._inSession = true
+      this.sessionQueue.push(effect)
     }
-    effectInfos.push(info)
+    if (effect.needsTriggerInfo) {
+      (effect._sessionInfos ?? (effect._sessionInfos = [])).push(
+          (inputInfo ? {...inputInfo, source, type} : {source, type}) as TriggerInfo
+      )
+    }
+  }
+  scheduleAtomEffect(effect: ReactiveEffect, source: any, newValue?: unknown, oldValue?: unknown) {
+    if (!effect._inSession) {
+      effect._inSession = true
+      this.sessionQueue.push(effect)
+    }
+    if (effect.needsTriggerInfo) {
+      (effect._sessionInfos ?? (effect._sessionInfos = [])).push(
+          {source, type: TriggerOpTypes.ATOM, key: 'value', newValue, oldValue} as TriggerInfo
+      )
+    }
   }
   digestEffectSession() {
     if (this.isDigesting) return
     this.sessionDepth--
     if (this.sessionDepth > 0) return
 
+    const queue = this.sessionQueue
+    // 空 session 快出口：同步 computed 每次 finishFullRecompute 都会建立/消化一次 session
+    if (queue.length === 0) {
+      this.inEffectSession = false
+      return
+    }
+
     this.isDigesting = true
+    let i = 0
     // CAUTION try/finally：任何一个 effect 抛异常都必须复位 session 状态，
     //  否则 notifier 永久卡在 session 中，后续所有 trigger 都会被吞掉。
     try {
-        const effectItor = this.effectsInSession[Symbol.iterator]()
-        let effect: ReactiveEffect | undefined
-        while(effect = effectItor.next().value) {
-            const infos = this.effectsInSessionPayloads.get(effect)
-            effect.run(infos)
-            this.effectsInSession.delete(effect)
-            this.effectsInSessionPayloads.delete(effect)
-        }
-        if(__DEV__) {
-          assert(this.effectsInSession.size === 0, 'effectsInSession should be empty')
-        }
-    } finally {
-        if (this.effectsInSession.size) {
-            for(const effect of this.effectsInSession) {
-                this.effectsInSessionPayloads.delete(effect)
+        // CAUTION queue.length 每轮重新读取：digest 过程中新触发（含重入）的 effect
+        //  会追加到队尾，在同一次 digest 中被处理（与旧的 Set 迭代语义一致）。
+        for (; i < queue.length; i++) {
+            const effect = queue[i]
+            effect._inSession = false
+            const infos = effect._sessionInfos
+            if (infos !== undefined) {
+                effect._sessionInfos = undefined
+                effect.run(infos)
+            } else {
+                effect.run()
             }
-            this.effectsInSession.clear()
+        }
+        queue.length = 0
+    } finally {
+        // 异常路径：复位尚未执行的排队项的标记，防止污染下一个 session
+        if (queue.length) {
+            for (let j = i + 1; j < queue.length; j++) {
+                queue[j]._inSession = false
+                queue[j]._sessionInfos = undefined
+            }
+            queue.length = 0
         }
         this.inEffectSession = false
         this.isDigesting = false
@@ -138,10 +170,14 @@ export class Notifier {
   collectTrackTarget() {
     const frame:any[] = []
     this.trackTargetFrames.push(frame)
+    this.currentTrackFrame = frame
     return () => {
-      assert(frame === this.trackTargetFrames.at(-1), 'track target frame error.')
+      assert(frame === this.currentTrackFrame, 'track target frame error.')
       // CAUTION 必须弹栈，否则 frame 永久驻留并继续收集后续所有 track target（内存泄漏）。
-      return this.trackTargetFrames.pop()!
+      const frames = this.trackTargetFrames
+      frames.pop()
+      this.currentTrackFrame = frames.length ? frames[frames.length - 1] : undefined
+      return frame
     }
   }
   getPrimitiveAtomDep(target: object) {
@@ -158,7 +194,8 @@ export class Notifier {
     return dep
   }
   trackPrimitiveAtomValue = (target: object) => {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect || !this.shouldTrack) return
     if (__DEV__) {
       assert(!(activeEffect instanceof Computed && target === activeEffect.data), 'should not read self in computed')
@@ -170,13 +207,14 @@ export class Notifier {
         : undefined
 
     // 手动收集的场景。
-    this.trackTargetFrames.at(-1)?.push(target)
+    if (this.currentTrackFrame !== undefined) this.currentTrackFrame.push(target)
 
     this.trackEffects(dep, eventInfo)
     return dep
   }
   track = (target: object, type: TrackOpTypes, key: unknown) => {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect || !this.shouldTrack) return
     // CAUTION 不能 track 自己。computed 在第二次执行的时候会有一个 replace 行为，会
     if (__DEV__) {
@@ -199,7 +237,7 @@ export class Notifier {
         : undefined
 
     // 手动收集的场景。
-    this.trackTargetFrames.at(-1)?.push(target)
+    if (this.currentTrackFrame !== undefined) this.currentTrackFrame.push(target)
 
     this.trackEffects(dep, eventInfo)
     return dep
@@ -208,7 +246,8 @@ export class Notifier {
       dep: Dep,
       debuggerEventExtraInfo?: DebuggerEventExtraInfo
   ) {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect) return
     let shouldTrack = false
     if (!activeEffect.isAsync) {
@@ -244,10 +283,14 @@ export class Notifier {
         })
       }
 
-      activeEffect!.dispatch('track', {
-        effect: activeEffect!,
-        ...debuggerEventExtraInfo!
-      })
+      // CAUTION 先判断监听者再构造 payload：track 是最热的路径之一，
+      //  无监听者时不能为派发分配对象。
+      if (activeEffect.hasListener('track')) {
+        activeEffect.dispatch('track', {
+          effect: activeEffect,
+          ...debuggerEventExtraInfo
+        })
+      }
     }
   }
   trigger(
@@ -258,28 +301,14 @@ export class Notifier {
   ) {
     if (!this.shouldTrigger) return
 
-    const info: TriggerInfo = {...inputInfo, source, type}
-
-    const {key, newValue, oldValue} = info
+    // CAUTION 这里不再预先构造 TriggerInfo（{...inputInfo, source, type}）：
+    //  只有 patch 型 Computed 才消费 info，由 runFromTrigger/scheduleEffect 按需组装。
+    const {key, newValue, oldValue} = inputInfo
     const depsMap = this.targetMap.get(source)
     if (!depsMap) {
       // never been tracked
       return
     }
-
-    // if (__DEV__) {
-    //   const getter = getComputedGetter(source)
-    //   this.triggerStack.push({
-    //     debugTarget: getter? getter : isAtom(source) ? source: toRaw(source),
-    //     type: isAtom(source) ? 'atom' : isComputed(source) ? 'computed' : 'reactive',
-    //     opType: type,
-    //     key: info.key,
-    //     newValue: info.newValue,
-    //     oldValue: info.oldValue,
-    //     targetLoc: getStackTrace()
-    //   })
-    // }
-
 
     let deps: (Dep | undefined)[] = []
     if (type === TriggerOpTypes.CLEAR) {
@@ -337,51 +366,90 @@ export class Notifier {
         ? { target: source, type, key, newValue, oldValue, oldTarget }
         : undefined
 
-    if (deps.length === 1) {
-      if (deps[0]) {
-        if (__DEV__) {
-          this.triggerEffects(deps[0], info, eventInfo)
-        } else {
-          this.triggerEffects(deps[0], info)
-        }
-      }
-    } else {
-      const effects: ReactiveEffect[] = []
-      for (const dep of deps) {
-        if (dep) {
-          effects.push(...dep)
-        }
-      }
-      if (__DEV__) {
-        this.triggerEffects(createDep(effects), info, eventInfo)
+    // 找出非空 dep：绝大多数 trigger 只命中一个 dep，走无去重的直接派发；
+    // 多个 dep 时同一个 effect 可能同时订阅了 key dep 和 ITERATE dep，必须去重
+    // （否则 patch computed 会收到重复 info），并且要先快照再执行。
+    let onlyDep: Dep | undefined
+    let hasMultiple = false
+    for (const dep of deps) {
+      if (!dep) continue
+      if (onlyDep === undefined) {
+        onlyDep = dep
       } else {
-        this.triggerEffects(createDep(effects), info)
+        hasMultiple = true
+        break
       }
     }
+    if (onlyDep === undefined) return
 
-    // if (__DEV__) {
-    //   this.triggerStack.pop()
-    // }
+    if (!hasMultiple) {
+      this.triggerEffects(onlyDep, source, type, inputInfo, eventInfo)
+    } else {
+      const dedupedEffects = new Set<ReactiveEffect>()
+      for (const dep of deps) {
+        if (!dep) continue
+        for (const effect of dep) {
+          dedupedEffects.add(effect)
+        }
+      }
+      const scopes = ReactiveEffect.activeScopes
+      const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
+      for (const effect of dedupedEffects) {
+        if (effect !== activeEffect) {
+          this.triggerEffect(effect, source, type, inputInfo, eventInfo)
+        }
+      }
+    }
   }
+  // primitive atom 写入的特化路径：newValue/oldValue 以标量传递，
+  // 无订阅者/轻量订阅者（不消费 info 的 effect）时全程零对象分配。
   triggerPrimitiveAtomValue(
       source: object,
-      inputInfo: InputTriggerInfo
+      newValue?: unknown,
+      oldValue?: unknown
   ) {
     if (!this.shouldTrigger) return
 
-    const dep = this.getPrimitiveAtomDep(source)
+    const dep = this.getPrimitiveAtomDep(source) as CompactDep | undefined
     if (!dep) return
 
-    const info: TriggerInfo = {...inputInfo, source, type: TriggerOpTypes.ATOM}
-    const {key, newValue, oldValue} = info
     const eventInfo = __DEV__
-        ? { target: source, type: TriggerOpTypes.ATOM, key, newValue, oldValue }
+        ? { target: source, type: TriggerOpTypes.ATOM, key: 'value', newValue, oldValue }
         : undefined
 
-    if (__DEV__) {
-      this.triggerEffects(dep, info, eventInfo)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
+    // CompactDep 单订阅者快路径：这是渲染框架里最热的形态（一个 atom 一个绑定 effect）
+    const single = dep.single
+    if (single !== undefined) {
+      if (single !== activeEffect) {
+        this.triggerAtomEffect(single, source, newValue, oldValue, eventInfo)
+      }
+      return
+    }
+    if (dep.overflow === undefined) return
+    // CAUTION 快照稳定化：effect 执行中可能增删订阅（对 native Set 展开，比 generator 快）
+    const effects = [...dep.overflow]
+    for (const effect of effects) {
+      if (effect !== activeEffect) {
+        this.triggerAtomEffect(effect, source, newValue, oldValue, eventInfo)
+      }
+    }
+  }
+  triggerAtomEffect(
+      effect: ReactiveEffect,
+      source: any,
+      newValue?: unknown,
+      oldValue?: unknown,
+      debuggerEventExtraInfo?: DebuggerEventExtraInfo
+  ) {
+    if (effect.hasListener('trigger')) {
+      effect.dispatch('trigger', extend({ effect }, debuggerEventExtraInfo))
+    }
+    if (this.inEffectSession) {
+      this.scheduleAtomEffect(effect, source, newValue, oldValue)
     } else {
-      this.triggerEffects(dep, info)
+      effect.runFromAtomTrigger(source, newValue, oldValue)
     }
   }
   getDepEffects(target: object) {
@@ -405,37 +473,67 @@ export class Notifier {
     }
     return result
   }
-  // 重算完成以后，由 effect 调用
-  //
   triggerEffects(
-      dep: Dep | ReactiveEffect[],
-      info: TriggerInfo,
+      dep: Dep,
+      source: any,
+      type: TriggerOpTypes,
+      inputInfo?: InputTriggerInfo,
       debuggerEventExtraInfo?: DebuggerEventExtraInfo
   ) {
-    // spread into array for stabilization
-    const effects = isArray(dep) ? dep : [...dep]
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
+
+    // CompactDep 单订阅者快路径：零迭代器、零数组
+    if (dep instanceof CompactDep) {
+      const single = dep.single
+      if (single !== undefined) {
+        // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
+        //  重算过程中可能会再次出发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
+        if (single !== activeEffect) {
+          this.triggerEffect(single, source, type, inputInfo, debuggerEventExtraInfo)
+        }
+        return
+      }
+      if (dep.overflow === undefined) return
+      const effects = [...dep.overflow]
+      for (const effect of effects) {
+        if (effect !== activeEffect) {
+          this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
+        }
+      }
+      return
+    }
+
+    // CAUTION 快照稳定化：effect 执行过程中可能向 dep 增删订阅，
+    //  不能直接在 live Set 上迭代（新增的订阅会被本轮误触发）。
+    const effects = [...(dep as unknown as Set<ReactiveEffect>)]
     for (const effect of effects) {
-      // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
-      //  重算过程中可能会再次出发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
-      if (ReactiveEffect.activeScopes.at(-1) !== effect ) {
-        this.triggerEffect(effect, info, debuggerEventExtraInfo)
+      if (effect !== activeEffect) {
+        this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
       }
     }
   }
   triggerEffect(
       effect: ReactiveEffect,
-      info: TriggerInfo,
+      source: any,
+      type: TriggerOpTypes,
+      inputInfo?: InputTriggerInfo,
       debuggerEventExtraInfo?: DebuggerEventExtraInfo
   ) {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
-    if (activeEffect === effect) throw new Error('recursive effect call')
+    if (__DEV__) {
+      const scopes = ReactiveEffect.activeScopes
+      assert((scopes.length ? scopes[scopes.length - 1] : undefined) !== effect, 'recursive effect call')
+    }
 
-    effect.dispatch('trigger', extend({ effect }, debuggerEventExtraInfo))
+    // 无监听者时不构造 payload（每次触发每个 effect 都会经过这里）
+    if (effect.hasListener('trigger')) {
+      effect.dispatch('trigger', extend({ effect }, debuggerEventExtraInfo))
+    }
 
     if (this.inEffectSession) {
-      this.scheduleEffect(effect, info, debuggerEventExtraInfo)
+      this.scheduleEffect(effect, source, type, inputInfo)
     } else {
-      effect.run([info])
+      effect.runFromTrigger(source, type, inputInfo)
     }
   }
   enableTracking() {
@@ -452,6 +550,13 @@ export class Notifier {
   }
 }
 
+// CAUTION 模块级单例引用：热路径（atom 读写、effect run、RxList track）每次经过
+//  Notifier.instance 静态 getter 都要做一次 `_instance ||` 判断。这里在模块求值时
+//  创建好单例，内部热点直接引用。Notifier.instance 公开 API 不变（返回同一个实例）。
+//  注意放在类定义之后求值；循环依赖模块（computed/reactiveEffect）只在函数体内使用，
+//  ESM live binding 保证调用时已初始化。
+export const notifier: Notifier = Notifier.instance
+
 /**
  * Batch reactive writes so dependent effects run once after the callback exits.
  *
@@ -459,10 +564,10 @@ export class Notifier {
  * boundary.
  */
 export function batch<T>(fn: () => T): T {
-  Notifier.instance.createEffectSession()
+  notifier.createEffectSession()
   try {
     return fn()
   } finally {
-    Notifier.instance.digestEffectSession()
+    notifier.digestEffectSession()
   }
 }
