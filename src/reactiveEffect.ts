@@ -5,6 +5,7 @@ import type {TriggerOpTypes} from "./operations.js";
 import {ManualCleanup} from "./manualCleanup.js";
 import {isAsync, isGenerator} from "./util.js";
 import {
+    trackRetainedDepEffectAdded,
     trackRetainedDepEffectRemoved,
     trackRetainedReactiveEffectCreated,
     trackRetainedReactiveEffectDestroyed
@@ -304,6 +305,41 @@ export class ReactiveEffect extends ManualCleanup {
                 if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
             }
             deps.length = 0
+        }
+    }
+    /**
+     * @internal
+     * 把本 effect 在一次探测运行中捕获的 deps 与 children 原样转移给 target，
+     * 自身清空。用于 RxList.map 的行级依赖探测：mapFn 只执行一次（在探测 effect 中），
+     * 发现有依赖后把订阅关系转交给真正的行级 Computed，避免重跑 mapFn 的副作用。
+     */
+    transferCapturesTo(target: ReactiveEffect) {
+        const deps = this.deps
+        if (deps.length) {
+            for (let i = 0; i < deps.length; i++) {
+                const dep = deps[i]
+                if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
+                dep.add(target)
+                trackRetainedDepEffectAdded(dep)
+                target.deps.push(dep)
+            }
+            deps.length = 0
+        }
+        const children = this._children
+        if (children && children.length) {
+            for (const child of children) {
+                child.parent = target
+            }
+            if (target._children && target._children.length) {
+                for (const child of children) {
+                    child.index = target._children.length
+                    target._children.push(child)
+                }
+            } else {
+                target._children = children
+                // index 保持原数组位置，无需修正
+            }
+            this._children = undefined
         }
     }
     destroy(ignoreChildren = false) {

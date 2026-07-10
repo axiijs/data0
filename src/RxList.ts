@@ -6,7 +6,8 @@ import {
     destroyComputed,
     DirtyCallback,
     GetterType,
-    setComputedRetainedDiagnosticSource
+    setComputedRetainedDiagnosticSource,
+    STATUS_CLEAN
 } from "./computed.js";
 import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
@@ -31,9 +32,42 @@ type MapContext = {
     onCleanup: (fn: MapCleanupFn) => void
 }
 
-function shouldKeepMapItemEffect(effect: ReactiveEffect) {
-    return effect.deps.length > 0 || effect.hasChildren()
+/**
+ * RxList.map 的行级依赖探测 effect（每个 map 产物复用一个实例）。
+ *
+ * 旧实现为每一行 new 一个 Computed、run 一遍、再对（最常见的）无依赖行 destroy，
+ * 一行的固定成本是完整的 Computed 构造 + 重算状态机 + 销毁。探测方案下 mapFn 仍然
+ * 恰好执行一次（在 probe 的 tracking 作用域里），只有真正捕获到依赖/子 effect 的行
+ * 才升级为常驻的行级 Computed（订阅关系原样转移，见 transferCapturesTo），
+ * 无依赖行的成本只剩 prepareTracking/completeTracking 一对。
+ */
+class MapItemDependencyProbe extends ReactiveEffect {
+    fn?: () => any
+    constructor() {
+        super()
+        this.active = true
+    }
+    callGetter() {
+        return this.fn!()
+    }
+    probe(fn: () => any) {
+        // 上一次 mapFn 抛异常时 deps 可能残留，复用前防御性清理
+        if (this.deps.length) this.cleanup()
+        this.fn = fn
+        try {
+            return this.run()
+        } finally {
+            this.fn = undefined
+        }
+    }
+    hasCaptures() {
+        return this.deps.length > 0 || this.hasChildren()
+    }
 }
+
+// 无依赖行共享同一个 frozen 空 frame，长列表少一次每行的空数组分配；
+// freeze 保证未来误往共享 frame push 会立刻抛错而不是跨行污染。
+const EMPTY_ITEM_FRAME = Object.freeze([]) as unknown as ReactiveEffect[]
 
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
@@ -490,6 +524,39 @@ export class RxList<T> extends Computed {
         // CAUTION cleanupFns 是用户自己用 context.onCleanup 收集的，因为可能用到 mapFn 中的局部变量
         //  如果可以直接从 mapFn return value 中来销毁副作用，那么应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能，不需要建立 cleanupFns 数组。
         let cleanupFns: MapCleanupFn[]|undefined
+        // 行级依赖探测 effect：整个 map 产物复用一个实例（说明见类定义处）。
+        // detached 创建：不能被 map computation 收集为 child。
+        let itemProbe: MapItemDependencyProbe | undefined
+
+        // 探测一行：mapFn 恰好执行一次；捕获到依赖/子 effect 时升级为常驻的行级
+        // Computed（探测期间建立的订阅原样转移），无依赖行零对象分配。
+        // 返回 [mapFn 返回值, 行级 effect frame]。
+        function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined): [U, ReactiveEffect[]] {
+            const probe = itemProbe ?? (itemProbe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe()))
+            const value = probe.probe(() => mapFn(item, source.atomIndexes?.[index]!, mapContext!)) as U
+            if (!probe.hasCaptures()) return [value, EMPTY_ITEM_FRAME]
+
+            // CAUTION 只有依赖变化需要重算的行才需要 index atom（重算时行的位置可能已变化）；
+            //  仅含子 effect 的行（作为 frame 容器）不会被 trigger，getter 不会执行。
+            let newItemIndex: Atom<number>|undefined
+            if (probe.deps.length > 0) {
+                if (!addedAtomIndexesDep) {
+                    source.addAtomIndexesDep()
+                    addedAtomIndexesDep = true
+                }
+                newItemIndex = source.atomIndexes![index]!
+            }
+            const rowComputed = new Computed(() => {
+                // CAUTION 特别注意这里面的变量，我们只希望 track 用户 mapFn 里面用到的外部 reactive 对象，不希望 track 到自己的 key/index。
+                if (newItemIndex) {
+                    list.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw], newItemIndex, mapContext!))
+                }
+            }, undefined, true)
+            probe.transferCapturesTo(rowComputed)
+            // 探测已经完成了首次计算，行级 Computed 从 CLEAN 开始（下次依赖触发时正常重算）
+            rowComputed._status = STATUS_CLEAN
+            return [value, [rowComputed]]
+        }
 
         return new RxList(
             function computation(this: RxList<U>) {
@@ -498,47 +565,23 @@ export class RxList<T> extends Computed {
                 cleanupFns = useContext ? [] : undefined
 
                 const result: U[] = []
-                source.data.forEach((_, i) => {
+                const sourceData = source.data
+                for (let i = 0; i < sourceData.length; i++) {
                     const mapContext: MapContext|undefined = useContext ? {
                         onCleanup(fn: MapCleanupFn) {
                             cleanupFns![i] = fn
                         }
                     } : undefined
 
-                    // 注意这里逻辑有点复杂。如果内部有依赖，会发生重新计算，那么重计算时就要用 itemIndex 去更新。因为 index 是可能变化的。
-                    let newItemIndex: Atom<number>|undefined
                     if (options?.skipItemEffect) {
-                        result[i] = mapFn(source.data[i], source.atomIndexes?.[i]!, mapContext!)
+                        result[i] = mapFn(sourceData[i], source.atomIndexes?.[i]!, mapContext!)
                         this.effectFramesArray![i] = []
                     } else {
-                        const newItemRun = new Computed(() => {
-                            //有依赖并且是冲计算，就一定有 newItemIndex。
-                            // CAUTION 特别注意这里面的变量，我们只希望  track 用户 mapFn 里面用到的外部  reactive 对象，不希望 track 到自己的 key/index。
-                            if(newItemIndex) {
-                                this.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw], newItemIndex, mapContext!))
-                            } else {
-                                result[i] = mapFn(source.data[i], source.atomIndexes?.[i]!, mapContext!)
-                            }
-                        }, undefined, true)
-
-                        newItemRun.run()
-
-                        if (newItemRun.hasDeps()) {
-                            if (!addedAtomIndexesDep) {
-                                source.addAtomIndexesDep()
-                                addedAtomIndexesDep = true
-                            }
-                            newItemIndex = source.atomIndexes![i]!
-                        }
-                        if (shouldKeepMapItemEffect(newItemRun)) {
-                            this.effectFramesArray![i] = [newItemRun] as ReactiveEffect[]
-                        } else {
-                            newItemRun.destroy()
-                            this.effectFramesArray![i] = []
-                        }
+                        const [value, frame] = runItemAndCollectEffect(this, sourceData[i], i, mapContext)
+                        result[i] = value
+                        this.effectFramesArray![i] = frame
                     }
-
-                })
+                }
 
                 return result
             },
@@ -555,6 +598,8 @@ export class RxList<T> extends Computed {
 
                     if (method === 'splice') {
                         // CAUTION 这里重新从已经改变的  source 去读，才能重新被 reactive proxy 处理，和全量计算时收到的参数一样
+                        // CAUTION 第一次计算一定要使用 newItemsInArg 作为参数：有可能一批 triggerInfo 里
+                        //  有多次元素位置变化，此时很难从 source.data 推断元素的新位置。
                         const newItemsInArgs = argv!.slice(2)
                         const effectFrames: ReactiveEffect[][] = []
                         const newCleanups: MapCleanupFn[] = []
@@ -566,36 +611,13 @@ export class RxList<T> extends Computed {
                             } : undefined
                             let newItem: U
                             const newIndex = index + argv![0]!
-                            let newItemIndex: Atom<number>|undefined
                             if (options?.skipItemEffect) {
                                 newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
                                 effectFrames![index] = []
                             } else {
-                                const newItemRun = new Computed(() => {
-                                    // newItemIndex 是后面为每一个元素生成的，一开始是没有的。这里如果有，说明是内部有依赖变换发生的更新，已经不是第一次计算了。
-                                    if (newItemIndex) {
-                                        this.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw]!, newItemIndex, mapContext!))
-                                    } else {
-                                        // 第一次计算，一定要使用 newItemsInArg 作为参数。
-                                        // 因为有可能第一次计算就有多个 triggerInfo，里面多次元素位置变化，导致 source.data 很难知道元素的新位置。
-                                        newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
-                                    }
-                                }, undefined, true)
-                                newItemRun.run()
-
-                                if (newItemRun.hasDeps()) {
-                                    if (!addedAtomIndexesDep) {
-                                        source.addAtomIndexesDep()
-                                        addedAtomIndexesDep = true
-                                    }
-                                    newItemIndex = source.atomIndexes![newIndex]!
-                                }
-                                if (shouldKeepMapItemEffect(newItemRun)) {
-                                    effectFrames![index] = [newItemRun] as ReactiveEffect[]
-                                } else {
-                                    newItemRun.destroy()
-                                    effectFrames![index] = []
-                                }
+                                const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext)
+                                newItem = value
+                                effectFrames![index] = frame
                             }
                             return newItem!
                         })
@@ -658,6 +680,8 @@ export class RxList<T> extends Computed {
             options?.scheduleRecompute,
             {
                 onDestroy(this: RxList<U>)  {
+                    itemProbe?.destroy()
+                    itemProbe = undefined
                     if (addedAtomIndexesDep) {
                         source.removeAtomIndexesDep()
                     }

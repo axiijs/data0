@@ -743,6 +743,33 @@ describe('RxList', () => {
         expect(value).toBe(-1)
     })
 
+    test('map upgrades only rows whose mapFn actually read reactive data', () => {
+        // mapFn 按行条件读取响应式数据：只有读了的行升级为常驻行级 effect
+        const base = atom(10)
+        const list = new RxList<number>([1, 2, 3, 4])
+        const mapped = list.map(item => (item % 2 === 0 ? item + base() : item))
+        expect(mapped.toArray()).toMatchObject([1, 12, 3, 14])
+        // 奇数行无依赖不保留 effect，偶数行保留
+        expect(mapped.effectFramesArray!.map(f => f.length)).toMatchObject([0, 1, 0, 1])
+
+        // 依赖变化只重算有依赖的行
+        base(100)
+        expect(mapped.toArray()).toMatchObject([1, 102, 3, 104])
+
+        // 新增行同样按需升级（patch 路径）
+        list.push(5, 6)
+        expect(mapped.toArray()).toMatchObject([1, 102, 3, 104, 5, 106])
+        base(1000)
+        expect(mapped.toArray()).toMatchObject([1, 1002, 3, 1004, 5, 1006])
+
+        // 删除有依赖的行后，其 effect 被销毁，后续变更不再影响
+        list.splice(1, 1)
+        expect(mapped.toArray()).toMatchObject([1, 3, 1004, 5, 1006])
+
+        mapped.destroy()
+        list.destroy()
+    })
+
     test('lazy length meta created inside autorun survives the autorun rerun cleanup', () => {
         // 旧实现不能惰性创建 meta 的原因：在 autorun/computed 中首次读取时会被
         // 收集为该 effect 的 child，重跑 cleanup 时被误销毁。createDetached 修复后回归覆盖。
