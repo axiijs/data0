@@ -12,6 +12,17 @@ import {
 } from "./retainedDiagnostics";
 
 
+// CAUTION 共享的"空 deps"哨兵：所有 effect 初始都指向它，第一次 track 到 dep 时
+//  才替换成容量恰好为 1 的 [dep]（见 addDep）。两个动机：
+//  1. 渲染框架里绝大多数绑定 effect 只有 0 或 1 个 dep。旧实现 `deps = []` 后第一次
+//     push 会让 V8 直接把 elements store 扩到容量 17（0 + 0>>1 + 16），每个单 dep
+//     effect 白付 64B 常驻内存；`[dep]` 字面量的容量恰好是 1。
+//  2. 从未 track 到依赖的 effect（静态内容的 FunctionHost、探测后无依赖的 map 行）
+//     完全不为 deps 分配数组。
+//  所有写入必须走 addDep/transferCapturesTo；读取方（cleanup/dep markers/hasDeps）
+//  都有 length 守卫，对共享空数组只读不写。
+const SHARED_EMPTY_DEPS: Dep[] = []
+
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
     public active: boolean
@@ -52,7 +63,16 @@ export class ReactiveEffect extends ManualCleanup {
         effect.dispatch('destroy')
     }
 
-    deps: Dep[] = []
+    deps: Dep[] = SHARED_EMPTY_DEPS
+    // CAUTION deps 的唯一合法写入口（见 SHARED_EMPTY_DEPS 的说明）
+    addDep(dep: Dep) {
+        const deps = this.deps
+        if (deps === SHARED_EMPTY_DEPS) {
+            this.deps = [dep]
+        } else {
+            deps.push(dep)
+        }
+    }
     // 有增量计算的情况会 manual track dep，这时不要做 dep marker，因为不需要 finalize 自动对比的计算的过程。
     declare useDepMarker: boolean
     parent?: ReactiveEffect
@@ -321,7 +341,7 @@ export class ReactiveEffect extends ManualCleanup {
                 if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
                 dep.add(target)
                 trackRetainedDepEffectAdded(dep)
-                target.deps.push(dep)
+                target.addDep(dep)
             }
             deps.length = 0
         }
