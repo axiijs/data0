@@ -1,4 +1,4 @@
-import {Notifier} from "./notify";
+import {notifier} from "./notify";
 import {TrackOpTypes, TriggerOpTypes} from './operations'
 import {def, isPlainObject, isStringOrNumber} from "./util";
 import {ReactiveFlags} from "./flags";
@@ -59,7 +59,7 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
         if (Object.is(value, newValue)) return
         const oldValue = value
         value = newValue
-        Notifier.instance.trigger(finalProxy, TriggerOpTypes.ATOM, { key: 'value', newValue, oldValue})
+        notifier.trigger(finalProxy, TriggerOpTypes.ATOM, { key: 'value', newValue, oldValue})
     }
 
     const handler:Handler = {
@@ -169,7 +169,7 @@ function createPrimitiveAtom<T>(initValue: T, name?: string) {
         if (Object.is(updater[PRIMITIVE_ATOM_VALUE], newValue)) return
         const oldValue = updater[PRIMITIVE_ATOM_VALUE]
         updater[PRIMITIVE_ATOM_VALUE] = newValue as T
-        Notifier.instance.triggerPrimitiveAtomValue(updater, { key: 'value', newValue, oldValue})
+        notifier.triggerPrimitiveAtomValue(updater, { key: 'value', newValue, oldValue})
     } as PrimitiveAtomUpdater<T>
 
     // CAUTION setPrototypeOf 要在添加自有属性之前做，V8 对"先改原型再加属性"的对象
@@ -204,7 +204,6 @@ function primitiveAtomToPrimitive(this: PrimitiveAtomUpdater<unknown>, hint: str
 }
 
 function trackAtomValue(target: object, primitive = false) {
-    const notifier = Notifier.instance
     if (!notifier.shouldTrack || !ReactiveEffect.activeScopes.length) return
     if (primitive) {
         notifier.trackPrimitiveAtomValue(target)

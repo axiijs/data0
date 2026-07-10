@@ -11,15 +11,17 @@ export class ManualCleanup {
         const frame: CleanupFrame = []
         ManualCleanup.collectFrames.push(frame)
         return () => {
-            assert(ManualCleanup.collectFrames.at(-1) === frame, 'collect effect frame error')
-            return ManualCleanup.collectFrames.pop()!
+            const frames = ManualCleanup.collectFrames
+            assert(frames[frames.length - 1] === frame, 'collect effect frame error')
+            return frames.pop()!
         }
     }
 
     constructor() {
-        const collectFrame = ManualCleanup.collectFrames.at(-1)
-        if (collectFrame) {
-            collectFrame.push(this)
+        // CAUTION 每个 effect/computed 的构造都会经过这里，用索引访问而不是 .at(-1)
+        const frames = ManualCleanup.collectFrames
+        if (frames.length) {
+            frames[frames.length - 1].push(this)
         }
     }
 

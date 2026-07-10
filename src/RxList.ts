@@ -10,7 +10,7 @@ import {
 } from "./computed.js";
 import {Atom, atom, isAtom} from "./atom.js";
 import {Dep} from "./dep.js";
-import {InputTriggerInfo, ITERATE_KEY, Notifier, TriggerInfo} from "./notify.js";
+import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
@@ -156,7 +156,7 @@ export class RxList<T> extends Computed {
     }
     splice( start: number, deleteCount: number, ...items: T[]) {
         this.pauseAutoTrack()
-        // Notifier.instance.createEffectSession()
+        // notifier.createEffectSession()
 
         const originLength = this.data.length
         const deleteItemsCount = Math.min(deleteCount, originLength - start)
@@ -199,7 +199,7 @@ export class RxList<T> extends Computed {
         }
 
         // CATION 特别注意这里 atomIndexes 的变化也要先 catch 住
-        Notifier.instance.createEffectSession()
+        notifier.createEffectSession()
         this.sendTriggerInfos()
 
         if (this.atomIndexes) {
@@ -209,7 +209,7 @@ export class RxList<T> extends Computed {
                 this.atomIndexes[i]?.(i)
             }
         }
-        Notifier.instance.digestEffectSession()
+        notifier.digestEffectSession()
 
         this.resetAutoTrack()
         return result
@@ -371,7 +371,7 @@ export class RxList<T> extends Computed {
     }
     // CAUTION 这里手动 track index dep 的变化，是为了在 splice 的时候能手动去根据订阅的 index dep 触发，而不是直接触发所有的 index key。
     at(index: number): T|undefined{
-        const dep = Notifier.instance.track(this, TrackOpTypes.GET, index)
+        const dep = notifier.track(this, TrackOpTypes.GET, index)
         if (dep && !this.indexKeyDeps.has(index)) {
             this.indexKeyDeps.set(index, dep)
         }
@@ -385,7 +385,7 @@ export class RxList<T> extends Computed {
             handler(this.at(i)!, i)
         }
         // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
     }
     /**
      * @internal
@@ -394,7 +394,7 @@ export class RxList<T> extends Computed {
         let index = 0;
         let data = this.data;
         // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         return {
             next: () => {
                 if (index < data.length) {
@@ -427,7 +427,7 @@ export class RxList<T> extends Computed {
     // reactive methods and attr
     map<U>(mapFn: (item: T, index: Atom<number>, context:MapContext) => U, options?: MapOptions<U>) : RxList<U>{
         // CAUTION 生成数据结构的方法应该都不 track Iterable_Key。不然可能导致在 computed 里面的 map 方法被反复执行，这算是一种泄露了。
-        // Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        // notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
 
         const source = this
         const useIndex = mapFn.length>1 && !options?.ignoreIndex
@@ -498,8 +498,10 @@ export class RxList<T> extends Computed {
                 triggerInfos.forEach((triggerInfo) => {
 
                     const { method , argv  ,key } = triggerInfo
-                    assert((method === 'splice' || key !== undefined), 'trigger info has no method and key')
-                    assert(triggerInfo.source === source, 'unexpected triggerInfo source')
+                    if (__DEV__) {
+                        assert((method === 'splice' || key !== undefined), 'trigger info has no method and key')
+                        assert(triggerInfo.source === source, 'unexpected triggerInfo source')
+                    }
 
                     options?.beforePatch?.(triggerInfo)
 
@@ -743,7 +745,7 @@ export class RxList<T> extends Computed {
             }
             searchedItemAndIndexes[current] =currentItem
             resultComputed.autoTrack()
-            const getFrame = Notifier.instance.collectTrackTarget()
+            const getFrame = notifier.collectTrackTarget()
             const matchResult = matchFn(source.data[current])
             const trackTargets = getFrame()
             resultComputed.resetAutoTrack()
@@ -1053,7 +1055,7 @@ export class RxList<T> extends Computed {
         )
     }
     toArray() {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         return this.data
     }
     toMap() {

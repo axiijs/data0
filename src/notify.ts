@@ -77,6 +77,9 @@ export class Notifier {
     return Notifier._instance || (Notifier._instance = new Notifier())
   }
   trackTargetFrames: any[][] = []
+  // 栈顶 frame 的直接引用：track 热路径上每次读 trackTargetFrames.at(-1) 是一次
+  // 通用方法调用，绝大多数时候栈是空的，用一个字段判空即可
+  currentTrackFrame?: any[]
   // 被 track 的对象 {target -> key -> dep}
   targetMap= new WeakMap<any, KeyToDepMap>()
   shouldTrack = true
@@ -138,10 +141,14 @@ export class Notifier {
   collectTrackTarget() {
     const frame:any[] = []
     this.trackTargetFrames.push(frame)
+    this.currentTrackFrame = frame
     return () => {
-      assert(frame === this.trackTargetFrames.at(-1), 'track target frame error.')
+      assert(frame === this.currentTrackFrame, 'track target frame error.')
       // CAUTION 必须弹栈，否则 frame 永久驻留并继续收集后续所有 track target（内存泄漏）。
-      return this.trackTargetFrames.pop()!
+      const frames = this.trackTargetFrames
+      frames.pop()
+      this.currentTrackFrame = frames.length ? frames[frames.length - 1] : undefined
+      return frame
     }
   }
   getPrimitiveAtomDep(target: object) {
@@ -158,7 +165,8 @@ export class Notifier {
     return dep
   }
   trackPrimitiveAtomValue = (target: object) => {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect || !this.shouldTrack) return
     if (__DEV__) {
       assert(!(activeEffect instanceof Computed && target === activeEffect.data), 'should not read self in computed')
@@ -170,13 +178,14 @@ export class Notifier {
         : undefined
 
     // 手动收集的场景。
-    this.trackTargetFrames.at(-1)?.push(target)
+    if (this.currentTrackFrame !== undefined) this.currentTrackFrame.push(target)
 
     this.trackEffects(dep, eventInfo)
     return dep
   }
   track = (target: object, type: TrackOpTypes, key: unknown) => {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect || !this.shouldTrack) return
     // CAUTION 不能 track 自己。computed 在第二次执行的时候会有一个 replace 行为，会
     if (__DEV__) {
@@ -199,7 +208,7 @@ export class Notifier {
         : undefined
 
     // 手动收集的场景。
-    this.trackTargetFrames.at(-1)?.push(target)
+    if (this.currentTrackFrame !== undefined) this.currentTrackFrame.push(target)
 
     this.trackEffects(dep, eventInfo)
     return dep
@@ -208,7 +217,8 @@ export class Notifier {
       dep: Dep,
       debuggerEventExtraInfo?: DebuggerEventExtraInfo
   ) {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (!activeEffect) return
     let shouldTrack = false
     if (!activeEffect.isAsync) {
@@ -418,10 +428,12 @@ export class Notifier {
   ) {
     // spread into array for stabilization
     const effects = isArray(dep) ? dep : [...dep]
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     for (const effect of effects) {
       // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
       //  重算过程中可能会再次出发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
-      if (ReactiveEffect.activeScopes.at(-1) !== effect ) {
+      if (activeEffect !== effect ) {
         this.triggerEffect(effect, info, debuggerEventExtraInfo)
       }
     }
@@ -431,7 +443,8 @@ export class Notifier {
       info: TriggerInfo,
       debuggerEventExtraInfo?: DebuggerEventExtraInfo
   ) {
-    const activeEffect = ReactiveEffect.activeScopes.at(-1)
+    const scopes = ReactiveEffect.activeScopes
+    const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
     if (activeEffect === effect) throw new Error('recursive effect call')
 
     // 无监听者时不构造 payload（每次触发每个 effect 都会经过这里）
@@ -459,6 +472,13 @@ export class Notifier {
   }
 }
 
+// CAUTION 模块级单例引用：热路径（atom 读写、effect run、RxList track）每次经过
+//  Notifier.instance 静态 getter 都要做一次 `_instance ||` 判断。这里在模块求值时
+//  创建好单例，内部热点直接引用。Notifier.instance 公开 API 不变（返回同一个实例）。
+//  注意放在类定义之后求值；循环依赖模块（computed/reactiveEffect）只在函数体内使用，
+//  ESM live binding 保证调用时已初始化。
+export const notifier: Notifier = Notifier.instance
+
 /**
  * Batch reactive writes so dependent effects run once after the callback exits.
  *
@@ -466,10 +486,10 @@ export class Notifier {
  * boundary.
  */
 export function batch<T>(fn: () => T): T {
-  Notifier.instance.createEffectSession()
+  notifier.createEffectSession()
   try {
     return fn()
   } finally {
-    Notifier.instance.digestEffectSession()
+    notifier.digestEffectSession()
   }
 }

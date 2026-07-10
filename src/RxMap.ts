@@ -8,7 +8,7 @@ import {
     GetterType,
     SkipIndicator
 } from "./computed.js";
-import {ITERATE_KEY, Notifier} from "./notify.js";
+import {ITERATE_KEY, notifier} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {Atom} from "./atom.js";
 import {RxList} from "./RxList.js";
@@ -120,11 +120,11 @@ export class RxMap<K, V> extends Computed{
     // track methods
     get(key: K) {
         // 先执行 track 才会触发 recompute
-        Notifier.instance.track(this, TrackOpTypes.GET, key)
+        notifier.track(this, TrackOpTypes.GET, key)
         return this.data.get(key)
     }
     forEach(handler: (item: V, index: K) => void) {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
 
         for(let [key, value ] of this.data) {
             handler(value!, key)
@@ -135,7 +135,7 @@ export class RxMap<K, V> extends Computed{
         let index = 0;
         let data = this.data;
         // track length
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         const keys = Array.from(data.keys())
         return {
             next: () => {

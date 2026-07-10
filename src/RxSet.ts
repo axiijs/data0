@@ -1,6 +1,6 @@
 import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, GetterType} from "./computed.js";
 import {Atom} from "./atom.js";
-import {ITERATE_KEY, Notifier, TriggerInfo} from "./notify.js";
+import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {RxList} from "./RxList";
 /**
@@ -82,7 +82,7 @@ export class RxSet<T> extends Computed {
         const base = this
         //  has 是 n(1) 的操作，所以不用 applyPatch 了。
         return computed(() => {
-            Notifier.instance.track(base, TrackOpTypes.ITERATE, ITERATE_KEY)
+            notifier.track(base, TrackOpTypes.ITERATE, ITERATE_KEY)
             return base.data.has(value)
         })
     }
@@ -281,7 +281,7 @@ export class RxSet<T> extends Computed {
     }
     forEach(handler: (item: T) => void) {
         this.data.forEach(handler)
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
     }
     toList(): RxList<T> {
         const base = this
@@ -316,7 +316,7 @@ export class RxSet<T> extends Computed {
         )
     }
     toArray() {
-        Notifier.instance.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
         return [...this.data]
     }
     public size!: Atom<number>

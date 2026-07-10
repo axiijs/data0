@@ -1,5 +1,5 @@
 import {Dep, finalizeDepMarkers, initDepMarkers} from "./dep.js";
-import {maxMarkerBits, Notifier} from "./notify.js";
+import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import {ManualCleanup} from "./manualCleanup.js";
 import {isAsync, isGenerator} from "./util.js";
 import {
@@ -69,9 +69,10 @@ export class ReactiveEffect extends ManualCleanup {
         this.active = !!getter
         if (this.active) trackRetainedReactiveEffectCreated(this)
 
-        if (ReactiveEffect.activeScopes.length) {
-            const parent = ReactiveEffect.activeScopes.at(-1)
-            if (parent?.shouldCollectChild) {
+        const scopes = ReactiveEffect.activeScopes
+        if (scopes.length) {
+            const parent = scopes[scopes.length - 1]
+            if (parent.shouldCollectChild) {
                 this.parent = parent
                 this.index = parent.addChild(this)
             }
@@ -154,10 +155,10 @@ export class ReactiveEffect extends ManualCleanup {
 
     prepareTracking(isFirst = false, isAsync = this.isAsync) {
         if (!isAsync) {
-            Notifier.trackOpBit = 1 << ++Notifier.instance.effectTrackDepth
+            Notifier.trackOpBit = 1 << ++notifier.effectTrackDepth
             ReactiveEffect.activeScopes.push(this)
 
-            if (this.useDepMarker && Notifier.instance.effectTrackDepth <= maxMarkerBits) {
+            if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 initDepMarkers(this)
             } else {
                 this.cleanup()
@@ -178,12 +179,12 @@ export class ReactiveEffect extends ManualCleanup {
 
     completeTracking(isLast = false, isAsync = this.isAsync) {
         if (!isAsync) {
-            if (this.useDepMarker && Notifier.instance.effectTrackDepth <= maxMarkerBits) {
+            if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 finalizeDepMarkers(this)
             }
 
             ReactiveEffect.activeScopes.pop()
-            Notifier.trackOpBit = 1 << --Notifier.instance.effectTrackDepth
+            Notifier.trackOpBit = 1 << --notifier.effectTrackDepth
 
         } else {
             if (isLast) {
@@ -213,10 +214,10 @@ export class ReactiveEffect extends ManualCleanup {
         if(!this.isAsync) {
             try {
                 this.prepareTracking()
-                Notifier.instance.enableTracking()
+                notifier.enableTracking()
                 return this.callGetter()
             } finally {
-                Notifier.instance.resetTracking()
+                notifier.resetTracking()
                 this.completeTracking()
             }
         } else {
@@ -225,9 +226,9 @@ export class ReactiveEffect extends ManualCleanup {
             const generator = this.callGetter() as Generator<any, string, boolean>
             const resultPromise = this.runGenerator(generator, (isFirst) => {
                 this.prepareTracking(isFirst)
-                Notifier.instance.enableTracking()
+                notifier.enableTracking()
             }, (isLast) => {
-                Notifier.instance.resetTracking()
+                notifier.resetTracking()
                 this.completeTracking()
             })
 

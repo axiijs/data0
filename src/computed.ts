@@ -1,5 +1,5 @@
 import {getDebugName,} from "./debug";
-import {Notifier, TriggerInfo} from './notify'
+import {Notifier, notifier, TriggerInfo} from './notify'
 import {assert, isAsync, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
@@ -267,11 +267,11 @@ export class Computed extends ReactiveEffect {
         const getterContext = this.createGetterContext()
         warn('async getter can only track reactive data before first await. If you want to track more data, please use generator getter.')
         this.prepareTracking(true)
-        this.manualTracking ? Notifier.instance.pauseTracking() : Notifier.instance.enableTracking()
+        this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
         try {
             return this.getter!.call(this, getterContext!)
         } finally {
-            Notifier.instance.resetTracking()
+            notifier.resetTracking()
             this.completeTracking(true)
         }
     }
@@ -284,10 +284,10 @@ export class Computed extends ReactiveEffect {
                 if (runEffectId !== this.runtEffectId) return false
 
                 this.prepareTracking(isFirst)
-                this.manualTracking ? Notifier.instance.pauseTracking() : Notifier.instance.enableTracking()
+                this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
             },
             (isLast) => {
-                Notifier.instance.resetTracking()
+                notifier.resetTracking()
                 this.completeTracking(isLast)
             }
         )
@@ -295,13 +295,13 @@ export class Computed extends ReactiveEffect {
     callSimpleGetter() {
         const getterContext = this.createGetterContext()
         this.prepareTracking()
-        this.manualTracking ? Notifier.instance.pauseTracking() : Notifier.instance.enableTracking()
+        this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
         // CAUTION 一定要 try/finally：用户 getter 抛异常时必须复位全局追踪状态
         //  （activeScopes/effectTrackDepth/trackOpBit），否则一次异常会永久污染整个系统。
         try {
             return this.getter!.call(this, getterContext!)
         } finally {
-            Notifier.instance.resetTracking()
+            notifier.resetTracking()
             this.completeTracking()
         }
     }
@@ -330,8 +330,8 @@ export class Computed extends ReactiveEffect {
         return this._boundRecursiveMarkDirty ?? (this._boundRecursiveMarkDirty = () => this.recursiveMarkDirty())
     }
     recursiveMarkDirty() {
-        // CAUTION Notifier.instance.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
-        const depEffects = Notifier.instance.getDepEffects(this.trackClassInstance ? this: this.data)
+        // CAUTION notifier.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
+        const depEffects = notifier.getDepEffects(this.trackClassInstance ? this: this.data)
         if (!depEffects) return
 
         for(const effect of depEffects) {
@@ -470,7 +470,7 @@ export class Computed extends ReactiveEffect {
     }
     finishFullRecompute(result: any) {
         if (!this.preventEffectSession) {
-            Notifier.instance.createEffectSession()
+            notifier.createEffectSession()
         }
 
         this.replaceData(result)
@@ -481,7 +481,7 @@ export class Computed extends ReactiveEffect {
             this.phase = PATCH_PHASE
         }
         if (!this.preventEffectSession) {
-            Notifier.instance.digestEffectSession()
+            notifier.digestEffectSession()
         }
         this.settleCleanPromise()
         this.dispatch('clean')
@@ -581,13 +581,13 @@ export class Computed extends ReactiveEffect {
         if (!this._savedTriggerInfos?.length) return
         const infos = [...this._savedTriggerInfos]
         this._savedTriggerInfos.length = 0
-        Notifier.instance.createEffectSession()
+        notifier.createEffectSession()
         try {
             for(const info of infos) {
-                Notifier.instance.trigger(...info)
+                notifier.trigger(...info)
             }
         } finally {
-            Notifier.instance.digestEffectSession()
+            notifier.digestEffectSession()
         }
     }
     // 由 this.run/onTrack/forceDirtyDepsRecompute 调用
@@ -711,21 +711,21 @@ export class Computed extends ReactiveEffect {
     // 给继承者在 apply catch 中用的 工具函数
     // CAUTION 以下全部是原型方法（原来是每实例的箭头函数字段），调用点都是 this.xxx() 的方法调用
     manualTrack(target: object, type: TrackOpTypes, key: unknown) {
-        Notifier.instance.enableTracking()
+        notifier.enableTracking()
         const dep = isPrimitiveAtom(target) && type === TrackOpTypes.ATOM && key === 'value'
-            ? Notifier.instance.trackPrimitiveAtomValue(target)
-            : Notifier.instance.track(target, type, key)
-        Notifier.instance.resetTracking()
+            ? notifier.trackPrimitiveAtomValue(target)
+            : notifier.track(target, type, key)
+        notifier.resetTracking()
         return dep
     }
     pauseAutoTrack() {
-        Notifier.instance.pauseTracking()
+        notifier.pauseTracking()
     }
     autoTrack() {
-        Notifier.instance.enableTracking()
+        notifier.enableTracking()
     }
     resetAutoTrack() {
-        Notifier.instance.resetTracking()
+        notifier.resetTracking()
     }
     destroy(ignoreChildren = false) {
         assert(ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1] !== this, 'cannot destroy an active effect inside self')
