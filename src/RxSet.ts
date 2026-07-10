@@ -94,7 +94,12 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => !other.data.has(x)))
+                // 直接迭代 Set，省去 [...] 的中间数组物化
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (!other.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({ methodResult, method, argv, newValue, source, result}) => {
@@ -141,7 +146,11 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => other.data.has(x)))
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (other.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({type, method, methodResult, argv, newValue, source, result}) => {
@@ -178,7 +187,14 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data].filter(x => !other.data.has(x)).concat([...other.data].filter(x => !base.data.has(x))))
+                const result = new Set<T>()
+                for (const x of base.data) {
+                    if (!other.data.has(x)) result.add(x)
+                }
+                for (const x of other.data) {
+                    if (!base.data.has(x)) result.add(x)
+                }
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({methodResult, method, argv, newValue, source, result}) => {
@@ -221,7 +237,9 @@ export class RxSet<T> extends Computed {
             function computation(this: RxSet<T>) {
                 this.manualTrack(base, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(other, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
-                return new Set([...base.data, ...other.data])
+                const result = new Set<T>(base.data)
+                for (const x of other.data) result.add(x)
+                return result
             },
             function applyPatch(this: RxSet<T>, data:any, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach(({methodResult, method, argv, newValue, source, result}) => {

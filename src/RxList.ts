@@ -343,6 +343,29 @@ export class RxList<T> extends Computed {
         }
         return low
     }
+    // 在按 compare 有序的数组中定位与 item 引用相等的元素：
+    // 二分到相等区间后线性扫描（同序元素可能有多个）。找不到（比如元素的排序键
+    // 在删除前被外部改写、数组已不完全有序）返回 -1，调用方回退 indexOf 兜底。
+    private static binarySearchFind<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
+        let low = 0
+        let high = arr.length
+        while (low < high) {
+            const mid = (low + high) >>> 1
+            if (compare(arr[mid], item) < 0) {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        for (let i = low; i < arr.length && compare(arr[i], item) === 0; i++) {
+            if (arr[i] === item) return i
+        }
+        return -1
+    }
+    private static locateInSorted<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
+        const found = RxList.binarySearchFind(arr, item, compare)
+        return found !== -1 ? found : arr.indexOf(item)
+    }
 
     public toSorted(compare?: (a: T, b: T) => number): RxList<T> {
         const source = this
@@ -369,10 +392,10 @@ export class RxList<T> extends Computed {
                     const { method, argv, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
-                        // 1) remove items
+                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
                         const deletedItems = (methodResult as T[]) || []
                         deletedItems.forEach((item) => {
-                            const idx = this.data.indexOf(item)
+                            const idx = RxList.locateInSorted(this.data, item, compare!)
                             if (idx !== -1) {
                                 this.splice(idx, 1)
                             }
@@ -386,7 +409,7 @@ export class RxList<T> extends Computed {
                     } else {
                         // explicit key change: remove old, insert new
                         if (oldValue !== undefined) {
-                            const idx = this.data.indexOf(oldValue as T)
+                            const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
                             if (idx !== -1) {
                                 this.splice(idx, 1)
                             }

@@ -310,16 +310,24 @@ export class Computed extends ReactiveEffect {
         }
     }
 
+    // CAUTION context 对象整体复用：带 context 参数的 getter（如 filter 的每行 computed）
+    //  每次重算都要走这里，原实现每次分配 1 个对象 + 1 个闭包 + 2 个 bind。
+    //  context 的契约是"仅在 getter 执行期间有效"，跨次复用安全；lastValue 每次刷新。
+    declare _getterContext?: GetterContext
     createGetterContext(): GetterContext | undefined {
-        // pauseCollectChild/resumeCollectChild 是原型方法，传给 context 时要 bind；
-        // 只有 getter 声明了参数才会走到这里，绑定成本只有用 context 的 computed 才付。
-        return (this.getter && this.getter?.length > 0) ? {
+        if (!this.getter || this.getter.length === 0) return undefined
+        const cached = this._getterContext
+        if (cached) {
+            cached.lastValue = this.data
+            return cached
+        }
+        return this._getterContext = {
             lastValue: this.data,
             onCleanup: (fn: () => any) => this.lastCleanupFn = fn,
             asyncStatus: this.asyncStatus!,
-            pauseCollectChild: this.pauseCollectChild.bind(this),
-            resumeCollectChild: this.resumeCollectChild.bind(this),
-        } : undefined
+            pauseCollectChild: () => this.pauseCollectChild(),
+            resumeCollectChild: () => this.resumeCollectChild(),
+        }
     }
 
     callGetter() {

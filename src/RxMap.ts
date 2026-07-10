@@ -131,24 +131,11 @@ export class RxMap<K, V> extends Computed{
         }
         // track iterator
     }
-    [Symbol.iterator]() {
-        let index = 0;
-        let data = this.data;
-        // track length
+    [Symbol.iterator](): IterableIterator<[K, V]> {
+        // 与 forEach 一致：只 track ITERATE_KEY（set/delete/add 的变更路径都会通知它），
+        // 直接用原生 Map 迭代器，不再快照 keys 数组、也不逐 key track GET
         notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
-        const keys = Array.from(data.keys())
-        return {
-            next: () => {
-                if (index < keys.length) {
-                    // 转发到 at 上实现 track index
-                    const key = keys[index++]
-                    const value = this.get(key)
-                    return { value: [key, value], done: false };
-                } else {
-                    return { done: true };
-                }
-            }
-        };
+        return this.data[Symbol.iterator]()
     }
     // CAUTION keys/values/entries/size 全部惰性创建：旧实现每个 RxMap 构造时无条件
     //  预建 1 个 keys RxList + 2 个 map 派生 RxList + 1 个 size computed（约 5 个

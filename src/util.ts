@@ -226,11 +226,13 @@ export function uuid() {
 export function replace(source: any, nextSourceValue: any) {
     const rawSource = source
     if (Array.isArray(source)) {
-        source.splice(0, Infinity, ...nextSourceValue)
+        spliceMany(source, 0, Infinity, nextSourceValue)
     } else if (isPlainObject(source)) {
-        const nextKeys = Object.keys(nextSourceValue)
-        const keysToDelete = Object.keys(rawSource).filter(k => !nextKeys.includes(k))
-        keysToDelete.forEach((k) => delete (source as { [k: string]: any })[k])
+        // Set 查找而不是 includes：对象 key 多时 filter+includes 是 O(n²)
+        const nextKeys = new Set(Object.keys(nextSourceValue))
+        for (const k of Object.keys(rawSource)) {
+            if (!nextKeys.has(k)) delete (source as { [k: string]: any })[k]
+        }
         Object.assign(source, nextSourceValue)
     } else if (source instanceof Map) {
 
