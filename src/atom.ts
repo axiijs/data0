@@ -158,19 +158,24 @@ const primitiveAtomProto = Object.create(Function.prototype, {
 
 function createPrimitiveAtom<T>(initValue: T, name?: string) {
     // CAUTION 只能这样写才能支持 arguments.length === 0 ，否则就永远不会 为 0
-    const updater = function(newValue?: T): T | void {
+    // CAUTION 用命名函数表达式（NFE）自引用而不是闭包变量自引用：
+    //  闭包变量自引用会让每个 atom 携带一个只装着自己的 Context 对象（每 atom ~20B 常驻）；
+    //  NFE 的名字绑定由函数对象自身承载，函数体又不捕获任何创建期变量
+    //  （initValue/name 都只在函数外使用），所以每个 atom 不再分配专属 Context。
+    const updater = function updater(newValue?: T): T | void {
+        const self = updater as PrimitiveAtomUpdater<T>
         if (arguments.length === 0) {
-            trackAtomValue(updater, true)
-            return updater[PRIMITIVE_ATOM_VALUE]
+            trackAtomValue(self, true)
+            return self[PRIMITIVE_ATOM_VALUE]
         }
 
         // CAUTION 和 Proxy atom 保持一致，不再支持 newValue 为 function 的 updater 语义。
         // Object.is 而不是 ===：NaN 重复写入不应该反复触发
-        if (Object.is(updater[PRIMITIVE_ATOM_VALUE], newValue)) return
-        const oldValue = updater[PRIMITIVE_ATOM_VALUE]
-        updater[PRIMITIVE_ATOM_VALUE] = newValue as T
+        if (Object.is(self[PRIMITIVE_ATOM_VALUE], newValue)) return
+        const oldValue = self[PRIMITIVE_ATOM_VALUE]
+        self[PRIMITIVE_ATOM_VALUE] = newValue as T
         // 标量传参：atom 写路径不构造 info 对象（见 triggerPrimitiveAtomValue）
-        notifier.triggerPrimitiveAtomValue(updater, newValue, oldValue)
+        notifier.triggerPrimitiveAtomValue(self, newValue, oldValue)
     } as PrimitiveAtomUpdater<T>
 
     // CAUTION setPrototypeOf 要在添加自有属性之前做，V8 对"先改原型再加属性"的对象

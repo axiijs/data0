@@ -179,15 +179,28 @@ export class Computed extends ReactiveEffect {
         this._updatedAtTime = time
         if (this._updatedAt) this._updatedAt(time)
     }
+    // CAUTION 可选构造参数不再用参数属性（public xxx）声明：参数属性会无条件产生
+    //  own property 赋值，即使值是 undefined 也占一个实例槽位。这里全部改成
+    //  "有值才赋"，默认值放在原型上（见 class 定义后的赋值）。
+    //  getter 复用 ReactiveEffect 里同样的条件赋值，不再重复声明。
+    declare getter?: GetterType
+    declare applyPatch?: ApplyPatchType
+    declare callbacks?: CallbacksType
+    declare skipIndicator?: SkipIndicator
+    declare preventEffectSession: boolean
     constructor(
-        public getter?: GetterType,
-        public applyPatch?: ApplyPatchType,
+        getter?: GetterType,
+        applyPatch?: ApplyPatchType,
         scheduleRecompute?: DirtyCallback|true,
-        public callbacks?: CallbacksType,
-        public skipIndicator?: SkipIndicator,
-        public preventEffectSession = false
+        callbacks?: CallbacksType,
+        skipIndicator?: SkipIndicator,
+        preventEffectSession?: boolean
     ) {
         super(getter)
+        if (applyPatch !== undefined) this.applyPatch = applyPatch
+        if (callbacks !== undefined) this.callbacks = callbacks
+        if (skipIndicator !== undefined) this.skipIndicator = skipIndicator
+        if (preventEffectSession) this.preventEffectSession = true
         markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
         this._status = typeof getter === 'function' ? STATUS_DIRTY : STATUS_CLEAN
 
@@ -788,6 +801,7 @@ export class Computed extends ReactiveEffect {
 // 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（同 ReactiveEffect 的做法）
 Computed.prototype.scheduleNeedsInfos = false
 Computed.prototype._cleanExpected = false
+Computed.prototype.preventEffectSession = false
 
 /**
  * @category Basic

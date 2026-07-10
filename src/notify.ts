@@ -271,14 +271,14 @@ export class Notifier {
       //  这才是合理的，因为不管哪种都说明 dirty。
       dep.add(activeEffect!)
       trackRetainedDepEffectAdded(dep)
-      activeEffect!.deps.push(dep)
+      activeEffect!.addDep(dep)
       // 如果是 async 的任务，那么在最后 complete 的时候应该应该用新的 dep 完全替换旧的 dep
       if (activeEffect.isAsync) {
         activeEffect.queueAsyncTrack(() => {
           if(!dep.has(activeEffect!)) {
             dep.add(activeEffect!)
             trackRetainedDepEffectAdded(dep)
-            activeEffect!.deps.push(dep)
+            activeEffect!.addDep(dep)
           }
         })
       }

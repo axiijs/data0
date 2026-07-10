@@ -575,7 +575,9 @@ export class RxList<T> extends Computed {
 
                     if (options?.skipItemEffect) {
                         result[i] = mapFn(sourceData[i], source.atomIndexes?.[i]!, mapContext!)
-                        this.effectFramesArray![i] = []
+                        // 共享的 frozen 空 frame：skipItemEffect 模式下每行必然无 effect，
+                        // 不为对齐 splice 索引的占位再逐行分配空数组
+                        this.effectFramesArray![i] = EMPTY_ITEM_FRAME
                     } else {
                         const [value, frame] = runItemAndCollectEffect(this, sourceData[i], i, mapContext)
                         result[i] = value
@@ -613,7 +615,7 @@ export class RxList<T> extends Computed {
                             const newIndex = index + argv![0]!
                             if (options?.skipItemEffect) {
                                 newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
-                                effectFrames![index] = []
+                                effectFrames![index] = EMPTY_ITEM_FRAME
                             } else {
                                 const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext)
                                 newItem = value
