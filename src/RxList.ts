@@ -379,33 +379,27 @@ export class RxList<T> extends Computed {
         return this.data[index]
     }
 
+    // CAUTION 遍历型读取只 track ITERATE_KEY，不再为每个 index 建 dep：
+    //  所有变更路径都必然通知 ITERATE_KEY 订阅者（splice/reorder → METHOD(key=ITERATE_KEY)，
+    //  set → SET 会附带 ITERATE_KEY dep，见 notify.trigger 的 SET case），逐 index track
+    //  是纯冗余——一次 forEach 会建立 O(n) 个 index dep（重算时 O(n) 的 marker 双遍历），
+    //  并把列表永久推入 splice 的逐 index 触发慢路径。
+    //  index 级细粒度依赖仍由显式 at() 提供。
     forEach(handler: (item: T, index: number) => void) {
-        for (let i = 0; i < this.data.length; i++) {
-            // 转发到 at 上实现 track
-            handler(this.at(i)!, i)
-        }
-        // track length
         notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        const data = this.data
+        for (let i = 0; i < data.length; i++) {
+            handler(data[i], i)
+        }
     }
     /**
      * @internal
      */
-    [Symbol.iterator]() {
-        let index = 0;
-        let data = this.data;
-        // track length
+    [Symbol.iterator](): IterableIterator<T> {
         notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
-        return {
-            next: () => {
-                if (index < data.length) {
-                    // 转发到 at 上实现 track index
-                    const value = this.at(index)
-                    return { value, done: false };
-                } else {
-                    return { done: true };
-                }
-            }
-        };
+        // 直接用原生数组迭代器（引擎优化，不逐步分配 result 对象）。
+        // 旧的手写 iterator 从不递增 index，for...of 非空列表会死循环。
+        return this.data[Symbol.iterator]()
     }
     /**
      * @internal

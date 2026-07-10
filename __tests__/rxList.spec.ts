@@ -627,6 +627,63 @@ describe('RxList', () => {
         expect(forEachRuns).toBe(3)
     })
 
+    test('forEach reruns on set() and does not create per-index deps', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const collected: number[][] = []
+        autorun(() => {
+            const current: number[] = []
+            list.forEach(item => current.push(item))
+            collected.push(current)
+        }, true)
+        expect(collected).toMatchObject([[1, 2, 3]])
+
+        // 遍历型读取只依赖 ITERATE_KEY，不应把列表推入 index dep 慢路径
+        expect(list._indexKeyDeps?.size ?? 0).toBe(0)
+
+        list.set(1, 20)
+        expect(collected).toMatchObject([[1, 2, 3], [1, 20, 3]])
+    })
+
+    test('for...of iterates and reacts to splice/set', () => {
+        // 旧实现的手写 iterator 从不递增 index，for...of 会死循环（回归覆盖）
+        const list = new RxList<number>([1, 2, 3])
+        const sums: number[] = []
+        autorun(() => {
+            let sum = 0
+            for (const item of list) {
+                sum += item
+            }
+            sums.push(sum)
+        }, true)
+        expect(sums).toMatchObject([6])
+
+        list.splice(1, 1, 10)
+        expect(sums).toMatchObject([6, 14])
+
+        list.set(0, 100)
+        expect(sums).toMatchObject([6, 14, 113])
+
+        expect([...list]).toMatchObject([100, 10, 3])
+    })
+
+    test('at() keeps fine-grained index dep: unrelated splice does not rerun', () => {
+        const list = new RxList<number>([1, 2, 3, 4, 5])
+        let runs = 0
+        autorun(() => {
+            runs++
+            list.at(1)
+        }, true)
+        expect(runs).toBe(1)
+
+        // 只订阅 index 1，修改 index 3 不应重跑
+        list.set(3, 40)
+        expect(runs).toBe(1)
+
+        // 影响 index 1 的 splice 要重跑
+        list.splice(1, 1, 20)
+        expect(runs).toBe(2)
+    })
+
 
     // groupBy
     test('groupBy', () => {
