@@ -9,7 +9,7 @@ import {
     setComputedRetainedDiagnosticSource
 } from "./computed.js";
 import {Atom, atom, isAtom} from "./atom.js";
-import {Dep} from "./dep.js";
+import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert, spliceMany} from "./util.js";
@@ -97,6 +97,22 @@ export class RxList<T> extends Computed {
     }
     /**
      * @internal
+     * 清扫已无订阅者的 index dep，返回是否仍有活跃订阅。
+     * CAUTION 悬崖修复：at() 建立的 index dep 在 effect 全部退订后 Map entry 仍在，
+     *  旧实现据此永久走 splice 的逐 index 触发慢路径（也是缓慢的内存增长）。
+     *  订阅者退订不会回调 RxList（Notifier 不知道 dep 的归属），所以在每次
+     *  结构变更入口做一次 O(订阅数) 的惰性清扫——这些 entry 本来也要被遍历。
+     */
+    pruneIndexKeyDeps(): boolean {
+        const indexDeps = this._indexKeyDeps
+        if (!indexDeps || indexDeps.size === 0) return false
+        for (const [index, dep] of indexDeps) {
+            if (isDepEmpty(dep)) indexDeps.delete(index)
+        }
+        return indexDeps.size > 0
+    }
+    /**
+     * @internal
      */
     atomIndexes? :Atom<number>[]
     /**
@@ -134,7 +150,7 @@ export class RxList<T> extends Computed {
     clear() {
         const length = this.data.length
         if (length === 0) return []
-        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         const hasAtomIndexes = !!this.atomIndexes
         if (length === 1 || hasIndexKeyDeps || hasAtomIndexes) return this.splice(0, length)
 
@@ -165,7 +181,8 @@ export class RxList<T> extends Computed {
 
         const originLength = this.data.length
         const deleteItemsCount = Math.min(deleteCount, originLength - start)
-        const hasIndexKeyDeps = !!this._indexKeyDeps?.size
+        // 清扫空 index dep：曾被 at() 订阅、现已全部退订的列表要能回到 fast path
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         const hasAtomIndexes = !!this.atomIndexes
         const canUseMetadataFastPath = !hasIndexKeyDeps && !hasAtomIndexes
         const isPureAppend = start === originLength && deleteCount === 0
@@ -183,10 +200,19 @@ export class RxList<T> extends Computed {
         // CAUTION 不需要触发 length 的变化，因为获取  length 的时候得到就已经是个 computed 了。
         const newLength = originLength - deleteItemsCount + items.length
         const changedIndexEnd = deleteItemsCount !== items.length ? newLength : start + items.length
-        const oldValues: T[] | undefined = hasIndexKeyDeps ? [] : undefined
+        // CAUTION 只对"实际有订阅者且落在受影响区间"的 index 记录 oldValue / 触发 SET：
+        //  旧实现对 [start, changedIndexEnd) 逐 index 触发，一次中段 splice 是 O(移动范围)
+        //  次 trigger；订阅通常是稀疏的（axii 每行订阅自己的 index），按订阅遍历后
+        //  复杂度变为 O(订阅数)。触发保持升序，与旧实现的可观察顺序一致。
+        let affected: [index: number, oldValue: T][] | undefined
         if (hasIndexKeyDeps) {
-            for (let i = start; i < changedIndexEnd; i++) {
-                oldValues![i] = this.data[i]
+            for (const index of this._indexKeyDeps!.keys()) {
+                if (index >= start && index < changedIndexEnd) {
+                    (affected ?? (affected = [])).push([index, this.data[index]])
+                }
+            }
+            if (affected && affected.length > 1) {
+                affected.sort((a, b) => a[0] - b[0])
             }
         }
         const result = spliceMany(this.data, start, deleteCount, items)
@@ -196,10 +222,9 @@ export class RxList<T> extends Computed {
         //  特别这里注意，我们利用传了 key 就会把对应 key 的 dep 拿出来的特性来 trigger ITERATE_KEY.
         //  CAUTION 一定先 trigger method，这样可能后面某些被删除的 atomIndexes 变化就不需要了。
         this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
-        // 只有当有 indexKeyDeps 的时候才需要手动查找 dep 和触发，这样效率更高
-        if (hasIndexKeyDeps){
-            for (let i = start; i < changedIndexEnd; i++) {
-                this.trigger(this, TriggerOpTypes.SET, { key: i, newValue: this.data[i], oldValue: oldValues![i]})
+        if (affected) {
+            for (const [index, oldValue] of affected) {
+                this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: this.data[index], oldValue })
             }
         }
 
@@ -242,9 +267,11 @@ export class RxList<T> extends Computed {
         // 要不要触发 set 语义呢？理论上是需要的
         const originItems = originIndexes.map(index => this.data[index])
         const originItemsInNewIndexes = newIndexes.map(index => this.data[index])
+        // 只对实际有订阅者的 index 触发 SET（清扫见 pruneIndexKeyDeps）
+        const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         newIndexes.forEach((newIndex, i) => {
             this.data[newIndex]= originItems[i]
-            if (this._indexKeyDeps?.size) {
+            if (hasIndexKeyDeps && this._indexKeyDeps!.has(newIndex)) {
                 this.trigger(this, TriggerOpTypes.SET, { key: newIndex, newValue: originItems[i], oldValue: originItemsInNewIndexes[i]})
             }
             if (oldIndexAtoms) {

@@ -100,6 +100,14 @@ export class CompactDep implements Dep {
 
 export const createCompactDep = (effects?: ReactiveEffect[]): Dep => new CompactDep(effects)
 
+// dep 是否已无任何订阅者（订阅者退订后 dep 对象本身还留在各处的记账 Map 里）
+export const isDepEmpty = (dep: Dep): boolean => {
+    if (dep instanceof CompactDep) {
+        return dep.single === undefined && (dep.overflow === undefined || dep.overflow.size === 0)
+    }
+    return (dep as unknown as Set<ReactiveEffect>).size === 0
+}
+
 export const wasTracked = (dep: Dep): boolean => (dep.w & Notifier.trackOpBit) > 0
 
 export const newTracked = (dep: Dep): boolean => (dep.n & Notifier.trackOpBit) > 0

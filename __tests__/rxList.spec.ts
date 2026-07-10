@@ -713,6 +713,36 @@ describe('RxList', () => {
         expect(runs).toBe(2)
     })
 
+    test('subscribed index far from splice point still updates (sparse subscription)', () => {
+        const list = new RxList<number>(Array.from({length: 1000}, (_, i) => i))
+        let value = -1
+        autorun(() => { value = list.at(500)! }, true)
+        expect(value).toBe(500)
+
+        // 头部删除使整体前移，订阅的 index 500 必须收到新值
+        list.splice(0, 1)
+        expect(value).toBe(501)
+
+        // 头部插入使整体后移
+        list.splice(0, 0, -1)
+        expect(value).toBe(500)
+
+        // reorder 覆盖到订阅 index 时也要更新
+        list.swap(500, 0)
+        expect(value).toBe(-1)
+    })
+
+    test('index deps of unsubscribed effects are pruned so splice returns to the fast path', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const stop = autorun(() => { list.at(0) }, true)
+        expect(list._indexKeyDeps!.size).toBe(1)
+
+        stop()
+        // 退订后 dep entry 惰性清扫：下一次结构变更时移除
+        list.push(4)
+        expect(list._indexKeyDeps!.size).toBe(0)
+    })
+
 
     // groupBy
     test('groupBy', () => {
