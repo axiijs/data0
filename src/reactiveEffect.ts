@@ -20,8 +20,9 @@ import {
 //  2. 从未 track 到依赖的 effect（静态内容的 FunctionHost、探测后无依赖的 map 行）
 //     完全不为 deps 分配数组。
 //  所有写入必须走 addDep/transferCapturesTo；读取方（cleanup/dep markers/hasDeps）
-//  都有 length 守卫，对共享空数组只读不写。
-const SHARED_EMPTY_DEPS: Dep[] = []
+//  都有 length 守卫，对共享空数组只读不写。freeze 保证未来出现绕过 addDep 的
+//  直接 push 时立刻抛错（ESM 严格模式），而不是静默地跨 effect 污染订阅。
+const SHARED_EMPTY_DEPS: Dep[] = Object.freeze([]) as unknown as Dep[]
 
 export class ReactiveEffect extends ManualCleanup {
     static activeScopes: ReactiveEffect[] = []
