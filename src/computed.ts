@@ -55,25 +55,34 @@ export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, 
 
 const queuedRecomputes = new WeakSet<Computed>()
 
+// 调度上下文（microtask/nextTick）没有可以同步传播异常的调用方：
+// 1. 一定要先出队再执行，否则 recompute 抛错（同步 getter 的异常会重抛）会把
+//    computed 永久卡在 queuedRecomputes 里，之后永远无法再被调度；
+//    先出队还保证执行期间的新触发能重新入队，而不是被去重静默吞掉。
+// 2. 异常必须捕获并上报（而不是变成 microtask 的 uncaught exception 崩掉进程）。
+//    computed 已经由 handleRecomputeError 复位为 DIRTY，下次触发可以重试。
+function runScheduledRecompute(this: Computed, recompute: (force?: boolean) => void) {
+    queuedRecomputes.delete(this)
+    try {
+        recompute()
+    } catch (err) {
+        console.error('[data0] uncaught error in scheduled recompute:', err)
+    }
+}
+
 // 如果是 async 的，用 queueMicrotask 来调度。
 // 如果不是 async 的，用 markDirty 而不是直接 recompute
 export function scheduleNextMicroTask(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
     if (queuedRecomputes.has(this)) return
     queuedRecomputes.add(this)
-    queueMicrotask(() => {
-        recompute()
-        queuedRecomputes.delete(this)
-    })
+    queueMicrotask(() => runScheduledRecompute.call(this, recompute))
 }
 
 
 export function scheduleNextTick(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
     if (queuedRecomputes.has(this)) return
     queuedRecomputes.add(this)
-    nextTick(() => {
-        recompute()
-        queuedRecomputes.delete(this)
-    })
+    nextTick(() => runScheduledRecompute.call(this, recompute))
 }
 
 export const STATUS_DIRTY = -1
