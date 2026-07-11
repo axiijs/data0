@@ -572,6 +572,25 @@ describe('F10: NaN 键/元素的增量删除', () => {
 })
 
 describe('杂项修复', () => {
+    test('负小数 splice start 归一化为 +0,findIndex 不返回 -0', () => {
+        const source = new RxList([5, 1, 2])
+        const found = source.findIndex(x => x % 5 === 0)
+        try {
+            expect(found.raw).toBe(0)
+            // -0.5 经 ToIntegerOrInfinity 应为 +0(规范语义),而不是 -0
+            source.splice(-0.5, 1, 11)
+            expect(source.data).toEqual([11, 1, 2])
+            expect(Object.is(found.raw, -0)).toBe(false)
+            expect(found.raw).toBe(-1)
+            source.splice(-0.5, 0, 15)
+            expect(Object.is(found.raw, -0)).toBe(false)
+            expect(found.raw).toBe(0)
+        } finally {
+            destroyComputed(found)
+            source.destroy()
+        }
+    })
+
     test('getCachedValue 缓存 falsy 值', () => {
         const c = new Computed(function (this: Computed) { return 1 })
         c.run([], true)
