@@ -825,10 +825,10 @@ describe('RxList', () => {
         expect(grouped.get('low')!.toArray()).toMatchObject([{id:1, score: 1}, {id:2, score: 2}, {id: 3, score: 1}])
         expect(grouped.get('high')!.toArray()).toMatchObject([{id:4, score: 4}, {id: 0, score: 3}])
 
-        // splice 在前面，有影响
+        // splice 在前面，有影响；group 内顺序与 source 保持一致
         list.splice(3, 0, {id: 5, score: 3})
         expect(grouped.get('low')!.toArray()).toMatchObject([{id:1, score: 1}, {id:2, score: 2}, {id: 3, score: 1}])
-        expect(grouped.get('high')!.toArray()).toMatchObject([{id:4, score: 4}, {id: 0, score: 3}, {id: 5, score: 3}])
+        expect(grouped.get('high')!.toArray()).toMatchObject([{id: 5, score: 3}, {id:4, score: 4}, {id: 0, score: 3}])
 
         list.splice(2, Infinity)
         expect(grouped.get('low')!.toArray()).toMatchObject([{id:1, score: 1}, {id:2, score: 2}])

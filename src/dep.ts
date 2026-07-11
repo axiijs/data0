@@ -1,6 +1,6 @@
 import { Notifier } from './notify'
 import {ReactiveEffect} from "./reactiveEffect.js";
-import {trackRetainedDepEffectRemoved} from "./retainedDiagnostics";
+import {trackRetainedDepEffectAdded, trackRetainedDepEffectRemoved} from "./retainedDiagnostics";
 
 export type Dep = DepCollection & TrackedMarkers
 
@@ -137,4 +137,34 @@ export const finalizeDepMarkers = (effect: ReactiveEffect) => {
     }
     deps.length = ptr
   }
+}
+
+/**
+ * Restore the exact dependency set that existed before a failed recompute.
+ *
+ * A getter may throw after prepareTracking has either marked or removed the old
+ * deps and after it has partially collected new deps. Error recovery must retain
+ * the last successful dependency graph: otherwise a throw before the first read
+ * permanently unsubscribes the effect and no later source write can retry it.
+ *
+ * This runs only on the error path, so the temporary Set has no hot-path cost.
+ */
+export const restoreEffectDeps = (effect: ReactiveEffect, previousDeps?: Dep[]) => {
+  const previous = previousDeps ?? []
+  const previousSet = new Set(previous)
+
+  for (const dep of effect.deps) {
+    if (!previousSet.has(dep) && dep.delete(effect)) {
+      trackRetainedDepEffectRemoved(dep)
+    }
+  }
+
+  for (const dep of previous) {
+    if (!dep.has(effect)) {
+      dep.add(effect)
+      trackRetainedDepEffectAdded(dep)
+    }
+  }
+
+  effect.deps = previous
 }
