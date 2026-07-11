@@ -74,17 +74,20 @@ class MapItemDependencyProbe extends ReactiveEffect {
 const EMPTY_ITEM_FRAME = Object.freeze([]) as unknown as ReactiveEffect[]
 
 /**
- * dev 不变量：atomIndexes 与 data 严格等长，且第 i 个 atom 的值恒为 i。
+ * dev 不变量：atomIndexes 不长于 data，且每个**存在**的 entry 第 i 个 atom 的值恒为 i。
  * 违约意味着行级 index 记账出错（map 行会拿到错误位置），在变更当刻炸掉,
  * 而不是等下游行为漂移。模块级函数且仅在 __DEV__ 分支引用：
  * 生产构建连函数体一起被 DCE 移除，零运行时与零体积开销。
  * 全量值扫描是 O(n)，仅存在 atomIndexes（有行级 index 订阅）时发生。
+ * CAUTION 容忍稀疏：越界 set（契约内透传）会让 data 变长/出洞而不维护 atomIndexes,
+ *  "更短/有洞"不算违约；"更长"或"存在的值漂移"才是 splice/reorder 记账缺陷。
  */
 function assertAtomIndexesAligned(list: RxList<any>) {
     if (!list.atomIndexes) return
-    assert(list.atomIndexes.length === list.data.length, 'atomIndexes length misaligned with data')
+    assert(list.atomIndexes.length <= list.data.length, 'atomIndexes longer than data')
     for (let i = 0; i < list.atomIndexes.length; i++) {
-        assert(list.atomIndexes[i].raw === i, `atomIndex value drift at ${i}`)
+        const indexAtom = list.atomIndexes[i]
+        if (indexAtom) assert(indexAtom.raw === i, `atomIndex value drift at ${i}`)
     }
 }
 
@@ -315,6 +318,12 @@ export class RxList<T> extends Computed {
             this.sendTriggerInfos()
 
             if (this.atomIndexes) {
+                // CAUTION 稀疏对齐：越界 set（契约内透传）会让 data 变长而 atomIndexes
+                //  没跟上。此时必须先把 atomIndexes 撑到 splice 前的 data 长度（产生洞,
+                //  零分配），否则 native splice 会把 start 钳到旧长度，新 index atom
+                //  全部插错位置（值与位置漂移）。洞位置不分配 atom（与初始构建时
+                //  Array#map 跳过稀疏洞的行为一致），由下方 ?. 跳过。
+                if (this.atomIndexes.length < originLength) this.atomIndexes.length = originLength
                 spliceMany(this.atomIndexes, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
                 for (let i = normalizedStart; i <changedIndexEnd; i++) {
                     // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
@@ -715,7 +724,10 @@ export class RxList<T> extends Computed {
                         const deletedItems = this.spliceArray(spliceStart, spliceDeleteCount, newItems)
                         const deletedFrames = spliceMany(this.effectFramesArray!, spliceStart, spliceDeleteCount, effectFrames)
                         deletedFrames.forEach((frame) => {
-                            frame.forEach((effect) => {
+                            // CAUTION 稀疏行安全：越界 set（契约内透传）会让行记账产生洞，
+                            //  reorder 的搬移又会把洞物化成显式 undefined（forEach 不再跳过）。
+                            //  删除区间覆盖这类行时 frame 可能为 undefined。
+                            frame?.forEach((effect) => {
                                 this.destroyEffect(effect)
                             })
                         })
@@ -1143,7 +1155,7 @@ export class RxList<T> extends Computed {
             let pos = 0
             for (let i = 0; i < rows.length; i++) {
                 if (rows[i] === self) return pos
-                if (rows[i].raw) pos++
+                if (rows[i]?.raw) pos++
             }
             return -1
         }
@@ -1203,8 +1215,9 @@ export class RxList<T> extends Computed {
                     let removeStart = 0
                     let removeCount = 0
                     const bound = Math.min(start + deletedCount, rows.length)
+                    // rows[i]?.raw：越界 set（契约内透传）会让行数组出现洞/显式 undefined
                     for (let i = 0; i < bound; i++) {
-                        if (rows[i].raw) {
+                        if (rows[i]?.raw) {
                             if (i < start) removeStart++
                             else removeCount++
                         }
@@ -1216,7 +1229,7 @@ export class RxList<T> extends Computed {
                     let removeStart = 0
                     const bound = Math.min(key, rows.length)
                     for (let i = 0; i < bound; i++) {
-                        if (rows[i].raw) removeStart++
+                        if (rows[i]?.raw) removeStart++
                     }
                     pending = {removeStart, removeCount: rows[key]?.raw ? 1 : 0, inserts: []}
                 }
@@ -1490,7 +1503,8 @@ export class RxList<T> extends Computed {
         if (this._length) destroyComputed(this._length)
         super.destroy()
         this.effectFramesArray?.forEach((frames) => {
-          frames.forEach((frame) => {
+          // 稀疏行安全：越界 set + reorder 会在记账数组中留下显式 undefined 项
+          frames?.forEach((frame) => {
             this.destroyEffect(frame)
           })
         })
