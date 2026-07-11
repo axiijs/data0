@@ -1076,92 +1076,129 @@ export class RxList<T> extends Computed {
         const filtered = new RxList<T>([])
         // 初始全量构建阶段行按源顺序执行，直接 push 即可（O(1)）
         let initialBuildDone = false
-        // 当前正在处理的 patch 中，新行能否安全地按源顺序定位插入：
-        // - 纯插入 splice（无删除项）：filtered 与源一致，可以；
-        // - explicit key change（set 同位置替换）：旧项还在 filtered 中，但对齐扫描会
-        //   恰好停在旧项位置（即正确插入点），随后旧行销毁把旧项移除，可以；
-        // - 替换型 splice（如 replaceData）：filtered 里残留多个待删除旧项，按值对齐会
-        //   与旧项混淆（重复值时错位）；patch 结束后按 map indicator 全量校正一次。
-        let orderedInsertSafePatch = false
-        let rebuildAfterPatch = false
         let mapList!: RxList<Atom<boolean>>
-        mapList = this.map((item, _, {onCleanup}) => {
-            const remove = () => {
-                const index =  filtered.data.indexOf(item)
-                if (index !== -1) {
-                    filtered.splice(index, 1)
-                }
-            }
-            // CAUTION 保持 filtered 与源列表同序：插入位置 = 源顺序中位于 item 之前
-            //  且当前已在 filtered 中的元素个数（双指针对齐扫描，O(源长度)）。
-            //  旧实现除头部特判外一律 push 到尾部，中段元素 toggle 成匹配 / 中段
-            //  纯插入新匹配项都会导致 filtered 顺序与源不一致。
-            const insertOrdered = () => {
-                const src = source.data
-                const filteredData = filtered.data
-                let fi = 0
-                for (let si = 0; si < src.length && fi < filteredData.length; si++) {
-                    if (src[si] === item) break
-                    if (src[si] === filteredData[fi]) fi++
-                }
-                filtered.splice(fi, 0, item)
-            }
-            const insertLegacy = () => {
-                if (item === source.data[0]) {
-                    filtered.unshift(item)
-                } else {
-                    filtered.push(item)
-                }
-            }
 
+        // CAUTION 不变量：filtered 恒等于"mapList indicator 为 true 的行"按行序组成的
+        //  子序列。所有定位都基于行（indicator atom 的身份/位置），绝不按值查找
+        //  （indexOf / 值对齐扫描在重复原始值下会命中错误实例，破坏顺序）。
+        //  - patch 中的 splice / set：beforePatch 基于"应用前"的 indicator 前缀计算
+        //    受影响区间（removeStart/removeCount），新行首次运行只把匹配项按序上报到
+        //    pending.inserts，flushPending 用一次 spliceArray 精确应用差量；
+        //  - 已有行 toggle：以自身 indicator atom 在 mapList 中定位（身份比较），
+        //    位置 = 前缀中为 true 的行数；
+        //  - reorder：行序整体变化，用最终 indicator 顺序全量重建一次。
+        let pending: {removeStart: number, removeCount: number, inserts: T[]} | null = null
+        let rebuildAfterPatch = false
+
+        const flushPending = () => {
+            if (!pending) return
+            const {removeStart, removeCount, inserts} = pending
+            pending = null
+            if (removeCount > 0 || inserts.length > 0) {
+                filtered.spliceArray(removeStart, removeCount, inserts)
+            }
+        }
+
+        const rebuildFromIndicators = () => {
+            const next: T[] = []
+            const rows = mapList.data
+            for (let i = 0; i < rows.length; i++) {
+                if (rows[i]?.raw) next.push(source.data[i])
+            }
+            filtered.spliceArray(0, filtered.data.length, next)
+        }
+
+        // 行在 filtered 中的位置：以 indicator atom 身份定位到行，位置 = 前缀中
+        // raw 为 true 的行数。toggle 发生在 patch 之外，mapList 与 filtered 一致。
+        const locateRowPosition = (self: Atom<boolean>) => {
+            const rows = mapList.data
+            let pos = 0
+            for (let i = 0; i < rows.length; i++) {
+                if (rows[i] === self) return pos
+                if (rows[i].raw) pos++
+            }
+            return -1
+        }
+
+        mapList = this.map((item) => {
             return computed(({lastValue} ) => {
                 const matched = filterFn(item)
-                if (matched) {
-                    if (lastValue.raw === false) {
-                        // 已有行 toggle 成匹配：此刻 filtered 与源成员一致，按源顺序定位
-                        insertOrdered()
-                    } else if (!lastValue.raw) {
-                        // 行首次运行
+                // AtomComputed 初始值为 null：首次运行时 raw 还不是 boolean
+                const isFirstRun = typeof lastValue.raw !== 'boolean'
+                if (isFirstRun) {
+                    if (matched) {
                         if (!initialBuildDone) {
+                            // 全量构建按源顺序逐行执行，尾插即为正确位置
                             filtered.push(item)
-                        } else if (orderedInsertSafePatch) {
-                            insertOrdered()
+                        } else if (pending) {
+                            // patch 中的新行按序上报，由 flushPending 统一定位应用
+                            pending.inserts.push(item)
                         } else {
-                            insertLegacy()
+                            // rebuildAfterPatch 流程（reorder 批次中的新行）：先尾插，
+                            // afterPatch 以最终 indicator 顺序重建
+                            filtered.push(item)
                         }
                     }
-                } else {
-                    // 第一次没匹配上不需要执行 remove，节省一下性能。
-                    if (lastValue.raw === true) remove()
+                } else if (matched !== lastValue.raw) {
+                    const pos = locateRowPosition(lastValue as Atom<boolean>)
+                    if (pos !== -1) {
+                        if (matched) {
+                            filtered.splice(pos, 0, item)
+                        } else {
+                            filtered.splice(pos, 1)
+                        }
+                    } else if (!matched) {
+                        // 行已不在 mapList 中（理论不可达），按值兜底移除
+                        const index = filtered.data.indexOf(item)
+                        if (index !== -1) filtered.splice(index, 1)
+                    } else {
+                        filtered.push(item)
+                    }
                 }
                 return matched
-            }, undefined, true, {
-                onDestroy() {
-                    remove()
-                }
-            })
+            }, undefined, true)
         }, {
             ignoreIndex: true,
             beforePatch(info) {
-                // 有新增项时按最终 source 顺序定位。旧实现把“同时有删除”的替换
-                // splice 退回尾插，导致 filtered 与 source 顺序分叉。
-                const deletedCount = (info.methodResult as unknown[] | undefined)?.length ?? 0
-                const insertedCount = info.method === 'splice' ? (info.argv?.length ?? 2) - 2 : 0
-                if (deletedCount > 0 && insertedCount > 0) rebuildAfterPatch = true
+                // 应用上一条 info 计算出的差量（此刻 mapList 已应用上一条，
+                // filtered 补齐后两者重新一致，才能为本条计算前缀）
+                flushPending()
                 if (info.method === 'reorder') rebuildAfterPatch = true
-                orderedInsertSafePatch = info.method !== 'splice'
-                    || (info.argv?.length ?? 2) > 2
+                // 一旦进入重建流程，后续 info 不再做差量定位，统一在 afterPatch 重建
+                if (rebuildAfterPatch) return
+
+                const rows = mapList.data
+                if (info.method === 'splice') {
+                    const deletedCount = (info.methodResult as unknown[] | undefined)?.length ?? 0
+                    // patch 逐条重放：mapList 尚未应用本条 info，长度即 splice 前的长度
+                    const start = normalizeSpliceStart(info.argv![0], rows.length)
+                    let removeStart = 0
+                    let removeCount = 0
+                    const bound = Math.min(start + deletedCount, rows.length)
+                    for (let i = 0; i < bound; i++) {
+                        if (rows[i].raw) {
+                            if (i < start) removeStart++
+                            else removeCount++
+                        }
+                    }
+                    pending = {removeStart, removeCount, inserts: []}
+                } else {
+                    // explicit key change（set）：同位置替换
+                    const key = info.key as number
+                    let removeStart = 0
+                    const bound = Math.min(key, rows.length)
+                    for (let i = 0; i < bound; i++) {
+                        if (rows[i].raw) removeStart++
+                    }
+                    pending = {removeStart, removeCount: rows[key]?.raw ? 1 : 0, inserts: []}
+                }
             },
             afterPatch() {
-                if (!rebuildAfterPatch) return
-                // 替换 splice 中新旧相等值无法用 indexOf 区分：等所有旧 row
-                // cleanup 完成后，以最终 map indicator 顺序重建一次结果。
-                const next: T[] = []
-                for (let i = 0; i < source.data.length; i++) {
-                    if (mapList.data[i]?.raw) next.push(source.data[i])
+                flushPending()
+                if (rebuildAfterPatch) {
+                    rebuildFromIndicators()
+                    rebuildAfterPatch = false
                 }
-                filtered.spliceArray(0, filtered.data.length, next)
-                rebuildAfterPatch = false
             }
         })
         initialBuildDone = true
@@ -1221,24 +1258,35 @@ export class RxList<T> extends Computed {
                     this.data.get(groupKey)!.splice(groupIndex, 0, item)
                 }
 
+                // CAUTION 删除项在组内的定位必须按位置计数，不能用 indexOf：
+                //  重复原始值下 indexOf 会命中错误实例，破坏组内顺序。
+                //  被删项的组内位置 = splice/set 起点之前（前缀未被本次触及）的同 key
+                //  元素数；同一次 splice 中更早的同 key 删除项此刻已被移除，不参与计数。
+                const removeAtSourcePosition = (item: T, sourceIndex: number) => {
+                    const groupKey = getKey(item)
+                    const group = this.data.get(groupKey)
+                    if (!group) return
+                    let pos = 0
+                    const bound = Math.min(sourceIndex, source.data.length)
+                    for (let i = 0; i < bound; i++) {
+                        if (sameKey(getKey(source.data[i]), groupKey)) pos++
+                    }
+                    if (pos < group.data.length) group.splice(pos, 1)
+                }
+
                 for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
-                        deleteItems.forEach((item) => {
-                            const groupKey = getKey(item)
-                            if (this.data.has(groupKey)) {
-                                const group = this.data.get(groupKey)!
-                                const index = group.data.indexOf(item)
-                                if (index !== -1) group.splice(index, 1)
-                            }
-                        })
-
                         const newItemsInArgs = argv!.slice(2)
                         const lengthBeforeSplice = source.data.length - newItemsInArgs.length + deleteItems.length
                         const startIndex = normalizeSpliceStart(argv![0], lengthBeforeSplice)
+                        deleteItems.forEach((item) => {
+                            // 所有删除项都从 startIndex 起：前缀 [0, startIndex) 未被本次触及
+                            removeAtSourcePosition(item, startIndex)
+                        })
                         newItemsInArgs.forEach((item, index) => {
                             insertInSourceOrder(item, startIndex + index)
                         })
@@ -1251,13 +1299,8 @@ export class RxList<T> extends Computed {
                             group.spliceArray(0, group.data.length, nextItems)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
-                        // explicit key change
-                        const oldGroupKey = getKey(oldValue as T)
-                        const oldGroup = this.data.get(oldGroupKey)
-                        if (oldGroup) {
-                            const oldIndex = oldGroup.data.indexOf(oldValue as T)
-                            if (oldIndex !== -1) oldGroup.splice(oldIndex, 1)
-                        }
+                        // explicit key change：set 不触及 [0, key) 前缀
+                        removeAtSourcePosition(oldValue as T, key as number)
                         insertInSourceOrder(newValue as T, key as number)
                     }
                 }
