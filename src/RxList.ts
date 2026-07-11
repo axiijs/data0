@@ -20,6 +20,7 @@ import {RxSet} from "./RxSet";
 
 type MapOptions<U> = {
     beforePatch?: (triggerInfo: InputTriggerInfo) => any,
+    afterPatch?: (triggerInfos: TriggerInfo[]) => any,
     scheduleRecompute?: DirtyCallback,
     ignoreIndex?: boolean,
     onCleanup?: (item: U) => any,
@@ -706,6 +707,7 @@ export class RxList<T> extends Computed {
 
                     }
                 })
+                options?.afterPatch?.(triggerInfos)
             },
             options?.scheduleRecompute,
             {
@@ -1014,10 +1016,11 @@ export class RxList<T> extends Computed {
         // - explicit key change（set 同位置替换）：旧项还在 filtered 中，但对齐扫描会
         //   恰好停在旧项位置（即正确插入点），随后旧行销毁把旧项移除，可以；
         // - 替换型 splice（如 replaceData）：filtered 里残留多个待删除旧项，按值对齐会
-        //   与旧项混淆（重复值时错位），维持遗留的追加行为——最终成员由旧行销毁时的
-        //   indexOf 清理保证。
+        //   与旧项混淆（重复值时错位）；patch 结束后按 map indicator 全量校正一次。
         let orderedInsertSafePatch = false
-        const mapList = this.map((item, _, {onCleanup}) => {
+        let rebuildAfterPatch = false
+        let mapList!: RxList<Atom<boolean>>
+        mapList = this.map((item, _, {onCleanup}) => {
             const remove = () => {
                 const index =  filtered.data.indexOf(item)
                 if (index !== -1) {
@@ -1077,8 +1080,22 @@ export class RxList<T> extends Computed {
             beforePatch(info) {
                 // 有新增项时按最终 source 顺序定位。旧实现把“同时有删除”的替换
                 // splice 退回尾插，导致 filtered 与 source 顺序分叉。
+                const deletedCount = (info.methodResult as unknown[] | undefined)?.length ?? 0
+                const insertedCount = info.method === 'splice' ? (info.argv?.length ?? 2) - 2 : 0
+                if (deletedCount > 0 && insertedCount > 0) rebuildAfterPatch = true
                 orderedInsertSafePatch = info.method !== 'splice'
                     || (info.argv?.length ?? 2) > 2
+            },
+            afterPatch() {
+                if (!rebuildAfterPatch) return
+                // 替换 splice 中新旧相等值无法用 indexOf 区分：等所有旧 row
+                // cleanup 完成后，以最终 map indicator 顺序重建一次结果。
+                const next: T[] = []
+                for (let i = 0; i < source.data.length; i++) {
+                    if (mapList.data[i]?.raw) next.push(source.data[i])
+                }
+                filtered.spliceArray(0, filtered.data.length, next)
+                rebuildAfterPatch = false
             }
         })
         initialBuildDone = true

@@ -137,7 +137,8 @@ describe('index/key 0 in incremental patches', () => {
         const list = new RxList([1, 2, 3])
         const groups = list.groupBy(item => item % 2)
         list.set(0, 5)
-        expect(groups.data.get(1)!.data).toEqual([3, 5])
+        // group RxList preserves the source order: source is now [5, 2, 3].
+        expect(groups.data.get(1)!.data).toEqual([5, 3])
         expect(groups.data.get(0)!.data).toEqual([2])
     })
 
