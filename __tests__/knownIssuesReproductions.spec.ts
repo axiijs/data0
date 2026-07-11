@@ -104,6 +104,19 @@ describe('known RxList consistency issues', () => {
         }
     })
 
+    test('map keeps row effect frames aligned for a set after reorder', () => {
+        const source = new RxList([13, 11, 5])
+        const filtered = source.filter(item => item % 2 === 1)
+        try {
+            source.sortSelf((a, b) => a - b)
+            source.set(0, 14)
+            expect(filtered.data).toEqual(source.data.filter(item => item % 2 === 1))
+        } finally {
+            filtered.destroy()
+            source.destroy()
+        }
+    })
+
     test('slice with negative bounds matches native slice after middle insertion', () => {
         const source = new RxList([0, 1, 2, 3])
         const sliced = source.slice(-4, -1)

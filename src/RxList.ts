@@ -668,8 +668,18 @@ export class RxList<T> extends Computed {
                             })
                         }
                     } else if(method === 'reorder') {
-                        // 排序会触发所有 map 出来的元素同样计算
-                        this.reorder(argv![0]! as Order[], triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
+                        // 数据、行 effect frame 和 cleanup 必须按同一组 old→new
+                        // 映射移动；旧实现只 reorder data，后续 set 会销毁错误行。
+                        const order = argv![0]! as Order[]
+                        const movedFrames = order.map(([oldIndex]) => this.effectFramesArray![oldIndex])
+                        const movedCleanups = cleanupFns
+                            ? order.map(([oldIndex]) => cleanupFns![oldIndex])
+                            : undefined
+                        order.forEach(([, newIndex], index) => {
+                            this.effectFramesArray![newIndex] = movedFrames[index]
+                            if (cleanupFns) cleanupFns[newIndex] = movedCleanups![index]
+                        })
+                        this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
                     } else {
                         // explicit key change
                         // CAUTION add/update 一定都要全部重新从 source 里面取，因为这样才能得到正确的 proxy。newValue 是 raw data，和 mapFn 里面预期拿到的不一致。
