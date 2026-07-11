@@ -49,6 +49,21 @@ describe('known RxList consistency issues', () => {
         }
     })
 
+    test('findIndex keeps reactive predicates after an unaffected structural patch', () => {
+        const item = {score: atom(3)}
+        const source = new RxList([item])
+        const index = source.findIndex(value => value.score() >= 3)
+        try {
+            expect(index()).toBe(0)
+            source.splice(1, 2)
+            item.score(1)
+            expect(index()).toBe(-1)
+        } finally {
+            destroyComputed(index)
+            source.destroy()
+        }
+    })
+
     test('map rebuilds row dependencies after an explicit set', () => {
         const factor = atom(1)
         const source = new RxList([1, 2])
@@ -77,12 +92,36 @@ describe('known RxList consistency issues', () => {
         }
     })
 
+    test('filter follows source reorder operations', () => {
+        const source = new RxList([3, 2, 1])
+        const filtered = source.filter(item => item % 2 === 1)
+        try {
+            source.sortSelf((a, b) => a - b)
+            expect(filtered.data).toEqual(source.data.filter(item => item % 2 === 1))
+        } finally {
+            filtered.destroy()
+            source.destroy()
+        }
+    })
+
     test('slice with negative bounds matches native slice after middle insertion', () => {
         const source = new RxList([0, 1, 2, 3])
         const sliced = source.slice(-4, -1)
         try {
             source.splice(1, 0, 8, 9)
             expect(sliced.data).toEqual(source.data.slice(-4, -1))
+        } finally {
+            sliced.destroy()
+            source.destroy()
+        }
+    })
+
+    test('slice normalizes fractional bounds before applying incremental patches', () => {
+        const source = new RxList([0, 1, 2, 3, 4])
+        const sliced = source.slice(1.5, 4.8)
+        try {
+            source.splice(2, 1, 9)
+            expect(sliced.data).toEqual(source.data.slice(1.5, 4.8))
         } finally {
             sliced.destroy()
             source.destroy()

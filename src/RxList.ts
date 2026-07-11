@@ -13,7 +13,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany} from "./util.js";
+import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -828,10 +828,12 @@ export class RxList<T> extends Computed {
         const searchedItemAndIndexes: { item:T, index:number, deleted:boolean }[] = []
 
         let trackTargetToSearchItem: WeakMap<any, Set<{ item:T, index:number, deleted:boolean }>> = new WeakMap()
+        let hasItemReactiveDeps = false
 
         const disposeAll = () => {
             searchedItemAndIndexes.length = 0
             trackTargetToSearchItem = new WeakMap()
+            hasItemReactiveDeps = false
         }
 
         function searchAndRemember(start:number, end: number, resultComputed: Computed) {
@@ -874,6 +876,7 @@ export class RxList<T> extends Computed {
                 resultComputed.resetAutoTrack()
             }
 
+            if (trackTargets!.length) hasItemReactiveDeps = true
             trackTargets!.forEach((target) => {
                 let items = trackTargetToSearchItem.get(target)
                 if (!items) {
@@ -900,6 +903,10 @@ export class RxList<T> extends Computed {
                 return searchAndRemember(0, Infinity, this)
             },
             function applyPatch(this: Computed, data: Atom<number>, triggerInfos){
+                // 增量 cache 无法逐 dep 精确退订/重订。只要 predicate 读取过
+                // reactive 数据，就用 full recompute 保证每轮依赖集合与搜索区间一致；
+                // 无 reactive predicate 的热路径仍保留增量 patch。
+                if (hasItemReactiveDeps) return false
                 let patchSuccess = undefined
                 // 每次 patch 都需要重新注册所有依赖。
                 this.cleanup()
@@ -1083,6 +1090,7 @@ export class RxList<T> extends Computed {
                 const deletedCount = (info.methodResult as unknown[] | undefined)?.length ?? 0
                 const insertedCount = info.method === 'splice' ? (info.argv?.length ?? 2) - 2 : 0
                 if (deletedCount > 0 && insertedCount > 0) rebuildAfterPatch = true
+                if (info.method === 'reorder') rebuildAfterPatch = true
                 orderedInsertSafePatch = info.method !== 'splice'
                     || (info.argv?.length ?? 2) > 2
             },
@@ -1430,9 +1438,10 @@ export class RxList<T> extends Computed {
 
     public slice(start?: number, end?: number): RxList<T> {
         const source = this
-        // handle negative or undefined arguments
-        start = start ?? 0
-        end = end ?? Infinity
+        // 与 Array#slice 一致，先执行 ToIntegerOrInfinity；后续区间 patch
+        // 只能使用整数边界，否则小数参与差量计算会产生半索引。
+        start = toIntegerOrInfinity(start ?? 0)
+        end = toIntegerOrInfinity(end ?? Infinity)
         
         /** Utility: clamp the user-provided slice range. */
         const clampIndexes = (length: number) : [number,number]|undefined =>  {
