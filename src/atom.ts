@@ -81,11 +81,14 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
         },
         set(target, key, newValue) {
             // CAUTION 注意这里是不 trigger 的
-            if (typeof value === 'object') {
+            // CAUTION 必须排除 null（typeof null === 'object'）：Reflect.set(null, ...)
+            //  会直接 TypeError。
+            if (value !== null && typeof value === 'object') {
                 return Reflect.set(value, key, newValue)
             }
-
-            return false
+            // 与不带 interceptor 的 primitive atom 行为一致：属性落在 updater 函数
+            // 对象上（get 分支对非对象值也是转发到 finalUpdater，读写对称）。
+            return Reflect.set(finalUpdater, key, newValue)
         },
         // TODO 有必要要吗？？？
         getPrototypeOf(): object | null {

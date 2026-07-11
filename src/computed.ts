@@ -223,6 +223,13 @@ export class Computed extends ReactiveEffect {
             this.isAsyncPatch = isAsync(this.applyPatch)
             this.isGeneratorPatch = isGenerator(this.applyPatch)
             this.isPatchAsync = this.isAsyncPatch|| this.isGeneratorPatch
+            // CAUTION generator patch 会读写 asyncStatus，但 asyncStatus 原来只在
+            //  getter 为 async/generator 时创建：同步 getter + generator patch 的组合
+            //  第一次 patch 就会 TypeError，且状态回 DIRTY 后每次重试都再次崩溃，
+            //  派生数据从此永久陈旧。
+            if (this.isPatchAsync && !this.asyncStatus) {
+                this.asyncStatus = atom(null)
+            }
         }
 
         if (typeof scheduleRecompute === 'function') {
@@ -459,8 +466,11 @@ export class Computed extends ReactiveEffect {
 
         // 循环检测，是 sync computed 已经在重算中了又立刻重算，说明重算中又有触发依赖变更的代码。
         // 要么把依赖变更代码移出去，要么把 computed 用 schedule 延迟一下。
+        // CAUTION async patch（isPatchAsync && inPatch）挂起期间收到新触发是合法的：
+        //  info 会累积到 triggerInfos，由 runAsyncPatch/runGeneratorPatch 的 while 循环
+        //  或 finishPatchRecompute 的续跑消化，不属于同步重算环。
         assert(
-            !((immediate || this.immediate) && this._status > STATUS_DIRTY && !this.isAsync),
+            !((immediate || this.immediate) && this._status > STATUS_DIRTY && !this.isAsync && !(this.isPatchAsync && this.inPatch)),
             'detect recompute triggerred in sync recompute, move trigger code to next tick or it may lead to infinite loop'
         )
 
@@ -594,6 +604,13 @@ export class Computed extends ReactiveEffect {
         }
 
         this.inPatch = false
+        // CAUTION async patch 收尾竞态：runAsyncPatch 的 while 检查到 triggerInfos 为空
+        //  之后、finish 之前（微任务间隙）仍可能到达新触发——handleTriggered 看到 inPatch
+        //  为 true 只会排队 info。这里必须续跑一轮 patch，否则该 info 要等下一次无关
+        //  触发才被消化（静默陈旧窗口）。
+        if (this.isPatchAsync && this._triggerInfos && this._triggerInfos.length) {
+            return this.patchRecompute()
+        }
         this.setStatus(STATUS_CLEAN)
         this.setUpdatedAt(Date.now())
         this.sendTriggerInfos()
@@ -719,25 +736,29 @@ export class Computed extends ReactiveEffect {
     }
     async runAsyncPatch() {
         let patchResult
-        this.prepareTracking(false,true)
-        try {
-            while(this.triggerInfos.length) {
-                const waitingTriggerInfos = [...this.triggerInfos]
-                this.triggerInfos.length = 0
-                this.pauseAutoTrack()
-                let patchPromise
-                try {
-                    patchPromise = (this.applyPatch as AsyncApplyPatchType<any>).call(this, this.data, waitingTriggerInfos)
-                } finally {
-                    this.resetAutoTrack()
-                }
-                patchResult = await patchPromise
-                if (patchResult === false) {
-                    break
-                }
+        while(this.triggerInfos.length) {
+            const waitingTriggerInfos = [...this.triggerInfos]
+            this.triggerInfos.length = 0
+            let patchPromise
+            // CAUTION scope 的 push/pop 只包住 applyPatch 的同步段（返回 promise 之前）：
+            //  旧实现让本 effect 在整个 async patch（跨所有 await）期间都留在
+            //  activeScopes 顶上，造成三个后果——
+            //  1. await 挂起期间任何无关代码读 atom 都被追踪成本 effect 的依赖（幽灵订阅）；
+            //  2. 挂起期间源的新写入因 trigger 的 activeEffect 抑制被静默丢弃（数据永久丢失）；
+            //  3. 两个 async patch 交错完成时 completeTracking 的 pop() 弹掉的是对方。
+            //  与 async getter 一致，patch 的依赖归属只覆盖第一个 await 之前的同步段。
+            this.prepareTracking(false, true)
+            this.pauseAutoTrack()
+            try {
+                patchPromise = (this.applyPatch as AsyncApplyPatchType<any>).call(this, this.data, waitingTriggerInfos)
+            } finally {
+                this.resetAutoTrack()
+                this.completeTracking(false, true)
             }
-        } finally {
-            this.completeTracking(false, true)
+            patchResult = await patchPromise
+            if (patchResult === false) {
+                break
+            }
         }
         return patchResult
     }
@@ -817,10 +838,12 @@ export class Computed extends ReactiveEffect {
         return this._cachedValues ?? (this._cachedValues = new Map())
     }
     getCachedValue<T>(effect:any, createFn: () => T) : T{
-        let value = this._cachedValues?.get(effect)
-        if (!value) {
-            this.cachedValues.set(effect, value = createFn())
-        }
+        // CAUTION 用 has 判断命中：createFn 可能返回 0/''/false/null 等 falsy 值，
+        //  用真值判断会导致这类值每次都重建。
+        const cached = this._cachedValues
+        if (cached?.has(effect)) return cached.get(effect)
+        const value = createFn()
+        this.cachedValues.set(effect, value)
         return value
     }
 }

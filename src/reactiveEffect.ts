@@ -45,7 +45,8 @@ export class ReactiveEffect extends ManualCleanup {
         if (effect.parent && !fromParent) {
             // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
             const siblings = effect.parent._children
-            if (siblings) {
+            // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
+            if (siblings && siblings.length) {
                 const last = siblings.pop()!
                 if (last !== effect) {
                     siblings[effect.index!] = last
@@ -59,7 +60,15 @@ export class ReactiveEffect extends ManualCleanup {
         if (!ignoreChildren) {
             effect.destroyChildren()
         } else if (effect._children) {
-            effect._children.length = 0
+            // CAUTION ignoreChildren 语义是"留下 children 由调用方自行管理"，
+            //  但必须断开它们的 parent 反向指针：否则这些孤儿 child 之后被单独
+            //  destroy 时，会在已清空的 siblings 数组上做 last 替换（pop 出
+            //  undefined 后写 last.index 直接 TypeError）。
+            const children = effect._children
+            for (let i = 0; i < children.length; i++) {
+                if (children[i].parent === effect) children[i].parent = undefined
+            }
+            children.length = 0
         }
         effect.dispatch('destroy')
     }
