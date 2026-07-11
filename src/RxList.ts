@@ -13,7 +13,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert, spliceMany} from "./util.js";
+import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -213,16 +213,23 @@ export class RxList<T> extends Computed {
         this.pauseAutoTrack()
 
         const originLength = this.data.length
-        const deleteItemsCount = Math.min(deleteCount, originLength - start)
+        // CAUTION 内部计算一律用归一化后的 start/deleteCount（Array#splice 的
+        //  ToIntegerOrInfinity + clamp 语义）：负/越界/小数 start 直接参与区间计算会算错
+        //  受影响的 index（订阅了 at(index) 的 effect 收不到 SET 而静默保持旧值），
+        //  也会给 atomIndexes 写入负下标。
+        //  triggerInfo.argv 仍按契约透传用户原始参数（axii/axle 锁定该行为并自行归一化），
+        //  data0 自己的派生结构（map/findIndex/concat 等）在 patch 端归一化后再消费。
+        const normalizedStart = normalizeSpliceStart(start, originLength)
+        const deleteItemsCount = normalizeSpliceDeleteCount(deleteCount, originLength, normalizedStart)
         // 清扫空 index dep：曾被 at() 订阅、现已全部退订的列表要能回到 fast path
         const hasIndexKeyDeps = this.pruneIndexKeyDeps()
         const hasAtomIndexes = !!this.atomIndexes
         const canUseMetadataFastPath = !hasIndexKeyDeps && !hasAtomIndexes
-        const isPureAppend = start === originLength && deleteCount === 0
-        const isPureClear = start === 0 && deleteCount >= originLength && items.length === 0
+        const isPureAppend = normalizedStart === originLength && deleteItemsCount === 0
+        const isPureClear = normalizedStart === 0 && deleteItemsCount >= originLength && items.length === 0
 
         if (canUseMetadataFastPath && (isPureAppend || isPureClear)) {
-            const result = spliceMany(this.data, start, deleteCount, items)
+            const result = spliceMany(this.data, normalizedStart, deleteItemsCount, items)
             this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
             this.sendTriggerInfos()
             this.resetAutoTrack()
@@ -232,7 +239,7 @@ export class RxList<T> extends Computed {
 
         // CAUTION 不需要触发 length 的变化，因为获取  length 的时候得到就已经是个 computed 了。
         const newLength = originLength - deleteItemsCount + items.length
-        const changedIndexEnd = deleteItemsCount !== items.length ? newLength : start + items.length
+        const changedIndexEnd = deleteItemsCount !== items.length ? newLength : normalizedStart + items.length
         // CAUTION 只对"实际有订阅者且落在受影响区间"的 index 记录 oldValue / 触发 SET：
         //  旧实现对 [start, changedIndexEnd) 逐 index 触发，一次中段 splice 是 O(移动范围)
         //  次 trigger；订阅通常是稀疏的（axii 每行订阅自己的 index），按订阅遍历后
@@ -240,7 +247,7 @@ export class RxList<T> extends Computed {
         let affected: [index: number, oldValue: T][] | undefined
         if (hasIndexKeyDeps) {
             for (const index of this._indexKeyDeps!.keys()) {
-                if (index >= start && index < changedIndexEnd) {
+                if (index >= normalizedStart && index < changedIndexEnd) {
                     (affected ?? (affected = [])).push([index, this.data[index]])
                 }
             }
@@ -248,7 +255,7 @@ export class RxList<T> extends Computed {
                 affected.sort((a, b) => a[0] - b[0])
             }
         }
-        const result = spliceMany(this.data, start, deleteCount, items)
+        const result = spliceMany(this.data, normalizedStart, deleteItemsCount, items)
 
 
         // CAUTION 无论有没有 indexKeyDeps 都要触发 Iterator_Key，
@@ -266,8 +273,8 @@ export class RxList<T> extends Computed {
         this.sendTriggerInfos()
 
         if (this.atomIndexes) {
-            spliceMany(this.atomIndexes, start, deleteCount, items.map((_, index) => atom(index + start)))
-            for (let i = start; i <changedIndexEnd; i++) {
+            spliceMany(this.atomIndexes, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
+            for (let i = normalizedStart; i <changedIndexEnd; i++) {
                 // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
                 this.atomIndexes[i]?.(i)
             }
@@ -603,6 +610,12 @@ export class RxList<T> extends Computed {
                         // CAUTION 第一次计算一定要使用 newItemsInArg 作为参数：有可能一批 triggerInfo 里
                         //  有多次元素位置变化，此时很难从 source.data 推断元素的新位置。
                         const newItemsInArgs = argv!.slice(2)
+                        // CAUTION argv 按契约透传用户原始参数，start 可能是负数/越界/小数，
+                        //  行 index（atomIndexes 下标）必须先归一化，否则负下标拿到 undefined
+                        //  的 index atom，用户 mapFn 直接崩溃。归一化基准是本列表当前长度
+                        //  （patch 逐条重放，此刻恰等于 source 在该次 splice 前的长度）。
+                        const spliceStart = normalizeSpliceStart(argv![0], this.data.length)
+                        const spliceDeleteCount = normalizeSpliceDeleteCount(argv![1], this.data.length, spliceStart)
                         const effectFrames: ReactiveEffect[][] = []
                         const newCleanups: MapCleanupFn[] = []
                         const newItems = newItemsInArgs.map((newItemsInArg, index) => {
@@ -612,7 +625,7 @@ export class RxList<T> extends Computed {
                                 }
                             } : undefined
                             let newItem: U
-                            const newIndex = index + argv![0]!
+                            const newIndex = index + spliceStart
                             if (options?.skipItemEffect) {
                                 newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
                                 effectFrames![index] = EMPTY_ITEM_FRAME
@@ -623,8 +636,8 @@ export class RxList<T> extends Computed {
                             }
                             return newItem!
                         })
-                        const deletedItems = this.spliceArray(argv![0], argv![1], newItems)
-                        const deletedFrames = spliceMany(this.effectFramesArray!, argv![0], argv![1], effectFrames)
+                        const deletedItems = this.spliceArray(spliceStart, spliceDeleteCount, newItems)
+                        const deletedFrames = spliceMany(this.effectFramesArray!, spliceStart, spliceDeleteCount, effectFrames)
                         deletedFrames.forEach((frame) => {
                             frame.forEach((effect) => {
                                 this.destroyEffect(effect)
@@ -634,7 +647,7 @@ export class RxList<T> extends Computed {
                         if (useContext && cleanupFns?.length) {
                             // CAUTION 这里要把删除的 effect 的 cleanup 都执行一遍
                             //  如果能从 return value 中进行销毁，应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能。
-                            const deletedCleanupFns = spliceMany(cleanupFns, argv![0], argv![1], newCleanups)
+                            const deletedCleanupFns = spliceMany(cleanupFns, spliceStart, spliceDeleteCount, newCleanups)
                             deletedCleanupFns.forEach((fn) => {
                                 fn?.()
                             })
@@ -864,7 +877,13 @@ export class RxList<T> extends Computed {
                     let startFindingIndex = Infinity
                     if (triggerSource === source ) {
                         if (method === 'splice') {
-                            const startIndex = argv![0] as number
+                            // CAUTION argv 是用户原始参数（可能负/越界/小数），必须按 splice 发生时
+                            //  的长度归一化成真实起点：负 start 直接参与会从 data[-1] 开始扫，
+                            //  越界 start 会漏掉"append 产生新匹配"的场景。
+                            const insertedCount = argv!.length - 2
+                            const deletedCount = (triggerInfo.methodResult as unknown[] | undefined)?.length ?? 0
+                            const lengthBeforeSplice = source.data.length - insertedCount + deletedCount
+                            const startIndex = normalizeSpliceStart(argv![0], lengthBeforeSplice)
                             // 可能新增了更小的能找到的，都从 startIndex 开始重新算。
                             if (this.data.raw == -1 || startIndex <= this.data.raw) {
                                 startFindingIndex = startIndex
@@ -1032,11 +1051,14 @@ export class RxList<T> extends Computed {
                         })
 
                         // 如果是从头插入，要逆序遍历 unshift 才能保持正确顺序
+                        // CAUTION argv 是用户原始参数，负/越界 start 要归一化后再判断是否头插
+                        //  （splice(-10, ...) 在短列表上就是头插）
                         const newItemsInArgs = argv!.slice(2)
-                        if (argv![0] === 0) {
+                        const lengthBeforeSplice = source.data.length - newItemsInArgs.length + deleteItems.length
+                        const insertAtHead = normalizeSpliceStart(argv![0], lengthBeforeSplice) === 0
+                        if (insertAtHead) {
                             newItemsInArgs.reverse()
                         }
-                        const insertAtHead = argv![0] === 0
 
                         // 先分好组，再一次性操作，可以合并 info，还能间接提高 dom 操作性能。
                         const newGroupedItems = new Map<any, T[]>()
@@ -1046,7 +1068,7 @@ export class RxList<T> extends Computed {
                                 newGroupedItems.set(groupKey,[])
                             }
                             // CAUTION 这里并不能真正保证 group 里面的顺序和原来的一致。只能尽量处理首位情况。
-                            if (argv![0] === 0) {
+                            if (insertAtHead) {
                                 newGroupedItems.get(groupKey)!.unshift(item)
                             } else {
                                 newGroupedItems.get(groupKey)!.push(item)
@@ -1304,8 +1326,11 @@ export class RxList<T> extends Computed {
 
                         // new items to insert
                         const newItems = argv!.slice(2) as T[]
-                        // insertion index = offset + argv![0]
-                        let insertPos = offset + (argv![0] as number)
+                        // CAUTION argv 是用户原始参数（可能负/越界），必须按该 source 在
+                        //  splice 前的长度归一化，否则 offset + 负数会插进前一个 source 的区间
+                        const lengthBeforeSplice = sources[sourceIndex].data.length - newItems.length + deletedItems.length
+                        // insertion index = offset + normalized start
+                        let insertPos = offset + normalizeSpliceStart(argv![0], lengthBeforeSplice)
                         // clamp insertPos if user spliced out-of-bounds
                         insertPos = Math.min(Math.max(insertPos, 0), this.data.length)
                         this.spliceArray(insertPos, 0, newItems)
@@ -1634,15 +1659,17 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
 
     function updateIndicatorsFromSourceChange(list: RxList<[T, Atom<boolean>]>, triggerInfo: TriggerInfo) {
         if (triggerInfo.method === 'splice') {
-            const {  argv } = triggerInfo
+            const {  argv, methodResult } = triggerInfo
             const newItemsInArgs = argv!.slice(2)
-            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
-
-            const deleteCount = argv![1]
+            // CAUTION argv 是用户原始参数：start 归一化后才能参与 index 比较，
+            //  deleteCount 用 methodResult（真实删除数）而不是 argv[1]（可能越界的用户输入）
             const insertCount = newItemsInArgs.length
+            const deleteCount = (methodResult as unknown[] | undefined)?.length ?? 0
+            // list 此刻尚未应用本次 splice，其长度即 splice 前的长度
+            const startIndex = normalizeSpliceStart(argv![0], list.data.length)
+            list.spliceArray(startIndex, deleteCount, newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
 
             if (deleteCount !== insertCount) {
-                const startIndex = argv![0] as number
 
                 const selectedValues = isAtom(currentValues) ? (currentValues.raw !== null ? [currentValues.raw] : []) : [...currentValues.data]
                 // 因为 index 产生了变化，所以要更新 indicator

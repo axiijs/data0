@@ -267,6 +267,28 @@ export function nextTick(fn: () => any) {
     Promise.resolve().then(fn)
 }
 
+// Array#splice 对 start/deleteCount 的 ToIntegerOrInfinity 语义：
+// NaN/undefined → 0，小数截断，±Infinity 保留（由后续 clamp 处理）。
+export function toIntegerOrInfinity(value: unknown): number {
+    const n = Number(value)
+    if (Number.isNaN(n)) return 0
+    return Math.trunc(n)
+}
+
+// 归一化 splice 的 start：负数从末尾回退，最终 clamp 到 [0, length]。
+// CAUTION triggerInfo.argv 按契约透传用户原始参数（axii/axle 锁定该行为并自行归一化），
+//  但 data0 内部消费 argv 的地方（元数据维护、派生列表的 patch）必须先用它归一化，
+//  否则负/越界/小数 start 会算错受影响区间或直接用负 index 访问数组。
+export function normalizeSpliceStart(start: unknown, length: number): number {
+    const n = toIntegerOrInfinity(start)
+    return n < 0 ? Math.max(length + n, 0) : Math.min(n, length)
+}
+
+// 归一化 splice 的 deleteCount：clamp 到 [0, length - normalizedStart]
+export function normalizeSpliceDeleteCount(deleteCount: unknown, length: number, normalizedStart: number): number {
+    return Math.min(Math.max(toIntegerOrInfinity(deleteCount), 0), length - normalizedStart)
+}
+
 // 超过该数量的插入不再走 native splice 的 spread 传参。
 // V8 的实参上限约 65k，留足余量；小批量仍用 native splice（快于手动搬移）。
 const SPLICE_SPREAD_LIMIT = 8192
