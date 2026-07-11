@@ -6,6 +6,7 @@ import {ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {CleanupFrame} from "./manualCleanup";
 import {markRetainedReactiveEffectKind, setRetainedReactiveEffectSource} from "./retainedDiagnostics";
+import {restoreEffectDeps} from "./dep.js";
 
 export const computedToInternal = new WeakMap<any, Computed>()
 
@@ -547,6 +548,9 @@ export class Computed extends ReactiveEffect {
     //  触发变更的调用点（而不是变成 unhandled rejection），语义上和"非 async 就应该同步计算"一致。
     fullRecompute(): any {
         const recomputeId = ++this.recomputeId
+        // 失败重算必须恢复“上一次成功”的完整依赖集合。prepareTracking 可能在
+        // getter 第一次读取前就清掉旧 deps，或在抛错前只收集了一部分新 deps。
+        const previousDeps = this.deps.length ? this.deps.slice() : undefined
         this.inPatch = false
         // 每次 full recompute 清空所有的 triggerInfos，这样才能使 patchable recompute 不错乱。
         if (this._triggerInfos) this._triggerInfos.length = 0
@@ -564,6 +568,7 @@ export class Computed extends ReactiveEffect {
                 this.finishFullRecompute(result)
             }, (err: any) => {
                 if (this.recomputeId !== recomputeId) return
+                restoreEffectDeps(this, previousDeps)
                 this.handleRecomputeError(err)
             })
         }
@@ -572,6 +577,7 @@ export class Computed extends ReactiveEffect {
         try {
             result = this.runEffect()
         } catch (err) {
+            restoreEffectDeps(this, previousDeps)
             this.handleRecomputeError(err, true)
             throw err
         }
