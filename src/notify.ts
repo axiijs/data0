@@ -178,6 +178,11 @@ export class Notifier {
         this.inEffectSession = false
         this.isDigesting = false
     }
+    if (__DEV__) {
+        // dev 不变量：digest 退出后 session 状态必须完全静止（防未来编辑破坏 finally 语义）
+        assert(this.sessionQueue.length === 0 && !this.inEffectSession && !this.isDigesting && this.sessionDepth === 0,
+            'effect session state not quiescent after digest')
+    }
     if (hasError) throw firstError
   }
   collectTrackTarget() {
@@ -586,10 +591,22 @@ export const notifier: Notifier = Notifier.instance
  *  （atom 本身的读取不受影响），batch 退出后恢复一致。这不是缺陷，明确不修。
  */
 export function batch<T>(fn: () => T): T {
+  // dev 不变量：batch 结束后全局作用域栈/追踪开关栈深度必须复原。
+  // 违约（某个订阅者泄漏了 scope 或 pause/reset 不配平）在边界当场炸。
+  let scopesDepthBefore = 0
+  let trackStackDepthBefore = 0
+  if (__DEV__) {
+    scopesDepthBefore = ReactiveEffect.activeScopes.length
+    trackStackDepthBefore = notifier.trackStack.length
+  }
   notifier.createEffectSession()
   try {
     return fn()
   } finally {
     notifier.digestEffectSession()
+    if (__DEV__) {
+      assert(ReactiveEffect.activeScopes.length === scopesDepthBefore, 'activeScopes depth not restored after batch (scope leak)')
+      assert(notifier.trackStack.length === trackStackDepthBefore, 'trackStack depth not restored after batch (pause/reset imbalance)')
+    }
   }
 }

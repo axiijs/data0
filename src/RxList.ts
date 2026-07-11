@@ -312,7 +312,21 @@ export class RxList<T> extends Computed {
             notifier.digestEffectSession()
         }
 
+        if (__DEV__) this.assertAtomIndexesAligned()
         return result
+    }
+    /**
+     * @internal
+     * dev 不变量：atomIndexes 与 data 严格等长，且第 i 个 atom 的值恒为 i。
+     * 违约意味着行级 index 记账出错（map 行会拿到错误位置），在变更当刻炸掉,
+     * 而不是等下游行为漂移。生产构建下该函数不会被调用（__DEV__ 剔除）。
+     */
+    assertAtomIndexesAligned() {
+        if (!this.atomIndexes) return
+        assert(this.atomIndexes.length === this.data.length, 'atomIndexes length misaligned with data')
+        for (let i = 0; i < this.atomIndexes.length; i++) {
+            assert(this.atomIndexes[i].raw === i, `atomIndex value drift at ${i}`)
+        }
     }
     // 显式 set 某一个 index 的值
     // CAUTION set 的契约是"替换已存在的稠密行"。越界/负数/非整数 key 属于 out-of-contract 用法：
@@ -352,6 +366,7 @@ export class RxList<T> extends Computed {
 
         this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
         this.sendTriggerInfos()
+        if (__DEV__) this.assertAtomIndexesAligned()
     }
     reposition(start:number, newStart:number, limit:number = 1 ) {
         assert(start >= 0 && limit > 0 && start+limit <= this.data.length, 'start index out of range')
@@ -769,6 +784,14 @@ export class RxList<T> extends Computed {
                     }
                 })
                 options?.afterPatch?.(triggerInfos)
+                if (__DEV__) {
+                    // dev 不变量：行级记账结构必须与数据严格等长对齐。
+                    // 错位意味着删除行时会销毁/执行到相邻行的 effect 或 cleanup。
+                    assert(this.effectFramesArray!.length === this.data.length, 'map effectFramesArray misaligned with data')
+                    if (cleanupSlots) {
+                        assert(cleanupSlots.length === this.data.length, 'map cleanup slots misaligned with data')
+                    }
+                }
             },
             options?.scheduleRecompute,
             {

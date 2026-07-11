@@ -803,11 +803,15 @@ export class Computed extends ReactiveEffect {
     // CAUTION 以下全部是原型方法（原来是每实例的箭头函数字段），调用点都是 this.xxx() 的方法调用
     manualTrack(target: object, type: TrackOpTypes, key: unknown) {
         notifier.enableTracking()
-        const dep = isPrimitiveAtom(target) && type === TrackOpTypes.ATOM && key === 'value'
-            ? notifier.trackPrimitiveAtomValue(target)
-            : notifier.track(target, type, key)
-        notifier.resetTracking()
-        return dep
+        // CAUTION try/finally 配平：track 会向监听者派发 track 事件（用户代码），
+        //  抛错时 trackStack 必须复原,否则全局追踪开关永久失衡。
+        try {
+            return isPrimitiveAtom(target) && type === TrackOpTypes.ATOM && key === 'value'
+                ? notifier.trackPrimitiveAtomValue(target)
+                : notifier.track(target, type, key)
+        } finally {
+            notifier.resetTracking()
+        }
     }
     pauseAutoTrack() {
         notifier.pauseTracking()
