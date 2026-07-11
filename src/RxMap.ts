@@ -164,8 +164,14 @@ export class RxMap<K, V> extends Computed{
                                     this.push(info.argv![0]! as K)
                                 }
                             } else if(info.method === 'delete') {
-                                const index = this.data.indexOf(info.argv![0] as K)
-                                this.splice(index, 1)
+                                // CAUTION SameValueZero 查找：Map 的 key 语义支持 NaN，
+                                //  indexOf 的严格相等找不到 NaN 会返回 -1，直接 splice(-1, 1)
+                                //  会按负 index 归一化误删最后一个 key。
+                                const deletedKey = info.argv![0] as K
+                                const index = this.data.findIndex(
+                                    key => key === deletedKey || (key !== key && deletedKey !== deletedKey)
+                                )
+                                if (index !== -1) this.splice(index, 1)
                             } else {
                                 assert(false, 'unreachable')
                             }

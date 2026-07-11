@@ -327,7 +327,10 @@ export class RxSet<T> extends Computed {
                     })
 
                     deletedItems.forEach(x => {
-                        this.splice(this.data.indexOf(x), 1)
+                        // CAUTION SameValueZero 查找：Set 的成员语义支持 NaN，indexOf 的
+                        //  严格相等找不到 NaN 会返回 -1，splice(-1, 1) 会误删最后一个元素。
+                        const index = this.data.findIndex(item => item === x || (item !== item && x !== x))
+                        if (index !== -1) this.splice(index, 1)
                     })
                 })
             }
