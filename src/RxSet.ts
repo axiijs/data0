@@ -20,6 +20,8 @@ export class RxSet<T> extends Computed {
         this.getter = getter
 
         // 自己是 source
+        // CAUTION 架构语义（AGENTS.md A3）：传入 Set 时直接采纳引用（所有权移交），
+        //  之后必须通过本实例的方法修改。刻意不做防御性拷贝，明确不修。
         this.data = source instanceof Set ? source : new Set(Array.isArray(source) ? source : [])
 
         if (this.getter) {
@@ -32,6 +34,8 @@ export class RxSet<T> extends Computed {
 
     replace(newData: T[]|Set<T>): [T[], T[]]{
         const old = this.data
+        // CAUTION 架构语义（AGENTS.md A3）：传入 Set 时直接采纳引用（所有权移交），
+        //  调用方之后复用该 Set 直接增删不会触发任何通知。
         this.data = newData instanceof Set ? newData : new Set(newData)
 
         const newItems: T[] = []
@@ -327,7 +331,10 @@ export class RxSet<T> extends Computed {
                     })
 
                     deletedItems.forEach(x => {
-                        this.splice(this.data.indexOf(x), 1)
+                        // CAUTION SameValueZero 查找：Set 的成员语义支持 NaN，indexOf 的
+                        //  严格相等找不到 NaN 会返回 -1，splice(-1, 1) 会误删最后一个元素。
+                        const index = this.data.findIndex(item => item === x || (item !== item && x !== x))
+                        if (index !== -1) this.splice(index, 1)
                     })
                 })
             }

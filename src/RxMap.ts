@@ -32,6 +32,8 @@ export class RxMap<K, V> extends Computed{
         super(getter, applyPatch, scheduleRecompute, callbacks, skipIndicator)
         this.getter = getter
         // 自己是 source
+        // CAUTION 架构语义（AGENTS.md A3）：传入 Map 时直接采纳引用（所有权移交），
+        //  之后必须通过本实例的方法修改。刻意不做防御性拷贝，明确不修。
         if (source) {
             this.data = isMap(source) ? source : new Map(Array.isArray(source) ? source : Object.entries(source))
         } else {
@@ -164,8 +166,14 @@ export class RxMap<K, V> extends Computed{
                                     this.push(info.argv![0]! as K)
                                 }
                             } else if(info.method === 'delete') {
-                                const index = this.data.indexOf(info.argv![0] as K)
-                                this.splice(index, 1)
+                                // CAUTION SameValueZero 查找：Map 的 key 语义支持 NaN，
+                                //  indexOf 的严格相等找不到 NaN 会返回 -1，直接 splice(-1, 1)
+                                //  会按负 index 归一化误删最后一个 key。
+                                const deletedKey = info.argv![0] as K
+                                const index = this.data.findIndex(
+                                    key => key === deletedKey || (key !== key && deletedKey !== deletedKey)
+                                )
+                                if (index !== -1) this.splice(index, 1)
                             } else {
                                 assert(false, 'unreachable')
                             }

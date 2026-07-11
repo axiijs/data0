@@ -268,11 +268,15 @@ export function nextTick(fn: () => any) {
 }
 
 // Array#splice 对 start/deleteCount 的 ToIntegerOrInfinity 语义：
-// NaN/undefined → 0，小数截断，±Infinity 保留（由后续 clamp 处理）。
+// NaN/undefined → 0，小数截断，-0 → +0，±Infinity 保留（由后续 clamp 处理）。
 export function toIntegerOrInfinity(value: unknown): number {
     const n = Number(value)
     if (Number.isNaN(n)) return 0
-    return Math.trunc(n)
+    const i = Math.trunc(n)
+    // CAUTION 规范要求 -0 归一化为 +0：Math.trunc(-0.5) 是 -0，若不归一化会
+    //  顺着 normalizeSpliceStart 流进派生结构（例如 findIndex 返回 -0，
+    //  atom 的 Object.is 判等会把 0 → -0 当成变化反复触发订阅者）。
+    return i === 0 ? 0 : i
 }
 
 // 归一化 splice 的 start：负数从末尾回退，最终 clamp 到 [0, length]。

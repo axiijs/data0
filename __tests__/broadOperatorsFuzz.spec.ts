@@ -1,0 +1,267 @@
+import {describe, expect, test} from 'vitest'
+import {atom} from '../src/atom.js'
+import {RxList} from '../src/RxList.js'
+import {RxMap} from '../src/RxMap.js'
+import {RxSet} from '../src/RxSet.js'
+
+function mulberry32(seed: number) {
+    let a = seed >>> 0
+    return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0
+        let t = Math.imul(a ^ (a >>> 15), 1 | a)
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+}
+
+type Op =
+    | { kind: 'splice', start: number, deleteCount: number, items: number[] }
+    | { kind: 'set', index: number, value: number }
+    | { kind: 'sortSelf' }
+    | { kind: 'reposition', start: number, newStart: number, limit: number }
+    | { kind: 'swap', a: number, b: number }
+    | { kind: 'push', items: number[] }
+    | { kind: 'pop' }
+    | { kind: 'shift' }
+    | { kind: 'unshift', items: number[] }
+
+function randomOp(rand: () => number, len: number, nextVal: () => number): Op {
+    const r = rand()
+    if (r < 0.35) {
+        const startChoice = rand()
+        let start: number
+        if (startChoice < 0.15) start = -Math.floor(rand() * (len + 2))
+        else if (startChoice < 0.25) start = len + Math.floor(rand() * 3)
+        else if (startChoice < 0.32) start = rand() * len
+        else if (startChoice < 0.35) start = NaN
+        else start = Math.floor(rand() * (len + 1))
+        const deleteCount = rand() < 0.2 ? Math.floor(rand() * 3) + len : Math.floor(rand() * 4)
+        const items = Array.from({length: Math.floor(rand() * 4)}, nextVal)
+        return {kind: 'splice', start, deleteCount, items}
+    }
+    if (r < 0.5 && len > 0) return {kind: 'set', index: Math.floor(rand() * len), value: nextVal()}
+    if (r < 0.6) return {kind: 'sortSelf'}
+    if (r < 0.7 && len >= 2) {
+        const limit = 1 + Math.floor(rand() * Math.min(2, len - 1))
+        const start = Math.floor(rand() * (len - limit + 1))
+        const newStart = Math.floor(rand() * (len - limit + 1))
+        return {kind: 'reposition', start, newStart, limit}
+    }
+    if (r < 0.8 && len >= 2) {
+        const a = Math.floor(rand() * len)
+        let b = Math.floor(rand() * len)
+        if (a === b) b = (b + 1) % len
+        return {kind: 'swap', a: Math.min(a, b), b: Math.max(a, b)}
+    }
+    if (r < 0.9) return {kind: 'push', items: Array.from({length: 1 + Math.floor(rand() * 3)}, nextVal)}
+    if (r < 0.93 && len > 0) return {kind: 'pop'}
+    if (r < 0.96 && len > 0) return {kind: 'shift'}
+    return {kind: 'unshift', items: Array.from({length: 1 + Math.floor(rand() * 2)}, nextVal)}
+}
+
+function applyOp(list: RxList<number>, op: Op) {
+    switch (op.kind) {
+        case 'splice': return list.splice(op.start, op.deleteCount, ...op.items)
+        case 'set': return list.set(op.index, op.value)
+        case 'sortSelf': return list.sortSelf((a, b) => a - b)
+        case 'reposition': return list.reposition(op.start, op.newStart, op.limit)
+        case 'swap': {
+            if (op.b - op.a < 1) return
+            return list.swap(op.a, op.b, 1)
+        }
+        case 'push': return list.push(...op.items)
+        case 'pop': return list.pop()
+        case 'shift': return list.shift()
+        case 'unshift': return list.unshift(...op.items)
+    }
+}
+
+describe('broad fuzz: unique values, all operators', () => {
+    for (const seed of [1, 2, 3, 4, 5, 42, 1337, 20260711]) {
+        test(`seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            let counter = 100
+            const nextVal = () => counter++
+            const source = new RxList<number>([1, 2, 3, 4, 5])
+
+            const mapped = source.map(x => x * 2)
+            const filtered = source.filter(x => x % 2 === 0)
+            const sorted = source.toSorted((a, b) => a - b)
+            const sliced = source.slice(1, 4)
+            const other = new RxList<number>([1000, 1001])
+            const concated = source.concat(other)
+            const asSet = source.toSet()
+            const grouped = source.groupBy(x => x % 3)
+            const found = source.findIndex(x => x % 5 === 0)
+            const len = source.length
+            const history: Op[] = []
+            try {
+                for (let step = 0; step < 150; step++) {
+                    const op = randomOp(rand, source.data.length, nextVal)
+                    history.push(op)
+                    applyOp(source, op)
+
+                    const src = source.data
+                    const ctx = `seed=${seed} step=${step} op=${JSON.stringify(op)} src=${JSON.stringify(src)} recent=${JSON.stringify(history.slice(-6))}`
+                    expect(mapped.data, `map ${ctx}`).toEqual(src.map(x => x * 2))
+                    expect(filtered.data, `filter ${ctx}`).toEqual(src.filter(x => x % 2 === 0))
+                    expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
+                    expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
+                    expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
+                    for (const [k, g] of grouped.data) {
+                        expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => x % 3 === k))
+                    }
+                    expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x % 5 === 0))
+                    expect(len.raw, `length ${ctx}`).toBe(src.length)
+                }
+            } finally {
+                mapped.destroy(); filtered.destroy(); sorted.destroy(); sliced.destroy()
+                concated.destroy(); asSet.destroy()
+                for (const g of grouped.data.values()) g.destroy()
+                grouped.destroy(); source.destroy(); other.destroy()
+            }
+        })
+    }
+})
+
+describe('broad fuzz: map(item, index) atomIndexes consistency', () => {
+    for (const seed of [21, 22, 23]) {
+        test(`seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            let counter = 0
+            const source = new RxList<number>([counter++, counter++, counter++])
+            const mapped = source.map((item, index) => ({item, index}))
+            try {
+                for (let step = 0; step < 100; step++) {
+                    const r = rand()
+                    const len = source.data.length
+                    if (r < 0.4) {
+                        const start = Math.floor(rand() * (len + 1))
+                        const dc = Math.floor(rand() * 3)
+                        const items = Array.from({length: Math.floor(rand() * 3)}, () => counter++)
+                        source.splice(start, dc, ...items)
+                    } else if (r < 0.6) {
+                        source.sortSelf((a, b) => b - a)
+                    } else if (r < 0.8 && len >= 2) {
+                        source.reposition(Math.floor(rand() * len), Math.floor(rand() * len), 1)
+                    } else {
+                        source.push(counter++)
+                    }
+                    expect(mapped.data.map(e => e.item), `seed=${seed} step=${step}`).toEqual(source.data)
+                    mapped.data.forEach((entry, i) => {
+                        expect(entry.index.raw, `seed=${seed} step=${step} row=${i}`).toBe(i)
+                    })
+                }
+            } finally {
+                mapped.destroy(); source.destroy()
+            }
+        })
+    }
+})
+
+describe('broad fuzz: findIndex with reactive predicates', () => {
+    for (const seed of [31, 32, 33, 34]) {
+        test(`seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            let id = 0
+            const mk = (score: number) => ({id: id++, score: atom(score)})
+            type Item = ReturnType<typeof mk>
+            const source = new RxList<Item>([mk(1), mk(5), mk(2)])
+            const found = source.findIndex(item => item.score() >= 4)
+            try {
+                for (let step = 0; step < 120; step++) {
+                    const r = rand()
+                    const len = source.data.length
+                    if (r < 0.35 && len > 0) {
+                        source.data[Math.floor(rand() * len)].score(Math.floor(rand() * 8))
+                    } else if (r < 0.6) {
+                        const start = Math.floor(rand() * (len + 1))
+                        const dc = Math.floor(rand() * 2)
+                        const items = Array.from({length: Math.floor(rand() * 2)}, () => mk(Math.floor(rand() * 8)))
+                        source.splice(start, dc, ...items)
+                    } else if (r < 0.75 && len > 0) {
+                        source.set(Math.floor(rand() * len), mk(Math.floor(rand() * 8)))
+                    } else if (r < 0.85) {
+                        source.sortSelf((a, b) => a.score.raw - b.score.raw)
+                    } else {
+                        source.push(mk(Math.floor(rand() * 8)))
+                    }
+                    expect(found(), `seed=${seed} step=${step}`).toBe(source.data.findIndex(item => item.score.raw >= 4))
+                }
+            } finally {
+                source.destroy()
+            }
+        })
+    }
+})
+
+describe('broad fuzz: RxSet operations and RxMap derivations', () => {
+    for (const seed of [41, 42, 43]) {
+        test(`rxset seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            const val = () => Math.floor(rand() * 10)
+            const a = new RxSet<number>([val(), val(), val()])
+            const b = new RxSet<number>([val(), val(), val()])
+            const diff = a.difference(b)
+            const inter = a.intersection(b)
+            const sym = a.symmetricDifference(b)
+            const uni = a.union(b)
+            try {
+                for (let step = 0; step < 150; step++) {
+                    const target = rand() < 0.5 ? a : b
+                    const r = rand()
+                    if (r < 0.4) target.add(val())
+                    else if (r < 0.75) {
+                        const arr = [...target.data]
+                        if (arr.length) target.delete(arr[Math.floor(rand() * arr.length)])
+                    } else {
+                        target.replace(Array.from({length: Math.floor(rand() * 4)}, val))
+                    }
+                    const A = [...a.data], B = [...b.data]
+                    const sortNum = (x: number[]) => x.slice().sort((m, n) => m - n)
+                    const ctx = `seed=${seed} step=${step}`
+                    expect(sortNum([...diff.data]), ctx).toEqual(sortNum(A.filter(x => !B.includes(x))))
+                    expect(sortNum([...inter.data]), ctx).toEqual(sortNum(A.filter(x => B.includes(x))))
+                    expect(sortNum([...sym.data]), ctx).toEqual(sortNum([...A.filter(x => !B.includes(x)), ...B.filter(x => !A.includes(x))]))
+                    expect(sortNum([...uni.data]), ctx).toEqual(sortNum([...new Set([...A, ...B])]))
+                }
+            } finally {
+                diff.destroy(); inter.destroy(); sym.destroy(); uni.destroy()
+                a.destroy(); b.destroy()
+            }
+        })
+    }
+
+    for (const seed of [51, 52]) {
+        test(`rxmap seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            const key = () => 'k' + Math.floor(rand() * 8)
+            const map = new RxMap<string, number>({k0: 0, k1: 1})
+            const keys = map.keys()
+            const values = map.values()
+            const entries = map.entries()
+            const size = map.size
+            try {
+                for (let step = 0; step < 150; step++) {
+                    const r = rand()
+                    if (r < 0.45) map.set(key(), Math.floor(rand() * 100))
+                    else if (r < 0.75) map.delete(key())
+                    else if (r < 0.9) {
+                        const obj: Record<string, number> = {}
+                        for (let i = 0; i < Math.floor(rand() * 4); i++) obj[key()] = Math.floor(rand() * 100)
+                        map.replace(obj)
+                    } else map.clear()
+
+                    const ctx = `seed=${seed} step=${step}`
+                    expect(keys.data, ctx).toEqual([...map.data.keys()])
+                    expect(values.data, ctx).toEqual([...map.data.values()])
+                    expect(entries.data, ctx).toEqual([...map.data.entries()])
+                    expect(size.raw, ctx).toBe(map.data.size)
+                }
+            } finally {
+                map.destroy()
+            }
+        })
+    }
+})

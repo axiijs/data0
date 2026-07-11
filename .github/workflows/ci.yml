@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # 锁文件安装失败本身是仓库问题(AGENTS.md),不允许回退无锁安装
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test --run
+
+      - name: Type check
+        run: pnpm type-check
+
+      - name: Build
+        run: pnpm build
+
+      - name: Coverage
+        run: pnpm exec vitest run --coverage

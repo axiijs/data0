@@ -3,7 +3,7 @@ import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
 import type {TriggerOpTypes} from "./operations.js";
 import {ManualCleanup} from "./manualCleanup.js";
-import {isAsync, isGenerator} from "./util.js";
+import {assert, isAsync, isGenerator} from "./util.js";
 import {
     trackRetainedDepEffectAdded,
     trackRetainedDepEffectRemoved,
@@ -45,7 +45,8 @@ export class ReactiveEffect extends ManualCleanup {
         if (effect.parent && !fromParent) {
             // 要把自己从 parent.children 中移除掉。直接用 last 替换掉当前的要上出的，提升删除速度。
             const siblings = effect.parent._children
-            if (siblings) {
+            // CAUTION length 守卫：防御 siblings 已被外部清空时 pop 出 undefined
+            if (siblings && siblings.length) {
                 const last = siblings.pop()!
                 if (last !== effect) {
                     siblings[effect.index!] = last
@@ -59,7 +60,15 @@ export class ReactiveEffect extends ManualCleanup {
         if (!ignoreChildren) {
             effect.destroyChildren()
         } else if (effect._children) {
-            effect._children.length = 0
+            // CAUTION ignoreChildren 语义是"留下 children 由调用方自行管理"，
+            //  但必须断开它们的 parent 反向指针：否则这些孤儿 child 之后被单独
+            //  destroy 时，会在已清空的 siblings 数组上做 last 替换（pop 出
+            //  undefined 后写 last.index 直接 TypeError）。
+            const children = effect._children
+            for (let i = 0; i < children.length; i++) {
+                if (children[i].parent === effect) children[i].parent = undefined
+            }
+            children.length = 0
         }
         effect.dispatch('destroy')
     }
@@ -232,13 +241,30 @@ export class ReactiveEffect extends ManualCleanup {
         }
     }
 
+    /**
+     * CAUTION 按身份出栈，绝不盲目 pop：这是作用域栈唯一合法的移除入口。
+     *  同步执行严格嵌套（自己必然在栈顶，只多一次比较）；但 async 执行
+     *  （async patch/generator）可能交错完成，栈顶可能是别人——盲目 pop 会把
+     *  对方弹掉，之后对方的一切 track 归属到错误的 effect 上（订阅污染）。
+     *  该原语从构造上消灭"弹错栈"这一类缺陷。
+     */
+    private removeFromActiveScopes() {
+        const scopes = ReactiveEffect.activeScopes
+        if (scopes[scopes.length - 1] === this) {
+            scopes.pop()
+            return
+        }
+        const index = scopes.lastIndexOf(this)
+        if (index !== -1) scopes.splice(index, 1)
+    }
+
     completeTracking(isLast = false, isAsync = this.isAsync) {
         if (!isAsync) {
             if (this.useDepMarker && notifier.effectTrackDepth <= maxMarkerBits) {
                 finalizeDepMarkers(this)
             }
 
-            ReactiveEffect.activeScopes.pop()
+            this.removeFromActiveScopes()
             Notifier.trackOpBit = 1 << --notifier.effectTrackDepth
 
         } else {
@@ -250,7 +276,7 @@ export class ReactiveEffect extends ManualCleanup {
                 }
             }
 
-            ReactiveEffect.activeScopes.pop()
+            this.removeFromActiveScopes()
         }
     }
     // 依赖触发时由 notifier 调用（非 session 路径）。基类 effect 不消费 TriggerInfo，
@@ -277,6 +303,15 @@ export class ReactiveEffect extends ManualCleanup {
         if (this.isRunningAsync) {}
 
         if(!this.isAsync) {
+            // CAUTION dev 不变量：一次同步 run 结束后，全局作用域栈与追踪开关栈的
+            //  深度必须复原。违约（漏 pop / 漏 reset）在这里当场炸，而不是在遥远的
+            //  下游表现为静默的幽灵订阅或追踪失效。生产构建下代码被剔除。
+            let scopesDepthBefore = 0
+            let trackStackDepthBefore = 0
+            if (__DEV__) {
+                scopesDepthBefore = ReactiveEffect.activeScopes.length
+                trackStackDepthBefore = notifier.trackStack.length
+            }
             try {
                 this.prepareTracking()
                 notifier.enableTracking()
@@ -284,6 +319,10 @@ export class ReactiveEffect extends ManualCleanup {
             } finally {
                 notifier.resetTracking()
                 this.completeTracking()
+                if (__DEV__) {
+                    assert(ReactiveEffect.activeScopes.length === scopesDepthBefore, 'activeScopes depth not restored after effect run (scope leak)')
+                    assert(notifier.trackStack.length === trackStackDepthBefore, 'trackStack depth not restored after effect run (pause/reset imbalance)')
+                }
             }
         } else {
             // async 执行中的时候产生了新的触发了重算怎么办？？？
