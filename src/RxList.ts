@@ -189,12 +189,18 @@ export class RxList<T> extends Computed {
         if (length === 1 || hasIndexKeyDeps || hasAtomIndexes) return this.splice(0, length)
 
         this.pauseAutoTrack()
-        const deletedItems = this.data.slice()
-        this.data.length = 0
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: deletedItems })
-        this.sendTriggerInfos()
-        this.resetAutoTrack()
-        return deletedItems
+        // CAUTION try/finally：sendTriggerInfos 会同步执行订阅者，订阅者抛错时
+        //  必须复位追踪状态，否则 trackStack 每次异常泄漏一个槽位、顶层 shouldTrack
+        //  永久卡在 false。
+        try {
+            const deletedItems = this.data.slice()
+            this.data.length = 0
+            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: deletedItems })
+            this.sendTriggerInfos()
+            return deletedItems
+        } finally {
+            this.resetAutoTrack()
+        }
     }
     pop( ) {
         return this.splice(this.data.length - 1, 1)[0]
@@ -212,7 +218,16 @@ export class RxList<T> extends Computed {
     // （大列表 replaceData/concat 等场景 spread 会 RangeError）与 O(n) 实参拷贝。
     spliceArray(start: number, deleteCount: number, items: T[] = []) {
         this.pauseAutoTrack()
-
+        // CAUTION try/finally：trigger/digest 会同步执行订阅者，订阅者抛错时必须
+        //  复位追踪状态，否则 trackStack 每次异常泄漏一个槽位、顶层 shouldTrack
+        //  永久卡在 false。
+        try {
+            return this.doSplice(start, deleteCount, items)
+        } finally {
+            this.resetAutoTrack()
+        }
+    }
+    private doSplice(start: number, deleteCount: number, items: T[]) {
         const originLength = this.data.length
         // CAUTION 内部计算一律用归一化后的 start/deleteCount（Array#splice 的
         //  ToIntegerOrInfinity + clamp 语义）：负/越界/小数 start 直接参与区间计算会算错
@@ -233,14 +248,18 @@ export class RxList<T> extends Computed {
             const result = spliceMany(this.data, normalizedStart, deleteItemsCount, items)
             this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
             this.sendTriggerInfos()
-            this.resetAutoTrack()
             return result
         }
 
 
         // CAUTION 不需要触发 length 的变化，因为获取  length 的时候得到就已经是个 computed 了。
         const newLength = originLength - deleteItemsCount + items.length
-        const changedIndexEnd = deleteItemsCount !== items.length ? newLength : normalizedStart + items.length
+        // CAUTION 受影响区间上界必须覆盖收缩场景：newLength < originLength 时
+        //  [newLength, originLength) 的 index 从有值变成 undefined，订阅了这些 index
+        //  的 at() effect（例如订阅末位后 pop）也必须收到 SET，否则永久读到旧值。
+        const changedIndexEnd = deleteItemsCount !== items.length
+            ? Math.max(newLength, originLength)
+            : normalizedStart + items.length
         // CAUTION 只对"实际有订阅者且落在受影响区间"的 index 记录 oldValue / 触发 SET：
         //  旧实现对 [start, changedIndexEnd) 逐 index 触发，一次中段 splice 是 O(移动范围)
         //  次 trigger；订阅通常是稀疏的（axii 每行订阅自己的 index），按订阅遍历后
@@ -271,18 +290,22 @@ export class RxList<T> extends Computed {
 
         // CATION 特别注意这里 atomIndexes 的变化也要先 catch 住
         notifier.createEffectSession()
-        this.sendTriggerInfos()
+        try {
+            this.sendTriggerInfos()
 
-        if (this.atomIndexes) {
-            spliceMany(this.atomIndexes, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
-            for (let i = normalizedStart; i <changedIndexEnd; i++) {
-                // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
-                this.atomIndexes[i]?.(i)
+            if (this.atomIndexes) {
+                spliceMany(this.atomIndexes, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
+                for (let i = normalizedStart; i <changedIndexEnd; i++) {
+                    // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
+                    this.atomIndexes[i]?.(i)
+                }
             }
+        } finally {
+            // CAUTION 放在 finally：session 一旦创建必须消化，否则 notifier 永久停留在
+            //  session 模式，之后所有 trigger 都被吞进队列。
+            notifier.digestEffectSession()
         }
-        notifier.digestEffectSession()
 
-        this.resetAutoTrack()
         return result
     }
     // 显式 set 某一个 index 的值
