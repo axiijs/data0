@@ -32,6 +32,8 @@ export class RxMap<K, V> extends Computed{
         super(getter, applyPatch, scheduleRecompute, callbacks, skipIndicator)
         this.getter = getter
         // 自己是 source
+        // CAUTION 架构语义（AGENTS.md A3）：传入 Map 时直接采纳引用（所有权移交），
+        //  之后必须通过本实例的方法修改。刻意不做防御性拷贝，明确不修。
         if (source) {
             this.data = isMap(source) ? source : new Map(Array.isArray(source) ? source : Object.entries(source))
         } else {

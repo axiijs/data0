@@ -167,6 +167,9 @@ export class RxList<T> extends Computed {
         this.getter = getter
 
         // 自己是 source
+        // CAUTION 架构语义（AGENTS.md「架构决策与已知语义边界」A3）：直接采纳传入
+        //  数组（零拷贝，所有权移交）。调用方之后必须通过本实例的方法修改；绕过
+        //  方法直改原数组不会触发任何通知。刻意不做防御性拷贝，明确不修。
         this.data = source || []
         if (this.getter) {
             this.run([], true)

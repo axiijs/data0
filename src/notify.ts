@@ -486,6 +486,10 @@ export class Notifier {
     }
     return result
   }
+  // CAUTION 架构语义（AGENTS.md「架构决策与已知语义边界」A1）：传播是急切推模式，
+  //  按订阅顺序同步执行，无拓扑排序、无读时拉取。菱形依赖（a→c 且 a→b→c）下，
+  //  先订阅的下游会以"新 a + 旧 b"先算一遍（可观察的中间值 + 重复重算），终值必然
+  //  收敛。这不是缺陷：glitch-free 需要拉模式/拓扑调度，与当前架构冲突，明确不修。
   triggerEffects(
       dep: Dep,
       source: any,
@@ -575,6 +579,11 @@ export const notifier: Notifier = Notifier.instance
  *
  * Nested batches share the same effect session and flush only at the outermost
  * boundary.
+ *
+ * CAUTION 架构语义（AGENTS.md「架构决策与已知语义边界」A2）：session 把订阅者的
+ *  执行连同"标脏"一起推迟到 digest，而 computed 读路径没有"脏则重算"的拉取。
+ *  因此 batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值
+ *  （atom 本身的读取不受影响），batch 退出后恢复一致。这不是缺陷，明确不修。
  */
 export function batch<T>(fn: () => T): T {
   notifier.createEffectSession()
