@@ -160,14 +160,6 @@ export class Computed extends ReactiveEffect {
         return this._keyToEffectFrames ?? (this._keyToEffectFrames = new WeakMap())
     }
     manualTracking = false
-    _dirtyFromDeps?: Set<Computed>
-    public get dirtyFromDeps(): Set<Computed> {
-        return this._dirtyFromDeps ?? (this._dirtyFromDeps = new Set())
-    }
-    _markedDirtyEffects?: Set<Computed>
-    public get markedDirtyEffects(): Set<Computed> {
-        return this._markedDirtyEffects ?? (this._markedDirtyEffects = new Set())
-    }
     // TODO 需要一个更好的约定
     public get debugName() {
         return getDebugName(this.data)
@@ -365,23 +357,14 @@ export class Computed extends ReactiveEffect {
     }
     recursiveMarkDirty() {
         // CAUTION notifier.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
+        // 旧实现还会把双向引用记进 dirtyFromDeps/markedDirtyEffects 两个 Set：
+        // 它们从无任何读取方，却对已销毁的 effect 保持强引用（纯泄漏），已移除。
         const depEffects = notifier.getDepEffects(this.trackClassInstance ? this: this.data)
         if (!depEffects) return
 
         for(const effect of depEffects) {
-            if (effect instanceof Computed) {
-
-                effect.dirtyFromDeps.add(this)
-                this.markedDirtyEffects.add(effect)
-            }
-        }
-
-        // CAUTION 一定要分成两个循环，因为 effect.run 可能随时会触发 this 重算，使得 status 变为 clean，
-        //  如果在下一个 effect 中把 clean 的 dep 添加进去了，就再也清理不了了。
-        for(const effect of depEffects) {
             effect.run()
         }
-
     }
     // CAUTION cleanPromise 惰性化：每轮 dirty 都无条件创建 Promise + 闭包，
     //  而绝大多数 computed 从来没有人 await。改为：进入"未完成的计算周期"时只置
