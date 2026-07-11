@@ -516,8 +516,13 @@ export class Computed extends ReactiveEffect {
         this.dispatch('recompute', this.data)
         this.dispatch('cleanup', this.data)
         // 使用 context 注册的 cleanup
+        // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
+        //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
+        //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
         if (this.lastCleanupFn) {
-            this.lastCleanupFn()
+            const cleanup = this.lastCleanupFn
+            this.lastCleanupFn = undefined
+            cleanup()
         }
     }
 
