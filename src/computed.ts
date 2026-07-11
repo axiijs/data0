@@ -431,7 +431,12 @@ export class Computed extends ReactiveEffect {
     run(infos?: TriggerInfo[], immediate = false) {
         if (this.skipIndicator?.skip) return
         if (infos && infos.length) {
-            this.triggerInfos.push(...infos)
+            // CAUTION 不能 push(...infos)：batch 中积累的 infos 可能超过引擎实参上限
+            //  （约 65k，超过直接 RangeError），必须逐个 push（同 spliceMany 的动机）。
+            const triggerInfos = this.triggerInfos
+            for (let i = 0; i < infos.length; i++) {
+                triggerInfos.push(infos[i])
+            }
         }
         this.handleTriggered(immediate)
     }
