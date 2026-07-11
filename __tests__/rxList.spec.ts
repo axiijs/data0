@@ -536,12 +536,13 @@ describe('RxList', () => {
             {id:4, score: 4},
             {id:0, score: 3},
         ])
-        // splice 在前面，有影响
+        // splice 在前面，有影响：filtered 保持与源一致的顺序
+        // （源变为 [.., {id:5}, {id:4}, {id:0}]，旧实现会把 {id:5} 追加到末尾）
         list.splice(3, 0, {id: 5, score: 3})
         expect(filtered.toArray()).toMatchObject([
+            {id:5, score: 3},
             {id:4, score: 4},
             {id:0, score: 3},
-            {id:5, score: 3},
         ])
 
         list.splice(2, Infinity)

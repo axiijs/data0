@@ -539,14 +539,19 @@ describe('coverage helpers for core lifecycle APIs', () => {
             this.manualTrack(source, TrackOpTypes.ATOM, 'value')
         }, undefined, true)
         parent.trackClassInstance = true
+        let childRuns = 0
         const child = new Computed(function(this: Computed) {
+            childRuns++
             this.manualTrack(parent, TrackOpTypes.ATOM, 'value')
         }, undefined, true)
 
         parent.run([], true)
         child.run([], true)
+        const childRunsBefore = childRuns
         parent.recursiveMarkDirty()
-        expect(parent.markedDirtyEffects.has(child)).toBe(true)
+        // recursiveMarkDirty 让订阅方重跑（旧实现的 markedDirtyEffects/dirtyFromDeps
+        // 记账集合从无读取方且泄漏已销毁 effect，已移除）
+        expect(childRuns).toBe(childRunsBefore + 1)
 
         const slice = new AsyncRxSlice<number>([], () => Promise.resolve([1, 2, 3]), item => item)
         await slice.fetch()

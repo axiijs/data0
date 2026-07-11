@@ -136,36 +136,49 @@ export class Notifier {
     }
 
     this.isDigesting = true
-    let i = 0
-    // CAUTION try/finally：任何一个 effect 抛异常都必须复位 session 状态，
-    //  否则 notifier 永久卡在 session 中，后续所有 trigger 都会被吞掉。
+    // CAUTION 单个 effect 抛异常不能中断 digest：旧实现直接丢弃队列中尚未执行的
+    //  effect——它们的"标脏"发生在 run 里，被丢弃后 status 停留在 CLEAN，读到的是
+    //  静默的陈旧值（batch 中一个订阅者出错会污染其他所有订阅者的数据一致性）。
+    //  现在逐个 try/catch，保证所有 effect 都执行；第一个错误在 digest 完成后
+    //  重新抛给 batch 调用方，其余错误 console.error 上报（不静默吞掉）。
+    let hasError = false
+    let firstError: unknown
     try {
         // CAUTION queue.length 每轮重新读取：digest 过程中新触发（含重入）的 effect
         //  会追加到队尾，在同一次 digest 中被处理（与旧的 Set 迭代语义一致）。
-        for (; i < queue.length; i++) {
+        for (let i = 0; i < queue.length; i++) {
             const effect = queue[i]
             effect._inSession = false
             const infos = effect._sessionInfos
-            if (infos !== undefined) {
-                effect._sessionInfos = undefined
-                effect.run(infos)
-            } else {
-                effect.run()
+            if (infos !== undefined) effect._sessionInfos = undefined
+            try {
+                if (infos !== undefined) {
+                    effect.run(infos)
+                } else {
+                    effect.run()
+                }
+            } catch (err) {
+                if (hasError) {
+                    console.error('[data0] suppressed additional effect error in batch digest:', err)
+                } else {
+                    hasError = true
+                    firstError = err
+                }
             }
+        }
+    } finally {
+        // 防御：即使出现预期外的异常（如 OOM），也要复位排队项标记与 session 状态，
+        // 防止 notifier 永久卡在 session 中，后续所有 trigger 都被吞掉。
+        // （正常路径下这些项都已处理过，重复复位是幂等的。）
+        for (let j = 0; j < queue.length; j++) {
+            queue[j]._inSession = false
+            queue[j]._sessionInfos = undefined
         }
         queue.length = 0
-    } finally {
-        // 异常路径：复位尚未执行的排队项的标记，防止污染下一个 session
-        if (queue.length) {
-            for (let j = i + 1; j < queue.length; j++) {
-                queue[j]._inSession = false
-                queue[j]._sessionInfos = undefined
-            }
-            queue.length = 0
-        }
         this.inEffectSession = false
         this.isDigesting = false
     }
+    if (hasError) throw firstError
   }
   collectTrackTarget() {
     const frame:any[] = []

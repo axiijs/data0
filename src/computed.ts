@@ -55,25 +55,34 @@ export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, 
 
 const queuedRecomputes = new WeakSet<Computed>()
 
+// 调度上下文（microtask/nextTick）没有可以同步传播异常的调用方：
+// 1. 一定要先出队再执行，否则 recompute 抛错（同步 getter 的异常会重抛）会把
+//    computed 永久卡在 queuedRecomputes 里，之后永远无法再被调度；
+//    先出队还保证执行期间的新触发能重新入队，而不是被去重静默吞掉。
+// 2. 异常必须捕获并上报（而不是变成 microtask 的 uncaught exception 崩掉进程）。
+//    computed 已经由 handleRecomputeError 复位为 DIRTY，下次触发可以重试。
+function runScheduledRecompute(this: Computed, recompute: (force?: boolean) => void) {
+    queuedRecomputes.delete(this)
+    try {
+        recompute()
+    } catch (err) {
+        console.error('[data0] uncaught error in scheduled recompute:', err)
+    }
+}
+
 // 如果是 async 的，用 queueMicrotask 来调度。
 // 如果不是 async 的，用 markDirty 而不是直接 recompute
 export function scheduleNextMicroTask(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
     if (queuedRecomputes.has(this)) return
     queuedRecomputes.add(this)
-    queueMicrotask(() => {
-        recompute()
-        queuedRecomputes.delete(this)
-    })
+    queueMicrotask(() => runScheduledRecompute.call(this, recompute))
 }
 
 
 export function scheduleNextTick(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
     if (queuedRecomputes.has(this)) return
     queuedRecomputes.add(this)
-    nextTick(() => {
-        recompute()
-        queuedRecomputes.delete(this)
-    })
+    nextTick(() => runScheduledRecompute.call(this, recompute))
 }
 
 export const STATUS_DIRTY = -1
@@ -151,14 +160,6 @@ export class Computed extends ReactiveEffect {
         return this._keyToEffectFrames ?? (this._keyToEffectFrames = new WeakMap())
     }
     manualTracking = false
-    _dirtyFromDeps?: Set<Computed>
-    public get dirtyFromDeps(): Set<Computed> {
-        return this._dirtyFromDeps ?? (this._dirtyFromDeps = new Set())
-    }
-    _markedDirtyEffects?: Set<Computed>
-    public get markedDirtyEffects(): Set<Computed> {
-        return this._markedDirtyEffects ?? (this._markedDirtyEffects = new Set())
-    }
     // TODO 需要一个更好的约定
     public get debugName() {
         return getDebugName(this.data)
@@ -356,23 +357,14 @@ export class Computed extends ReactiveEffect {
     }
     recursiveMarkDirty() {
         // CAUTION notifier.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
+        // 旧实现还会把双向引用记进 dirtyFromDeps/markedDirtyEffects 两个 Set：
+        // 它们从无任何读取方，却对已销毁的 effect 保持强引用（纯泄漏），已移除。
         const depEffects = notifier.getDepEffects(this.trackClassInstance ? this: this.data)
         if (!depEffects) return
 
         for(const effect of depEffects) {
-            if (effect instanceof Computed) {
-
-                effect.dirtyFromDeps.add(this)
-                this.markedDirtyEffects.add(effect)
-            }
-        }
-
-        // CAUTION 一定要分成两个循环，因为 effect.run 可能随时会触发 this 重算，使得 status 变为 clean，
-        //  如果在下一个 effect 中把 clean 的 dep 添加进去了，就再也清理不了了。
-        for(const effect of depEffects) {
             effect.run()
         }
-
     }
     // CAUTION cleanPromise 惰性化：每轮 dirty 都无条件创建 Promise + 闭包，
     //  而绝大多数 computed 从来没有人 await。改为：进入"未完成的计算周期"时只置
@@ -418,6 +410,11 @@ export class Computed extends ReactiveEffect {
                 cleanAll()
             }
         })
+        // CAUTION 预挂一个 no-op 的 rejection handler：cleanPromise 被创建后调用方可能并不
+        //  await（例如调用 recompute() 后丢弃返回值），async 出错时不能变成 unhandled
+        //  rejection（Node >= 15 默认直接崩溃进程）。真正 await 的调用方挂在同一个
+        //  promise 上，依然会正常收到 rejection。
+        this._cleanPromise.catch(() => {})
     }
     // dep trigger/recursiveMarkDirty/onTrack 时调用。
     // 1. 没有 infos 和 immediate 说明是 markDirty，是否启动由自己决定
@@ -426,7 +423,12 @@ export class Computed extends ReactiveEffect {
     run(infos?: TriggerInfo[], immediate = false) {
         if (this.skipIndicator?.skip) return
         if (infos && infos.length) {
-            this.triggerInfos.push(...infos)
+            // CAUTION 不能 push(...infos)：batch 中积累的 infos 可能超过引擎实参上限
+            //  （约 65k，超过直接 RangeError），必须逐个 push（同 spliceMany 的动机）。
+            const triggerInfos = this.triggerInfos
+            for (let i = 0; i < infos.length; i++) {
+                triggerInfos.push(infos[i])
+            }
         }
         this.handleTriggered(immediate)
     }
@@ -468,13 +470,13 @@ export class Computed extends ReactiveEffect {
         // 2. 在 async 模式下，任何依赖都可以再触发 recompute。
         // (强制)立刻执行 或者 已经在 recompute 中的 async, 会立刻重算。
         if (immediate || this.immediate || (this._status > STATUS_DIRTY && this.isAsync)) {
-            this.recompute()
+            this.recomputeInternal()
         } else {
             // CAUTION 如果是在 sync 的 recompute 阶段触发的。
             //  例如在 autorun/once 里面可能会既依赖 computed, 产生了 computed 变化，用户自己系统通过这种方式达到一个平衡状态。
             //   例如 不断将一个 pending list 中的数据取出来变成 processing。
             //   这时候的第一次 run 会变成 clean，所以 schedule 的 recompute 一定要是 forceRecompute 才能继续执行。
-            const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? () => this.recompute(true) : this.boundRecompute
+            const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? () => this.recomputeInternal(true) : this.boundRecompute
             if (this.scheduleNeedsInfos) {
                 this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, [...(this._triggerInfos ?? [])])
             } else {
@@ -497,19 +499,31 @@ export class Computed extends ReactiveEffect {
         this.dispatch('recompute', this.data)
         this.dispatch('cleanup', this.data)
         // 使用 context 注册的 cleanup
+        // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
+        //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
+        //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
         if (this.lastCleanupFn) {
-            this.lastCleanupFn()
+            const cleanup = this.lastCleanupFn
+            this.lastCleanupFn = undefined
+            cleanup()
         }
     }
 
     public recomputeId: number = 0
     // 重算过程中抛异常时统一处理：回到 DIRTY（后续 trigger 还能重试），
     // reject cleanPromise 让 await 方拿到错误，并派发 error 事件。
-    handleRecomputeError(err: any) {
+    // willPropagate 为 true 表示调用方随后会同步 rethrow（错误必然可观测）；
+    // 否则（async 路径）在既无 cleanPromise 等待方也无 error 监听者时，
+    // 用 console.error 兜底上报，避免错误被完全静默吞掉。
+    handleRecomputeError(err: any, willPropagate = false) {
         this.inPatch = false
         this.setStatus(STATUS_DIRTY)
+        const observable = this._cleanPromise !== undefined || this.hasListener('error')
         this.settleCleanPromiseWithError(err)
         this.dispatch('error', err)
+        if (!willPropagate && !observable) {
+            console.error('[data0] uncaught error in async computed recompute:', err)
+        }
     }
     finishFullRecompute(result: any) {
         if (!this.preventEffectSession) {
@@ -558,7 +572,7 @@ export class Computed extends ReactiveEffect {
         try {
             result = this.runEffect()
         } catch (err) {
-            this.handleRecomputeError(err)
+            this.handleRecomputeError(err, true)
             throw err
         }
         if (this.recomputeId !== recomputeId) return
@@ -607,7 +621,7 @@ export class Computed extends ReactiveEffect {
         try {
             patchResult = this.runPatch()
         } catch (err) {
-            this.handleRecomputeError(err)
+            this.handleRecomputeError(err, true)
             throw err
         }
         if (recomputeId !== this.recomputeId) return
@@ -635,12 +649,16 @@ export class Computed extends ReactiveEffect {
     }
     // 由 this.run/onTrack/forceDirtyDepsRecompute 调用
     // CAUTION 原型方法 + 惰性 bound 版本（scheduleRecompute 需要脱离 this 调用）
-    _boundRecompute?: (forceRecompute?: boolean) => Promise<any> | undefined
+    _boundRecompute?: (forceRecompute?: boolean) => void
     get boundRecompute() {
-        return this._boundRecompute ?? (this._boundRecompute = (forceRecompute?: boolean) => this.recompute(forceRecompute))
+        return this._boundRecompute ?? (this._boundRecompute = (forceRecompute?: boolean) => this.recomputeInternal(forceRecompute))
     }
+    // 内部触发路径（handleTriggered/调度器）用的重算：不经过 cleanPromise 的创建性 getter。
+    // CAUTION 内部路径不能创建 cleanPromise：内部调用方从不 await，无谓地创建会让
+    //  handleRecomputeError 误以为"有等待方在观测错误"，把本应 console.error 兜底的
+    //  async 错误静默吞掉。只有外部调用 recompute()/读取 cleanPromise 才创建。
     // CAUTION 不能声明为 async：同步 computed 的重算（以及其中的用户异常）必须保持同步语义。
-    recompute(forceRecompute = false): Promise<any> | undefined {
+    recomputeInternal(forceRecompute = false) {
         if ((this._status === STATUS_CLEAN && !forceRecompute) || !this.active) return
 
         // 四种类型计算：
@@ -668,7 +686,10 @@ export class Computed extends ReactiveEffect {
                 this.patchRecompute()
             }
         }
-
+    }
+    // 外部 API：返回 cleanPromise 供调用方 await 本轮计算完成（同步完成时返回 undefined）。
+    recompute(forceRecompute = false): Promise<any> | undefined {
+        this.recomputeInternal(forceRecompute)
         return this.cleanPromise
     }
     runPatch() {
@@ -827,10 +848,10 @@ export class AtomComputed extends Computed{
     }
 }
 
-// 强制重算
+// 强制重算。返回 cleanPromise，async computed 的调用方可以 await 本轮计算完成。
 export function recompute(computedItem: ComputedData, force = false) {
     const internal = computedToInternal.get(computedItem)!
-    internal.recompute(force)
+    return internal.recompute(force)
 }
 
 // 目前 debug 用的
