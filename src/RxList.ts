@@ -466,6 +466,14 @@ export class RxList<T> extends Computed {
     }
     // CAUTION 这里手动 track index dep 的变化，是为了在 splice 的时候能手动去根据订阅的 index dep 触发，而不是直接触发所有的 index key。
     at(index: number): T|undefined{
+        // 与 Array.prototype.at 一致：支持负索引（从末尾回数）。
+        // CAUTION 负索引的结果依赖 length，不能建 index dep（元素本身没变时对应
+        //  index 不会触发 SET），track ITERATE_KEY——所有结构变更（splice/reorder/set）
+        //  都会通知它。
+        if (index < 0) {
+            notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+            return this.data[this.data.length + index]
+        }
         const dep = notifier.track(this, TrackOpTypes.GET, index)
         if (dep && !this.indexKeyDeps.has(index)) {
             this.indexKeyDeps.set(index, dep)
