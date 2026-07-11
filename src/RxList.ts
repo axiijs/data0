@@ -320,6 +320,8 @@ export class RxList<T> extends Computed {
      * dev 不变量：atomIndexes 与 data 严格等长，且第 i 个 atom 的值恒为 i。
      * 违约意味着行级 index 记账出错（map 行会拿到错误位置），在变更当刻炸掉,
      * 而不是等下游行为漂移。生产构建下该函数不会被调用（__DEV__ 剔除）。
+     * 全量值扫描是 O(n)，仅存在 atomIndexes（有行级 index 订阅）时发生,
+     * dev 下可接受；若未来成为测试瓶颈可改为受影响区间扫描。
      */
     assertAtomIndexesAligned() {
         if (!this.atomIndexes) return

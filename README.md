@@ -1,0 +1,133 @@
+# data0
+
+响应式状态管理库,为 [axii](https://github.com/axiijs/axii) / axle 等增量渲染框架提供底层数据结构。核心特点:
+
+- **无 Proxy 的显式响应性**:`atom` / `computed` / `RxList` / `RxMap` / `RxSet`,变更必须经由实例方法,方法即变更边界。
+- **增量派生**:`map` / `filter` / `groupBy` / `toSorted` / `slice` 等派生结构默认按 `triggerInfo` 增量维护,不做全量 diff。
+- **面向框架的触发协议**:`triggerInfo`(method/argv/methodResult/reorderInfo)将结构化变更透传给下游,渲染层可据此做最小 DOM 操作。
+
+> 本 README 是 data0 的**语义契约**:它定义承诺面(什么行为受保证、什么属于契约外)。review 与缺陷报告以本文与 [AGENTS.md](./AGENTS.md) 为裁决依据。
+
+## 安装与快速上手
+
+```bash
+npm install data0
+```
+
+```ts
+import {atom, computed, RxList, autorun, batch} from 'data0'
+
+// 原子值:函数式读写
+const count = atom(0)
+count()          // 读(在 computed/autorun 内会建立依赖)
+count(1)         // 写(同步触发订阅者)
+count.raw        // 读但不追踪
+
+// 派生值:默认急切重算
+const double = computed(() => count() * 2)
+
+// 响应式列表与增量派生
+const list = new RxList([1, 2, 3])
+const doubled = list.map(x => x * 2)      // 增量维护
+const evens  = list.filter(x => x % 2 === 0)
+list.push(4)                               // doubled/evens 增量更新
+
+// 副作用
+const stop = autorun(() => console.log(double()))
+
+// 批量写:订阅者在 batch 结束时统一执行一次
+batch(() => { count(2); count(3) })
+
+stop()
+doubled.destroy(); evens.destroy(); list.destroy()
+```
+
+## 语义契约
+
+### 1. 变更边界与所有权(零拷贝采纳)
+
+- 响应性完全建立在"**通过实例方法修改**"之上。`RxList.splice/set/push/...`、`RxMap.set/delete/...`、`RxSet.add/delete/replace` 内部负责触发;没有 Proxy 兜底。
+- **构造与 `RxSet.replace` 直接采纳传入容器的引用**(`new RxList(arr)` 后 `list.data === arr`),视为所有权移交。之后绕过方法直改原容器(`arr.push(x)`)不会触发任何通知,派生结构静默失联——这是契约内行为,不是缺陷(详见 AGENTS.md A3)。
+- `data`(以及 atom 的 `.raw`)是**只读视图**:可以读,不可以写。
+
+### 2. 传播模型(急切推,同步)
+
+- atom 写入后**同步**执行订阅者,顺序为订阅顺序;computed 默认立即重算(`immediate`),async getter 默认经 microtask 调度。
+- **菱形依赖存在 glitch**(AGENTS.md A1):`a→c` 且 `a→b→c` 时,`c` 可能先以"新 a + 旧 b"重算一次,下游可观察到中间值并产生重复重算;**终值保证收敛正确**。对中间态敏感的副作用应自行防抖或读 `.raw` 终值。
+- **同步重算环会抛错**:在同步 computed 重算过程中又触发它自身的依赖变更,会抛出 `detect recompute triggerred in sync recompute`,请将变更移到调度回调中。
+
+### 3. `batch()` 语义
+
+- batch 内的写入立即生效于**数据本身**(atom 的 `.raw`、`RxList.data`),但订阅者(含 computed 的重算与标脏)推迟到 batch 退出时统一执行。
+- 因此 **batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值**(AGENTS.md A2),batch 退出后恢复一致。需要读写一致时在 batch 外读,或使用 `autorun`(其自身保证一致性)。
+- batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。
+
+### 4. RxList 参数契约
+
+- `splice(start, deleteCount, ...items)` 的参数按 `Array.prototype.splice` 规范归一化(ToIntegerOrInfinity:NaN→0、小数截断、负数从尾部回退、越界 clamp、`-0`→`+0`)。
+- **`triggerInfo.argv` 透传用户原始参数**(不归一化)。这是 axii/axle 依赖的协议;消费 argv 的派生结构必须自行归一化(内部实现均已如此)。
+- `set(index, value)` 的契约是**替换已存在的稠密行**。越界/负数/非整数 key 属于契约外用法:行为等同普通数组赋值(可能产生稀疏数组、`length` computed 不更新),key 原样透传给下游。
+- `at(index)` 支持负索引;对具体 index 的读取建立细粒度依赖,收缩(如 `pop`)会通知被裁剪的 index。
+
+### 5. async 契约
+
+- **async getter 只追踪第一个 `await` 之前读取的依赖**;需要跨 await 追踪时使用 generator getter(逐段追踪)。
+- **async applyPatch 同样只在同步段建立追踪**;挂起期间到达的源变更会排队,由后续 patch 轮次消化,不丢失。
+- async 错误经 `cleanPromise` reject 与 `error` 事件派发;两者都无人监听时 `console.error` 兜底,不产生 unhandled rejection。
+
+### 6. 生命周期
+
+- **谁创建,谁销毁**:派生结构不随 source 自动销毁,需调用 `.destroy()`(或 `destroyComputed`)。派生结构销毁时负责清理自己创建的行级 effect 与惰性 meta(`length`/`keys`/`size` 等)。
+- 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理;不希望被收集时用 `ReactiveEffect.createDetached`。
+- `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次。
+
+## 派生结构 × 源操作支持矩阵
+
+图例:**增量** = 增量维护;**重算** = 正确但回退全量重算;**无关** = 该操作不影响结果,自动忽略。
+
+| 派生结构 | splice(增删) | set(替换) | reorder(sortSelf/reposition/swap) |
+|---|---|---|---|
+| `RxList.map` | 增量 | 增量 | 增量 |
+| `RxList.filter` | 增量 | 增量 | 重建(按 indicator 顺序) |
+| `RxList.toSorted` | 增量 | 增量 | 无关 |
+| `RxList.slice` | 增量(负边界→重算) | 增量 | 重算 |
+| `RxList.concat` | 增量(批量多条→重算) | 增量 | 重算 |
+| `RxList.groupBy` | 增量 | 增量 | 组内重排 |
+| `RxList.indexBy` / `toMap` / `toSet` | 增量 | 增量 | 无关 |
+| `RxList.reduce` / `reduceToAtom` | 尾部追加增量,其余重算 | 重算 | 重算 |
+| `RxList.find` / `findIndex` / `some` / `every` | 增量(响应式谓词→重算) | 增量 | 重算 |
+| `createSelection` / `createSelections` | 增量 | 增量 | 增量 |
+| `createIndexKeySelection` | 增量 + 指示器按 index 校正 | 增量 | 增量 + 指示器校正 |
+| `RxList.length`、`RxMap.keys/values/entries/size`、`RxSet.size` | 增量(`clear`/`replace` 部分重算) | 增量 | 无关 |
+| `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量 | — | — |
+
+矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
+
+## 架构语义(不作为缺陷)
+
+以下行为经深度 review 评估后确认为架构绑定的既定语义,**不修**,详见 [AGENTS.md「架构决策与已知语义边界」](./AGENTS.md):
+
+- **A1** 菱形依赖 glitch(中间值可观察、重复重算,终值收敛);
+- **A2** `batch()` 内读 computed 得旧值;
+- **A3** 构造/`replace` 零拷贝采纳外部容器引用。
+
+其可执行定义在 `__tests__/architectureSemantics.spec.ts`。
+
+## 开发与验证
+
+```bash
+pnpm install --frozen-lockfile
+pnpm test --run        # 全量测试(含差分 fuzz、交错枚举、不变量自检)
+pnpm type-check
+pnpm build
+pnpm exec vitest run --coverage
+pnpm bench             # 性能基准(热路径改动必须跑)
+```
+
+- CI(`.github/workflows/ci.yml`)在每个 push/PR 上执行以上基线。
+- dev 构建(`__DEV__`)内置全局不变量断言(作用域栈/追踪栈平衡、行级记账对齐),违约立即抛错;生产构建零开销。
+- 贡献与 review 纪律见 [AGENTS.md](./AGENTS.md) 与 [CONTRIBUTING.md](./CONTRIBUTING.md)。
+
+## License
+
+[MIT](./LICENSE)
