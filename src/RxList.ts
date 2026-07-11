@@ -964,7 +964,18 @@ export class RxList<T> extends Computed {
     }
 
     filter(filterFn: (item:T) => boolean): RxList<T> {
+        const source = this
         const filtered = new RxList<T>([])
+        // 初始全量构建阶段行按源顺序执行，直接 push 即可（O(1)）
+        let initialBuildDone = false
+        // 当前正在处理的 patch 中，新行能否安全地按源顺序定位插入：
+        // - 纯插入 splice（无删除项）：filtered 与源一致，可以；
+        // - explicit key change（set 同位置替换）：旧项还在 filtered 中，但对齐扫描会
+        //   恰好停在旧项位置（即正确插入点），随后旧行销毁把旧项移除，可以；
+        // - 替换型 splice（如 replaceData）：filtered 里残留多个待删除旧项，按值对齐会
+        //   与旧项混淆（重复值时错位），维持遗留的追加行为——最终成员由旧行销毁时的
+        //   indexOf 清理保证。
+        let orderedInsertSafePatch = false
         const mapList = this.map((item, _, {onCleanup}) => {
             const remove = () => {
                 const index =  filtered.data.indexOf(item)
@@ -972,15 +983,42 @@ export class RxList<T> extends Computed {
                     filtered.splice(index, 1)
                 }
             }
+            // CAUTION 保持 filtered 与源列表同序：插入位置 = 源顺序中位于 item 之前
+            //  且当前已在 filtered 中的元素个数（双指针对齐扫描，O(源长度)）。
+            //  旧实现除头部特判外一律 push 到尾部，中段元素 toggle 成匹配 / 中段
+            //  纯插入新匹配项都会导致 filtered 顺序与源不一致。
+            const insertOrdered = () => {
+                const src = source.data
+                const filteredData = filtered.data
+                let fi = 0
+                for (let si = 0; si < src.length && fi < filteredData.length; si++) {
+                    if (src[si] === item) break
+                    if (src[si] === filteredData[fi]) fi++
+                }
+                filtered.splice(fi, 0, item)
+            }
+            const insertLegacy = () => {
+                if (item === source.data[0]) {
+                    filtered.unshift(item)
+                } else {
+                    filtered.push(item)
+                }
+            }
 
             return computed(({lastValue} ) => {
                 const matched = filterFn(item)
                 if (matched) {
-                    if (!lastValue.raw) {
-                        if (item === this.data[0]) {
-                            filtered.unshift(item)
-                        } else {
+                    if (lastValue.raw === false) {
+                        // 已有行 toggle 成匹配：此刻 filtered 与源成员一致，按源顺序定位
+                        insertOrdered()
+                    } else if (!lastValue.raw) {
+                        // 行首次运行
+                        if (!initialBuildDone) {
                             filtered.push(item)
+                        } else if (orderedInsertSafePatch) {
+                            insertOrdered()
+                        } else {
+                            insertLegacy()
                         }
                     }
                 } else {
@@ -993,7 +1031,15 @@ export class RxList<T> extends Computed {
                     remove()
                 }
             })
-        }, { ignoreIndex: true})
+        }, {
+            ignoreIndex: true,
+            beforePatch(info) {
+                orderedInsertSafePatch = info.method === 'splice'
+                    ? ((info.methodResult as unknown[] | undefined)?.length ?? 0) === 0
+                    : true // explicit key change：对齐扫描恰好停在被替换的旧项位置
+            }
+        })
+        initialBuildDone = true
 
         filtered.on('destroy', () => mapList.destroy())
 
