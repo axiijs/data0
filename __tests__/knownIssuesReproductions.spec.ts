@@ -13,12 +13,11 @@ import {RxSet} from '../src/RxSet.js'
 /**
  * Executable evidence for confirmed issues.
  *
- * Each test states the intended contract and is deliberately marked `fails` while
- * the defect exists. A fix must make the assertion pass and convert that case to
- * a normal `test`; these are not permanent skips.
+ * Each test started as a known-failing executable reproduction. Once its defect
+ * was fixed, it became a normal regression test in this same file.
  */
 describe('known RxList consistency issues', () => {
-    test.fails('findIndex follows reorder instead of throwing on ITERATE_KEY', () => {
+    test('findIndex follows reorder instead of throwing on ITERATE_KEY', () => {
         const source = new RxList([3, 1, 2])
         const index = source.findIndex(item => item === 1)
         try {
@@ -31,7 +30,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('findIndex tracks reactive predicates introduced by set', () => {
+    test('findIndex tracks reactive predicates introduced by set', () => {
         const source = new RxList([
             {score: atom(1)},
             {score: atom(3)},
@@ -50,7 +49,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('map rebuilds row dependencies after an explicit set', () => {
+    test('map rebuilds row dependencies after an explicit set', () => {
         const factor = atom(1)
         const source = new RxList([1, 2])
         const mapped = source.map(item => item * factor())
@@ -66,7 +65,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('filter keeps source order for replacement splices', () => {
+    test('filter keeps source order for replacement splices', () => {
         const source = new RxList([0, 1, 2, 3, 4, 5])
         const filtered = source.filter(item => item % 3 === 0)
         try {
@@ -78,7 +77,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('slice with negative bounds matches native slice after middle insertion', () => {
+    test('slice with negative bounds matches native slice after middle insertion', () => {
         const source = new RxList([0, 1, 2, 3])
         const sliced = source.slice(-4, -1)
         try {
@@ -90,7 +89,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('concat removes a duplicate from the source segment that changed', () => {
+    test('concat removes a duplicate from the source segment that changed', () => {
         const left = new RxList([1, 2])
         const right = new RxList([1, 3])
         const combined = left.concat(right)
@@ -104,7 +103,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('toSet retains a value while another equal source item remains', () => {
+    test('toSet retains a value while another equal source item remains', () => {
         const source = new RxList([1, 1, 2])
         const set = source.toSet()
         try {
@@ -116,7 +115,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('groupBy incremental groups preserve full-recompute order', () => {
+    test('groupBy incremental groups preserve full-recompute order', () => {
         const source = new RxList([1, 3])
         const groups = source.groupBy(item => item % 2)
         try {
@@ -129,7 +128,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('index-key selection applies RxSet.replace additions and deletions in the right direction', () => {
+    test('index-key selection applies RxSet.replace additions and deletions in the right direction', () => {
         const source = new RxList(['a', 'b', 'c'])
         const selected = new RxSet([0])
         const selection = source.createIndexKeySelection(selected)
@@ -143,7 +142,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('reduceToAtom receives the real appended item index', () => {
+    test('reduceToAtom receives the real appended item index', () => {
         const source = new RxList(['a', 'b'])
         const indexSum = source.reduceToAtom((sum, _item, index) => sum + index, 0)
         try {
@@ -155,7 +154,7 @@ describe('known RxList consistency issues', () => {
         }
     })
 
-    test.fails('reduce appends effect frames instead of overwriting frame zero', () => {
+    test('reduce appends effect frames instead of overwriting frame zero', () => {
         const source = new RxList([1, 2])
         const reduced = source.reduce<RxList<number>>((result, item) => {
             result.push(item)
@@ -174,7 +173,7 @@ describe('known RxList consistency issues', () => {
 })
 
 describe('known exception-safety issues', () => {
-    test.fails('a computed that throws before its first dependency read remains subscribed for recovery', () => {
+    test('a computed that throws before its first dependency read remains subscribed for recovery', () => {
         const source = atom(0)
         let shouldThrow = false
         const value = computed(() => {
@@ -193,7 +192,7 @@ describe('known exception-safety issues', () => {
         }
     })
 
-    test.fails('a throwing findIndex predicate restores all global tracking collectors', () => {
+    test('a throwing findIndex predicate restores all global tracking collectors', () => {
         const framesBefore = notifier.trackTargetFrames.slice()
         const currentFrameBefore = notifier.currentTrackFrame
         const stackBefore = notifier.trackStack.slice()
@@ -233,7 +232,7 @@ describe('known exception-safety issues', () => {
 })
 
 describe('known AsyncRxSlice state issues', () => {
-    test.fails('successful full fetch clears isLoading', async () => {
+    test('successful full fetch clears isLoading', async () => {
         const slice = new AsyncRxSlice<number>([], async () => [1, 2])
         try {
             await slice.fetchFullRemoteData()
@@ -244,7 +243,7 @@ describe('known AsyncRxSlice state issues', () => {
         }
     })
 
-    test.fails('an older update response cannot overwrite a newer replacement', async () => {
+    test('an older update response cannot overwrite a newer replacement', async () => {
         const resolvers = new Map<number, (items: number[]) => void>()
         const slice = new AsyncRxSlice<number>([], cursor => new Promise(resolve => {
             resolvers.set(cursor!, resolve)
@@ -265,7 +264,7 @@ describe('known AsyncRxSlice state issues', () => {
         }
     })
 
-    test.fails('a successful update clears a previous loadError', async () => {
+    test('a successful update clears a previous loadError', async () => {
         const slice = new AsyncRxSlice<number>([], async () => {
             throw new Error('old failure')
         })
@@ -284,7 +283,7 @@ describe('known AsyncRxSlice state issues', () => {
 })
 
 describe('repository and release evidence', () => {
-    test.fails('package manifest and pnpm importer use identical dependency specifiers', () => {
+    test('package manifest and pnpm importer use identical dependency specifiers', () => {
         const packageJson = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as {
             devDependencies: Record<string, string>
         }
@@ -316,7 +315,7 @@ describe('repository and release evidence', () => {
     if (process.platform === 'win32') {
         test.skip('release version argument cannot execute a second shell command', () => {})
     } else {
-        test.fails('release version argument cannot execute a second shell command', () => {
+        test('release version argument cannot execute a second shell command', () => {
             const sandbox = mkdtempSync(join(tmpdir(), 'data0-release-repro-'))
             const fakeBin = join(sandbox, 'bin')
             const marker = join(sandbox, 'injected')
@@ -329,6 +328,7 @@ describe('repository and release evidence', () => {
             }
             writeFakeCommand('git')
             writeFakeCommand('npm')
+            writeFakeCommand('pnpm')
 
             try {
                 const payload = `1.2.3; touch ${JSON.stringify(marker)}`
