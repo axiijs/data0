@@ -1733,13 +1733,21 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
             },
             function(_, triggerInfos: TriggerInfo[]) {
+                // CAUTION 不能对非 splice 的 info 断言崩溃：sortSelf/reposition/swap
+                //  触发 method='reorder'，set 触发 explicit key change，都是 source 的
+                //  合法操作。reorder 不改变成员，无需回收；set 回收被替换掉的旧值
+                //  （与 splice 删除项的语义一致）。
                 triggerInfos.forEach((triggerInfo) => {
-                    const { method } = triggerInfo
-                    assert(method === 'splice', 'currentValues can only support splice')
-                    const deleteItems = triggerInfo.methodResult
-                    deleteItems.forEach((item:T) => {
-                        deleteCurrentValueIfItemRemoved(item)
-                    })
+                    const { method, type, oldValue } = triggerInfo
+                    if (method === 'splice') {
+                        const deleteItems = triggerInfo.methodResult as T[] || []
+                        deleteItems.forEach((item:T) => {
+                            deleteCurrentValueIfItemRemoved(item)
+                        })
+                    } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        deleteCurrentValueIfItemRemoved(oldValue as T)
+                    }
+                    // reorder：成员不变，选中集不动
                 })
             },
             true
@@ -1773,6 +1781,11 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
                 inners.forEach(inner => inner.deleteIndicator(item))
             })
             list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
+        } else if (triggerInfo.method === 'reorder') {
+            // CAUTION 行必须随源同步重排（indicator 挂在行元组上随行移动，成员与
+            //  选中集都不变）。旧实现把 reorder 落进 explicit key change 分支，
+            //  用 ITERATE_KEY（Symbol）当 index 去 set，选择列表从此与源失序。
+            list.reorder(triggerInfo.argv![0] as Order[], triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
@@ -1837,8 +1850,17 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
 
     function trackIndicators(list: Computed) {
         list.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD);
+        // set 只触发 EXPLICIT_KEY_CHANGE：不追踪的话行内容会与源永久失联
+        list.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
     }
 
+    function getSelectedIndexes(): Set<number> {
+        if (isAtom(currentValues)) {
+            const raw = currentValues.raw
+            return raw !== null && raw !== undefined ? new Set([raw as number]) : new Set()
+        }
+        return new Set(currentValues.data)
+    }
 
     function updateIndicatorsFromSourceChange(list: RxList<[T, Atom<boolean>]>, triggerInfo: TriggerInfo) {
         if (triggerInfo.method === 'splice') {
@@ -1850,28 +1872,38 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             const deleteCount = (methodResult as unknown[] | undefined)?.length ?? 0
             // list 此刻尚未应用本次 splice，其长度即 splice 前的长度
             const startIndex = normalizeSpliceStart(argv![0], list.data.length)
-            list.spliceArray(startIndex, deleteCount, newItemsInArgs.map((item) => [item, createNewIndicator(item)] as [T, Atom<boolean>]))
+            // CAUTION createNewIndicator 的参数语义是 index：新行的初始选中状态由
+            //  落位的 index 决定，绝不能传 item——数值型 item 与某个选中 index 撞值时
+            //  会被误置为选中。
+            list.spliceArray(startIndex, deleteCount, newItemsInArgs.map((item, i) => [item, createNewIndicator(startIndex + i)] as [T, Atom<boolean>]))
 
+            // index 选中语义：选中的是位置，不随 item 移动。增删不等长时
+            // [startIndex + insertCount, ...) 的行整体平移，逐行按当前 index 重算
+            // 指示器（选中集是稀疏的，两向 toggle 的旧算法在"选中 index 落在删除
+            // 区间/多选相邻"等组合下会关错行）。等长替换时后续行不动，新行已按
+            // index 初始化，无需修正。
             if (deleteCount !== insertCount) {
-
-                const selectedValues = isAtom(currentValues) ? (currentValues.raw !== null ? [currentValues.raw] : []) : [...currentValues.data]
-                // 因为 index 产生了变化，所以要更新 indicator
-                selectedValues.forEach((value) => {
-                    const index = value as number
-                    if (index < list.data.length ) {
-                        // 只有 index 在后面的才是还存在，并且受了影响需要处理的。
-                        if (index >= startIndex && deleteCount !== insertCount) {
-                            const indexAfterChange = index + insertCount - deleteCount
-                            const oldIndexIndicator = list.data.at(indexAfterChange)![1]
-                            oldIndexIndicator(false)
-                        }
-                        const newIndicator = list.data.at(index)![1]
-                        newIndicator?.(true)
-                    }
-                })
+                const selectedIndexes = getSelectedIndexes()
+                for (let i = startIndex + insertCount; i < list.data.length; i++) {
+                    list.data[i][1](selectedIndexes.has(i))
+                }
             }
+        } else if (triggerInfo.method === 'reorder') {
+            // 行随源重排，但选中的 index 不动：重排后受影响区间逐行按新 index 校正
+            const reorderInfo = triggerInfo.reorderInfo as ReorderPatchInfo | undefined
+            list.reorder(triggerInfo.argv![0] as Order[], reorderInfo)
+            const selectedIndexes = getSelectedIndexes()
+            const affected = reorderInfo?.affectedRange
+            const start = affected ? Math.max(affected[0], 0) : 0
+            const end = affected ? Math.min(affected[1] + 1, list.data.length) : list.data.length
+            for (let i = start; i < end; i++) {
+                list.data[i][1](selectedIndexes.has(i))
+            }
+        } else {
+            // explicit key change（set）：index 不变，行内容替换，选中状态由 index 决定
+            const { newValue, key } = triggerInfo
+            list.set(key as number, [newValue as T, createNewIndicator(key as number)])
         }
-        // 不需要处理 explicit key change
     }
 
     function updateIndicatorsFromCurrentValueChange(list: RxList<[T,  Atom<boolean>]>,triggerInfo: TriggerInfo) {
@@ -1915,7 +1947,9 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             function(_, triggerInfos: TriggerInfo[]) {
                 triggerInfos.forEach((triggerInfo) => {
                     const { method } = triggerInfo
-                    assert(method === 'splice', 'currentValues can only support splice')
+                    // CAUTION 只有 splice 会改变长度；reorder（sortSelf/reposition/swap）
+                    //  长度不变，无需回收越界 index，也绝不能对其断言崩溃。
+                    if (method !== 'splice') return
                     const newLength = source.data.length
                     if (isAtom(currentValues)) {
                         if (currentValues.raw !== null && currentValues.raw >= newLength) {
