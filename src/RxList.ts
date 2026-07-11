@@ -29,6 +29,9 @@ type MapOptions<U> = {
 
 type MapCleanupFn = () => any
 
+// cleanup 槽位：随行移动的身份稳定容器（见 map() 中 cleanupSlots 的说明）
+type MapCleanupSlot = { fn?: MapCleanupFn }
+
 type MapContext = {
     onCleanup: (fn: MapCleanupFn) => void
 }
@@ -560,9 +563,26 @@ export class RxList<T> extends Computed {
 
         let addedAtomIndexesDep = useIndex
 
-        // CAUTION cleanupFns 是用户自己用 context.onCleanup 收集的，因为可能用到 mapFn 中的局部变量
-        //  如果可以直接从 mapFn return value 中来销毁副作用，那么应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能，不需要建立 cleanupFns 数组。
-        let cleanupFns: MapCleanupFn[]|undefined
+        // CAUTION cleanup 以"槽位对象"随行移动，而不是按 index 记账：
+        //  1. onCleanup 闭包捕获槽位对象本身（身份稳定），行移动后重算再注册仍写进
+        //     自己的槽位；旧实现闭包捕获创建时的 index，行移动后写回旧位置，
+        //     删除行时会执行到别人的 cleanup（错误释放）或过期的 cleanup（漏释放）。
+        //  2. 槽位数组与行严格等长（未注册的行占一个空槽），patch 的 splice 对齐
+        //     不再受"部分行未注册"的稀疏数组影响。
+        //  如果可以直接从 mapFn return value 中来销毁副作用，那么应该使用
+        //  options.onCleanup 注册统一销毁函数，避免逐行槽位分配。
+        let cleanupSlots: MapCleanupSlot[]|undefined
+        function createRowContext(): {slot: MapCleanupSlot, context: MapContext} {
+            const slot: MapCleanupSlot = {}
+            return {
+                slot,
+                context: {
+                    onCleanup(fn: MapCleanupFn) {
+                        slot.fn = fn
+                    }
+                }
+            }
+        }
         // 行级依赖探测 effect：整个 map 产物复用一个实例（说明见类定义处）。
         // detached 创建：不能被 map computation 收集为 child。
         let itemProbe: MapItemDependencyProbe | undefined
@@ -601,16 +621,17 @@ export class RxList<T> extends Computed {
             function computation(this: RxList<U>) {
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD);
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
-                cleanupFns = useContext ? [] : undefined
+                cleanupSlots = useContext ? [] : undefined
 
                 const result: U[] = []
                 const sourceData = source.data
                 for (let i = 0; i < sourceData.length; i++) {
-                    const mapContext: MapContext|undefined = useContext ? {
-                        onCleanup(fn: MapCleanupFn) {
-                            cleanupFns![i] = fn
-                        }
-                    } : undefined
+                    let mapContext: MapContext|undefined
+                    if (useContext) {
+                        const row = createRowContext()
+                        cleanupSlots![i] = row.slot
+                        mapContext = row.context
+                    }
 
                     if (options?.skipItemEffect) {
                         result[i] = mapFn(sourceData[i], source.atomIndexes?.[i]!, mapContext!)
@@ -649,13 +670,16 @@ export class RxList<T> extends Computed {
                         const spliceStart = normalizeSpliceStart(argv![0], this.data.length)
                         const spliceDeleteCount = normalizeSpliceDeleteCount(argv![1], this.data.length, spliceStart)
                         const effectFrames: ReactiveEffect[][] = []
-                        const newCleanups: MapCleanupFn[] = []
+                        // CAUTION 与行严格等长的槽位数组（未注册的行留空槽），
+                        //  否则"部分新行不注册 cleanup"会让整个数组错位。
+                        const newSlots: MapCleanupSlot[] = []
                         const newItems = newItemsInArgs.map((newItemsInArg, index) => {
-                            const mapContext: MapContext|undefined = useContext ? {
-                                onCleanup(fn: MapCleanupFn) {
-                                    newCleanups![index] = fn
-                                }
-                            } : undefined
+                            let mapContext: MapContext|undefined
+                            if (useContext) {
+                                const row = createRowContext()
+                                newSlots[index] = row.slot
+                                mapContext = row.context
+                            }
                             let newItem: U
                             const newIndex = index + spliceStart
                             if (options?.skipItemEffect) {
@@ -675,13 +699,13 @@ export class RxList<T> extends Computed {
                                 this.destroyEffect(effect)
                             })
                         })
-                        // 更新和执行 cleanupFns
-                        if (useContext && cleanupFns?.length) {
-                            // CAUTION 这里要把删除的 effect 的 cleanup 都执行一遍
+                        // 更新槽位数组并执行被删除行的 cleanup
+                        if (useContext && cleanupSlots) {
+                            // CAUTION 这里要把删除的行的 cleanup 都执行一遍
                             //  如果能从 return value 中进行销毁，应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能。
-                            const deletedCleanupFns = spliceMany(cleanupFns, spliceStart, spliceDeleteCount, newCleanups)
-                            deletedCleanupFns.forEach((fn) => {
-                                fn?.()
+                            const deletedSlots = spliceMany(cleanupSlots, spliceStart, spliceDeleteCount, newSlots)
+                            deletedSlots.forEach((slot) => {
+                                slot?.fn?.()
                             })
                         }
                         // 统一的销毁函数
@@ -691,16 +715,16 @@ export class RxList<T> extends Computed {
                             })
                         }
                     } else if(method === 'reorder') {
-                        // 数据、行 effect frame 和 cleanup 必须按同一组 old→new
+                        // 数据、行 effect frame 和 cleanup 槽位必须按同一组 old→new
                         // 映射移动；旧实现只 reorder data，后续 set 会销毁错误行。
                         const order = argv![0]! as Order[]
                         const movedFrames = order.map(([oldIndex]) => this.effectFramesArray![oldIndex])
-                        const movedCleanups = cleanupFns
-                            ? order.map(([oldIndex]) => cleanupFns![oldIndex])
+                        const movedSlots = cleanupSlots
+                            ? order.map(([oldIndex]) => cleanupSlots![oldIndex])
                             : undefined
                         order.forEach(([, newIndex], index) => {
                             this.effectFramesArray![newIndex] = movedFrames[index]
-                            if (cleanupFns) cleanupFns[newIndex] = movedCleanups![index]
+                            if (cleanupSlots) cleanupSlots[newIndex] = movedSlots![index]
                         })
                         this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
                     } else {
@@ -708,13 +732,14 @@ export class RxList<T> extends Computed {
                         // CAUTION add/update 一定都要全部重新从 source 里面取，因为这样才能得到正确的 proxy。newValue 是 raw data，和 mapFn 里面预期拿到的不一致。
                         // 没有 method 说明是 explicit_key_change 变化
                         const index = key as number
-                        const mapContext: MapContext|undefined = useContext ? {
-                            onCleanup(fn: MapCleanupFn) {
-                                cleanupFns![index] = fn
-                            }
-                        } : undefined
+                        const oldSlot = cleanupSlots?.[index]
+                        let mapContext: MapContext|undefined
+                        if (useContext) {
+                            const row = createRowContext()
+                            cleanupSlots![index] = row.slot
+                            mapContext = row.context
+                        }
                         const oldItem = this.data.at(index)!
-                        const oldCleanupFn = cleanupFns?.[index]
 
                         // 与初始构建/splice 使用同一条行级依赖探测路径。旧实现只用
                         // collectEffect 收集子 effect，却没有把 mapFn 读取的 atom 依赖
@@ -731,8 +756,8 @@ export class RxList<T> extends Computed {
                         })
                         this.effectFramesArray![index] = newFrame
 
-                        if (oldCleanupFn) {
-                            oldCleanupFn()
+                        if (oldSlot?.fn) {
+                            oldSlot.fn()
                         }
                         if(options?.onCleanup) {
                             options.onCleanup(oldItem)
@@ -750,9 +775,9 @@ export class RxList<T> extends Computed {
                     if (addedAtomIndexesDep) {
                         source.removeAtomIndexesDep()
                     }
-                    if (cleanupFns) {
-                        cleanupFns.forEach((fn) => {
-                            fn()
+                    if (cleanupSlots) {
+                        cleanupSlots.forEach((slot) => {
+                            slot?.fn?.()
                         })
                     }
                     if(options?.onCleanup) {
