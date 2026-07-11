@@ -73,6 +73,21 @@ class MapItemDependencyProbe extends ReactiveEffect {
 // freeze 保证未来误往共享 frame push 会立刻抛错而不是跨行污染。
 const EMPTY_ITEM_FRAME = Object.freeze([]) as unknown as ReactiveEffect[]
 
+/**
+ * dev 不变量：atomIndexes 与 data 严格等长，且第 i 个 atom 的值恒为 i。
+ * 违约意味着行级 index 记账出错（map 行会拿到错误位置），在变更当刻炸掉,
+ * 而不是等下游行为漂移。模块级函数且仅在 __DEV__ 分支引用：
+ * 生产构建连函数体一起被 DCE 移除，零运行时与零体积开销。
+ * 全量值扫描是 O(n)，仅存在 atomIndexes（有行级 index 订阅）时发生。
+ */
+function assertAtomIndexesAligned(list: RxList<any>) {
+    if (!list.atomIndexes) return
+    assert(list.atomIndexes.length === list.data.length, 'atomIndexes length misaligned with data')
+    for (let i = 0; i < list.atomIndexes.length; i++) {
+        assert(list.atomIndexes[i].raw === i, `atomIndex value drift at ${i}`)
+    }
+}
+
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
 export type ReorderPatchInfo = {
@@ -312,23 +327,8 @@ export class RxList<T> extends Computed {
             notifier.digestEffectSession()
         }
 
-        if (__DEV__) this.assertAtomIndexesAligned()
+        if (__DEV__) assertAtomIndexesAligned(this)
         return result
-    }
-    /**
-     * @internal
-     * dev 不变量：atomIndexes 与 data 严格等长，且第 i 个 atom 的值恒为 i。
-     * 违约意味着行级 index 记账出错（map 行会拿到错误位置），在变更当刻炸掉,
-     * 而不是等下游行为漂移。生产构建下该函数不会被调用（__DEV__ 剔除）。
-     * 全量值扫描是 O(n)，仅存在 atomIndexes（有行级 index 订阅）时发生,
-     * dev 下可接受；若未来成为测试瓶颈可改为受影响区间扫描。
-     */
-    assertAtomIndexesAligned() {
-        if (!this.atomIndexes) return
-        assert(this.atomIndexes.length === this.data.length, 'atomIndexes length misaligned with data')
-        for (let i = 0; i < this.atomIndexes.length; i++) {
-            assert(this.atomIndexes[i].raw === i, `atomIndex value drift at ${i}`)
-        }
     }
     // 显式 set 某一个 index 的值
     // CAUTION set 的契约是"替换已存在的稠密行"。越界/负数/非整数 key 属于 out-of-contract 用法：
@@ -368,7 +368,7 @@ export class RxList<T> extends Computed {
 
         this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
         this.sendTriggerInfos()
-        if (__DEV__) this.assertAtomIndexesAligned()
+        if (__DEV__) assertAtomIndexesAligned(this)
     }
     reposition(start:number, newStart:number, limit:number = 1 ) {
         assert(start >= 0 && limit > 0 && start+limit <= this.data.length, 'start index out of range')
