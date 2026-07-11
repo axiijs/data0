@@ -291,21 +291,25 @@ describe('repository and release evidence', () => {
         const importerStart = lockfile.indexOf('importers:')
         const packagesStart = lockfile.indexOf('\npackages:')
         const importer = lockfile.slice(importerStart, packagesStart)
+        const lockSpecifiers = new Map<string, string>()
+        let currentDependency: string | undefined
+        for (const line of importer.split('\n')) {
+            const dependency = line.match(/^ {6}(.+):$/)
+            if (dependency) {
+                currentDependency = dependency[1].replace(/^['"]|['"]$/g, '')
+                continue
+            }
+            const specifier = line.match(/^ {8}specifier:\s+(.+)$/)
+            if (currentDependency && specifier) {
+                lockSpecifiers.set(
+                    currentDependency,
+                    specifier[1].trim().replace(/^['"]|['"]$/g, ''),
+                )
+            }
+        }
 
         const mismatches = Object.entries(packageJson.devDependencies).flatMap(([name, expected]) => {
-            const plainMarker = `      ${name}:`
-            const quotedMarker = `      '${name}':`
-            const marker = importer.includes(quotedMarker) ? quotedMarker : plainMarker
-            const dependencyStart = importer.indexOf(marker)
-            if (dependencyStart === -1) return [{name, expected, actual: '<missing>'}]
-
-            const nextDependency = importer.indexOf('\n      ', dependencyStart + marker.length)
-            const block = importer.slice(
-                dependencyStart,
-                nextDependency === -1 ? importer.length : nextDependency,
-            )
-            const match = block.match(/\n\s+specifier:\s+([^\n]+)/)
-            const actual = match?.[1].trim().replace(/^['"]|['"]$/g, '') ?? '<missing>'
+            const actual = lockSpecifiers.get(name) ?? '<missing>'
             return actual === expected ? [] : [{name, expected, actual}]
         })
 
