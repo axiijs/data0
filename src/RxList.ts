@@ -532,12 +532,24 @@ export class RxList<T> extends Computed {
                     return true
                 }
                 // Incremental updates
+                // CAUTION undefined 是 RxList 的合法元素值，但增量路径无法正确处理它：
+                //  1) Array#sort 的全量语义从不对 undefined 调用 compare（undefined 一律
+                //     排到尾部），增量二分却会把 undefined 喂给 compare——数值型 compare
+                //     返回 NaN 时二分插到错误位置，与全量重算分叉；
+                //  2) explicit key change 的 oldValue/newValue 用 `!== undefined` 当
+                //     "有无"判断，无法区分"值为 undefined"与"无值"——set 引入 undefined
+                //     会丢行、替换 undefined 会残留行。
+                //  变更涉及 undefined 时一律回退全量重算（结果与 Array#sort 语义一致，
+                //  只损失该次增量性；同 tie 回退的处置）。
                 for (const info of triggerInfos) {
                     const { method, argv, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
-                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
                         const deletedItems = (methodResult as T[]) || []
+                        const newItems = argv!.slice(2) as T[]
+                        // includes 是 SameValueZero：undefined（含稀疏洞读出的 undefined）可命中
+                        if (deletedItems.includes(undefined as T) || newItems.includes(undefined as T)) return false
+                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
                         deletedItems.forEach((item) => {
                             const idx = RxList.locateInSorted(this.data, item, compare!)
                             if (idx !== -1) {
@@ -545,21 +557,18 @@ export class RxList<T> extends Computed {
                             }
                         })
                         // 2) insert new items in sorted order
-                        const newItems = argv!.slice(2) as T[]
                         for (const item of newItems) {
                             if (!insertOrBail(item)) return false
                         }
                     } else {
                         // explicit key change: remove old, insert new
-                        if (oldValue !== undefined) {
-                            const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
-                            if (idx !== -1) {
-                                this.splice(idx, 1)
-                            }
+                        // 值为 undefined（含越界 set 的"无旧值"）→ 回退全量重算
+                        if (oldValue === undefined || newValue === undefined) return false
+                        const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
+                        if (idx !== -1) {
+                            this.splice(idx, 1)
                         }
-                        if (newValue !== undefined) {
-                            if (!insertOrBail(newValue as T)) return false
-                        }
+                        if (!insertOrBail(newValue as T)) return false
                     }
                 }
             }
@@ -1842,15 +1851,25 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         list.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
     }
 
-    const itemToIndicator: Map<any, Atom<boolean>> = new Map()
+    // CAUTION indicator 记账必须支持重复 item（同值/同引用占多行）：
+    //  旧实现 Map<item, indicator> 在重复行下后写覆盖前写——currentValues 变化只更新
+    //  最后一行（其余行永不更新），删除任一行还会把存活孪生行的条目一并误删
+    //  （该行 indicator 永久失联，可观察为反选后卡 true）。改为 Map<item, Set<indicator>>：
+    //  currentValues 变化对同 item 的整组 indicator 广播；删除按 indicator 身份精确移除。
+    const itemToIndicators: Map<any, Set<Atom<boolean>>> = new Map()
 
     function createNewIndicator(item:T) {
         const indicator = atom(isAtom(currentValues) ? currentValues.raw === item : currentValues.data.has(item))
-        itemToIndicator.set(item, indicator)
+        let indicators = itemToIndicators.get(item)
+        if (!indicators) itemToIndicators.set(item, indicators = new Set())
+        indicators.add(indicator)
         return indicator
     }
 
     function deleteCurrentValueIfItemRemoved(item:T) {
+        // 重复 item：仍有同 item 行存活时不回收选中值，否则存活行会被误反选。
+        // （includes 是 SameValueZero，与 Map/Set 的成员语义一致，NaN 亦可命中。）
+        if (source.data.includes(item)) return
         if (isAtom(currentValues)) {
             if (item === currentValues.raw) {
                 currentValues(null)
@@ -1862,16 +1881,23 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         }
     }
 
-    function deleteIndicator(item:T) {
-        itemToIndicator.delete(item)
+    function deleteIndicator(item:T, indicator?: Atom<boolean>) {
+        const indicators = itemToIndicators.get(item)
+        if (!indicators) return
+        if (indicator !== undefined) {
+            indicators.delete(indicator)
+        } else {
+            indicators.clear()
+        }
+        if (indicators.size === 0) itemToIndicators.delete(item)
     }
 
 
     function updateIndicatorsFromCurrentValueChange(triggerInfo: TriggerInfo) {
         const { oldValue, newValue, method } = triggerInfo
         if(isAtom(currentValues)) {
-            itemToIndicator.get(oldValue as T)?.(false)
-            itemToIndicator.get(newValue as T)?.(true)
+            itemToIndicators.get(oldValue as T)?.forEach(indicator => indicator(false))
+            itemToIndicators.get(newValue as T)?.forEach(indicator => indicator(true))
         } else {
             // RxSet，有 add/delete/replace method
             let newItems: T[] = []
@@ -1884,12 +1910,10 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                 [newItems, deletedItems] = triggerInfo.methodResult as [T[], T[]]
             }
             newItems.forEach((item) => {
-                const indicator = itemToIndicator?.get(item)
-                indicator?.(true)
+                itemToIndicators.get(item)?.forEach(indicator => indicator(true))
             })
             deletedItems.forEach((item) => {
-                const indicator = itemToIndicator?.get(item)
-                indicator?.(false)
+                itemToIndicators.get(item)?.forEach(indicator => indicator(false))
             })
         }
     }
@@ -1942,13 +1966,18 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
 
     function updateIndicatorsFromSourceChange(list: RxList<[T, ...Atom<boolean>[]]>, triggerInfo: TriggerInfo) {
         if (triggerInfo.method === 'splice') {
-            const { methodResult , argv } = triggerInfo
+            const { argv } = triggerInfo
             const newItemsInArgs = argv!.slice(2)
-            const deleteItems: T[] = methodResult || []
-            deleteItems.forEach((item) => {
-                inners.forEach(inner => inner.deleteIndicator(item))
+            // CAUTION 先 splice 拿到被删除的行元组，再按 indicator 身份精确清理记账：
+            //  旧实现按 methodResult 的 item 值清理，重复 item 下会把存活孪生行的
+            //  记账一并误删（deleteIndicator 的重复值缺陷类）。
+            const deletedRows = list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
+            deletedRows.forEach((row) => {
+                // 稀疏行安全：越界 set（契约内透传）产生的洞位行是 undefined
+                if (!row) return
+                const [item, ...indicators] = row
+                inners.forEach((inner, i) => inner.deleteIndicator(item, indicators[i]))
             })
-            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
         } else if (triggerInfo.method === 'reorder') {
             // CAUTION 行必须随源同步重排（indicator 挂在行元组上随行移动，成员与
             //  选中集都不变）。旧实现把 reorder 落进 explicit key change 分支，
@@ -1957,7 +1986,13 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
-            list.set(key as number, [newValue as T, ...inners.map(inner => inner.createNewIndicator(newValue as T))] as [T, Atom<boolean>])
+            const oldRow = list.set(key as number, [newValue as T, ...inners.map(inner => inner.createNewIndicator(newValue as T))] as [T, Atom<boolean>])
+            // 被替换行的记账同步移除（旧实现从不清理：条目泄漏，重复 item 下
+            //  还会让 currentValues 变化继续驱动已离场行的 indicator）
+            if (oldRow) {
+                const [oldItem, ...oldIndicators] = oldRow as [T, ...Atom<boolean>[]]
+                inners.forEach((inner, i) => inner.deleteIndicator(oldItem, oldIndicators[i]))
+            }
         }
     }
 

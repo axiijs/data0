@@ -53,7 +53,7 @@ Review 结论必须分为三类，不得混写：
   7. batch/延迟调度下的多 info 单次 digest 重放差分（既有差分 fuzz 全部在 batch 外逐操作断言，隐含"每次 digest 恰一条 info"的假设；重放语义本身是独立攻击面，尤其是 EXPLICIT_KEY_CHANGE 与结构操作混排）；
   8. destroy 僵尸行为横扫 + destroy 事件对称性检查（直接断言"destroy 后不再接收更新"；不依赖 retainedDiagnostics——它只统计 active=true 的 effect，源模式结构在其中完全不可见）。
   9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`（实例回归）、`__tests__/sparseSetOperatorsSweep.spec.ts`（"OOB set × 全派生算子族不崩溃且可恢复"的等价类横扫，含 batch 多 info 回退路径）。
-  10. 既有攻击轴 × 未覆盖算子族的组合横扫（重复值域 × selection 家族、undefined 合法元素 × toSorted 的 EXPLICIT_KEY_CHANGE 路径、链式深层管道差分、回调重入）；发现 createSelection 重复 item indicator 漂移与 toSorted set-undefined 丢行两个缺陷类；资产：`__tests__/deepReview2026H2Findings.spec.ts`（test.fails 可执行证据，修复时改普通测试）。既有 fuzz 的盲区模式：差分 fuzz 只喂"单一算子 × 唯一/重复数值域"，selection（值→indicator 的 Map 记账）与"undefined 作为合法元素值"两个维度都不在任何生成器的值域里。
+  10. 既有攻击轴 × 未覆盖算子族的组合横扫（重复值域 × selection 家族、undefined 合法元素 × toSorted 的 EXPLICIT_KEY_CHANGE 路径、链式深层管道差分、回调重入）；发现并修复 createSelection 重复 item indicator 漂移（`itemToIndicators` 改 Set 广播 + 按身份精确移除）与 toSorted 变更含 undefined 时与全量 sort 分叉（回退全量重算）两个缺陷类；资产：`__tests__/deepReview2026H2Findings.spec.ts`（实例回归 + 两个等价类的常驻差分 sweep：重复 item 域 × selection 的"indicator ≡ currentValues 成员"不变量、undefined 值域 × toSorted 的"增量 ≡ 全量 sort"不变量，双 compare 形态）。既有 fuzz 的盲区模式：差分 fuzz 只喂"单一算子 × 唯一/重复数值域"，selection（值→indicator 的 Map 记账）与"undefined 作为合法元素值"两个维度都不在任何生成器的值域里。
 
 ### 4. data0 特有的 review 检查（附资产追溯）
 
