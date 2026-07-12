@@ -32,15 +32,17 @@ import {RxSet} from '../src/RxSet.js'
 //   sparseOOB    — 越界 set 产生的稀疏形态(方法 9)
 //   batchReplay  — 多 info 单次 digest 重放(方法 7)
 //   destroy      — 僵尸/泄漏对称性(方法 8)
-const DIMENSIONS = ['unique', 'duplicates', 'undefinedVal', 'sparseOOB', 'batchReplay', 'destroy'] as const
+//   weirdNum     — NaN/-0 元素值(Object.is 与 SameValueZero 分歧;2026-H2 裁定后新列)
+const DIMENSIONS = ['unique', 'duplicates', 'undefinedVal', 'sparseOOB', 'batchReplay', 'destroy', 'weirdNum'] as const
 type Dimension = typeof DIMENSIONS[number]
 
 // 格子取值:资产 spec 文件名(可加注释) | 'UNCOVERED' | 'NA:<构造性理由>'
 type Cell = string
 type Row = Record<Dimension, Cell>
 
-const row = (unique: Cell, duplicates: Cell, undefinedVal: Cell, sparseOOB: Cell, batchReplay: Cell, destroy: Cell): Row =>
-    ({unique, duplicates, undefinedVal, sparseOOB, batchReplay, destroy})
+// weirdNum 列缺省 UNCOVERED:新维度先显后清,禁止默认谎报
+const row = (unique: Cell, duplicates: Cell, undefinedVal: Cell, sparseOOB: Cell, batchReplay: Cell, destroy: Cell, weirdNum: Cell = 'UNCOVERED'): Row =>
+    ({unique, duplicates, undefinedVal, sparseOOB, batchReplay, destroy, weirdNum})
 
 const BROAD = 'broadOperatorsFuzz.spec.ts'
 const DUP = 'duplicateValuesFuzz.spec.ts'
@@ -49,43 +51,44 @@ const SWEEP = 'sparseSetOperatorsSweep.spec.ts'
 const BATCH = 'batchReplayFuzz.spec.ts'
 const DESTROY = 'destroySemantics.spec.ts'
 const MODEL = 'modelComparisonFuzz.spec.ts'
+const WEIRD = 'weirdNumbersFuzz.spec.ts'
 
 export const INVENTORY: Record<string, Row> = {
     // ---- RxList 派生 ----
-    'RxList.map':            row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.filter':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.toSorted':       row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.slice':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.concat':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.groupBy':        row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.toSet':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, SWEEP, BATCH, DESTROY),
-    'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY),
-    'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY),
-    'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY),
+    'RxList.map':            row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.filter':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.toSorted':       row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
+    'RxList.slice':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
+    'RxList.concat':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
+    'RxList.groupBy':        row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.toSet':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
+    'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
+    'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.indexBy':        row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'UNCOVERED', SWEEP, 'UNCOVERED', DESTROY),
     'RxList.toMap':          row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'UNCOVERED', 'UNCOVERED', 'UNCOVERED', 'UNCOVERED'),
     'RxList.reduce':         row('reduceOperator.spec.ts(示例级差分)', 'reduceOperator.spec.ts(示例级差分)', 'UNCOVERED', 'UNCOVERED', 'UNCOVERED', 'reduceOperator.spec.ts(僵尸检查)'),
     'RxList.reduceToAtom':   row('rxList.spec.ts(示例级)', 'UNCOVERED', 'UNCOVERED', SWEEP, 'UNCOVERED', DESTROY),
-    'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', SWEEP, BATCH, DESTROY),
+    'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', SWEEP, BATCH, DESTROY, 'NA:值无关(只依赖结构长度)'),
     'RxList.createSelection':         row('createSelection.spec.ts(示例级)', H2, 'UNCOVERED', SWEEP, MODEL, DESTROY),
     'RxList.createSelections':        row('createSelection.spec.ts(示例级)', H2, 'UNCOVERED', 'UNCOVERED', 'UNCOVERED', 'UNCOVERED'),
     'RxList.createIndexKeySelection': row('createSelection.spec.ts(示例级)', 'NA:按 index 键(与元素值无关)', 'UNCOVERED', SWEEP, 'UNCOVERED', DESTROY),
 
     // ---- RxMap 派生 ----
-    'RxMap.keys':    row(BROAD, 'NA:Map key 构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
+    'RxMap.keys':    row(BROAD, 'NA:Map key 构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY, 'reproducedIssuesFixes.spec.ts(F10 delete(NaN),示例级)'),
     'RxMap.values':  row(BROAD, 'UNCOVERED', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
     'RxMap.entries': row(BROAD, 'UNCOVERED', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
-    'RxMap.size':    row(BROAD, 'NA:值无关(只依赖成员数)', 'NA:值无关(只依赖成员数)', 'NA:非数组结构', MODEL, DESTROY),
+    'RxMap.size':    row(BROAD, 'NA:值无关(只依赖成员数)', 'NA:值无关(只依赖成员数)', 'NA:非数组结构', MODEL, DESTROY, 'NA:值无关(只依赖成员数)'),
 
     // ---- RxSet 派生 ----
-    'RxSet.difference':          row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
+    'RxSet.difference':          row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY, 'lifecycleAndReplayFixes.spec.ts(replace 含 NaN,示例级)'),
     'RxSet.intersection':        row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
     'RxSet.symmetricDifference': row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
     'RxSet.union':               row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
-    'RxSet.toList':              row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY),
+    'RxSet.toList':              row(`${BROAD}(replace 含重复入参)`, 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', MODEL, DESTROY, 'reproducedIssuesFixes.spec.ts(F10 delete(NaN),示例级)'),
     'RxSet.has':                 row('rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', 'UNCOVERED', 'UNCOVERED'),
-    'RxSet.size':                row(BROAD, 'NA:值无关(只依赖成员数)', 'NA:值无关(只依赖成员数)', 'NA:非数组结构', MODEL, 'UNCOVERED'),
+    'RxSet.size':                row(BROAD, 'NA:值无关(只依赖成员数)', 'NA:值无关(只依赖成员数)', 'NA:非数组结构', MODEL, 'UNCOVERED', 'NA:值无关(只依赖成员数)'),
     'RxSet.isSubsetOf':          row('rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', 'UNCOVERED', DESTROY),
     'RxSet.isSupersetOf':        row('via isSubsetOf: rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', 'UNCOVERED', 'UNCOVERED'),
     'RxSet.isDisjointFrom':      row('rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'UNCOVERED', 'NA:非数组结构', 'UNCOVERED', DESTROY),

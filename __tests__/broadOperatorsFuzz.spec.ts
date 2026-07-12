@@ -3,7 +3,7 @@ import {atom} from '../src/atom.js'
 import {RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
-import {mulberry32} from './fuzzKit.js'
+import {adversarialSpliceStart, mulberry32, uniqueInts} from './fuzzKit.js'
 
 type Op =
     | { kind: 'splice', start: number, deleteCount: number, items: number[] }
@@ -19,13 +19,8 @@ type Op =
 function randomOp(rand: () => number, len: number, nextVal: () => number): Op {
     const r = rand()
     if (r < 0.35) {
-        const startChoice = rand()
-        let start: number
-        if (startChoice < 0.15) start = -Math.floor(rand() * (len + 2))
-        else if (startChoice < 0.25) start = len + Math.floor(rand() * 3)
-        else if (startChoice < 0.32) start = rand() * len
-        else if (startChoice < 0.35) start = NaN
-        else start = Math.floor(rand() * (len + 1))
+        // 对抗参数域(负数/越界/小数/NaN)统一由 fuzzKit 提供
+        const start = adversarialSpliceStart(rand, len)
         const deleteCount = rand() < 0.2 ? Math.floor(rand() * 3) + len : Math.floor(rand() * 4)
         const items = Array.from({length: Math.floor(rand() * 4)}, nextVal)
         return {kind: 'splice', start, deleteCount, items}
@@ -71,8 +66,7 @@ describe('broad fuzz: unique values, all operators', () => {
     for (const seed of [1, 2, 3, 4, 5, 42, 1337, 20260711]) {
         test(`seed=${seed}`, () => {
             const rand = mulberry32(seed)
-            let counter = 100
-            const nextVal = () => counter++
+            const nextVal = uniqueInts(100)
             const source = new RxList<number>([1, 2, 3, 4, 5])
 
             const mapped = source.map(x => x * 2)

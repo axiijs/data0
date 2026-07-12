@@ -55,12 +55,14 @@ Review 结论必须分为三类，不得混写：
   9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`（实例回归）、`__tests__/sparseSetOperatorsSweep.spec.ts`（"OOB set × 全派生算子族不崩溃且可恢复"的等价类横扫，含 batch 多 info 回退路径）。
   10. 既有攻击轴 × 未覆盖算子族的组合横扫（重复值域 × selection 家族、undefined 合法元素 × toSorted 的 EXPLICIT_KEY_CHANGE 路径、链式深层管道差分、回调重入）；发现并修复 createSelection 重复 item indicator 漂移（`itemToIndicators` 改 Set 广播 + 按身份精确移除）与 toSorted 变更含 undefined 时与全量 sort 分叉（回退全量重算）两个缺陷类；资产：`__tests__/deepReview2026H2Findings.spec.ts`（实例回归 + 两个等价类的常驻差分 sweep：重复 item 域 × selection 的"indicator ≡ currentValues 成员"不变量、undefined 值域 × toSorted 的"增量 ≡ 全量 sort"不变量，双 compare 形态）。既有 fuzz 的盲区模式：差分 fuzz 只喂"单一算子 × 唯一/重复数值域"，selection（值→indicator 的 Map 记账）与"undefined 作为合法元素值"两个维度都不在任何生成器的值域里。
   11. 模型比对（系统级管道网 ≡ 朴素参考模型）：多源 × 多派生 × 链式管道 × selection × RxSet/RxMap 派生组成一张网，随机操作序列（约 1/3 打包进 batch 形成多 info 重放）后逐节点与朴素 JS 全量重算比对；同轮引入生产语义 CI 差分（`pnpm test:prod`，`__DEV__:false` 编译源码跑同套测试，dev 特化文件排除清单见 `vitest.prod.config.ts`）。首跑均未发现反例。资产：`__tests__/modelComparisonFuzz.spec.ts`（同时是 RxSet 运算族/RxMap 派生/createSelection 的 batchReplay 列与链式管道的对账资产）、`vitest.prod.config.ts` + CI 步骤。
+  12. NaN/-0 元素值域差分（weirdNum 列）+ 核心表面账本化 + patch 错误恢复探针。动态复现并修复三个缺陷类：toSorted 增量删除按 `===`/`indexOf` 定位在 NaN（找不到→静默残留）与 -0/0（tie 组内命中错误实例）下与全量分叉——修复为 `Object.is` 身份定位 + 定位失败/tie 组含可区分成员时回退全量；applyPatch 抛错后 phase 停留在 PATCH_PHASE、抛错轮 info 已消费——下次触发只增量重放新 info，抛错轮变更永久缺失——修复为 handleRecomputeError 统一回退 FULL_RECOMPUTE_PHASE；findIndex 的 splice 分支用终态长度回推"操作时长度"归一化负/越界 start，多 info 重放下回推失效、被删除的旧 match 静默保留（fuzzKit 统一对抗参数域后由 batchReplayFuzz 命中）——修复为多 info 一律回退全量（等价类同 groupBy/slice，README 脚注已更新）。契约裁定：toSorted comparator 必须构成一致全序（NaN × 裸数值 comparator 属契约外），README 参数契约节已更新。资产：`__tests__/weirdNumbersFuzz.spec.ts`（NaN/-0 值域差分）、`__tests__/coreLifecycleGaps.spec.ts`（async/generator getter × destroy、排队后 destroy、三参调度器契约、调度错误兜底、patch 错误恢复、oncePromise 拒绝、object-atom 协议特征）、`__tests__/coreSurfaceInventory.spec.ts`（核心表面账本 + 导出面普查）、`__tests__/lifecycleAndReplayFixes.spec.ts`（findIndex 多 info 最小回归）。
 
 ### 3.3 覆盖清单纪律（盲格必须可见）
 
 2026-H2 教训：两个存活多轮的缺陷类都落在"攻击轴已存在、但没和该算子/值域相乘"的盲格上（重复值域 × selection、undefined 值域 × toSorted）。方法轮换有清单，覆盖矩阵却没有清单，盲格因此不可见。规则：
 
 - `__tests__/coverageInventory.spec.ts` 是「公开派生算子 × 对抗维度 → 防线资产」的常驻账本，机械强制：引用的资产文件必须存在、清单键必须在原型上、原型新增公开成员必须被分类（派生算子必须逐维度登记覆盖资产，或显式写 `UNCOVERED`/`NA:<构造性理由>`）。
+- `__tests__/coreSurfaceInventory.spec.ts` 是响应式核心（computed/notify/reactiveEffect/atom）的「计算表面 × 对抗维度」账本 + **包导出面普查**：src/index 的每个运行时导出必须被分类（核心表面/集合/外围/工具/诊断），新增导出未分类当场失败；核心表面按 basic/errorInjection/destroyTiming/interleaving/batchSession/scheduler 六维登记。两本账本的 `UNCOVERED` 汇总共同构成 review 立项来源。
 - **禁止把无覆盖的格子谎报为有资产**；`UNCOVERED` 是显式登记的债务，其汇总是每轮深度 review 的第一立项来源（先盘点盲格，再发明新方法）。
 - 新增对抗值域维度时：生成器加进 `__tests__/fuzzKit.ts`（所有 fuzz 共享，"加一次、全算子可用"），清单加一列，全部算子重新过账。禁止在单个 fuzz 文件里私藏值域。
 - 每轮 review 至少消掉一批盲格或给出 NA 论证；账本只允许经论证的增长（新算子落地时）。
@@ -158,3 +160,4 @@ pnpm exec stryker run --mutate 'src/dep.ts'      # 指定其他模块
   - 2026-07 修复轮跑 `src/reactiveEffect.ts`（destroy 核心重构后）—— 行覆盖 96.1%，mutation score **73.10%**（209 killed / 3 timeout / 71 survived / 7 no-coverage，94s）。
   - 2026-07 评估修复轮：删除 Vue 遗留且无生产引用的字符串/指令辅助（`isOn`/`camelize`/`isReservedProp` 等），降低 util 中"无人使用却撑高幸存 mutant"的死代码面。
   - 2026-07 方法 10 轮首跑 `src/RxList.ts` —— mutation score **72.08%**（1401 killed / 37 timeout / 479 survived / 78 no-coverage，4m52s；测试套为 selection/undefined 修复后、duplicates/undefined 扩展 sweep 落地前）。479 个幸存 mutant 为当前最大单模块盲区账本，下轮 review 与 coverageInventory 的 UNCOVERED 格子共同作为立项来源。
+  - 2026-07 核心账本轮首跑 `src/computed.ts` —— mutation score **68.04%**（369 killed / 10 timeout / 149 survived / 29 no-coverage，3m17s；coreLifecycleGaps 资产落地前）。核心模块的检出率低于集合模块，与"核心平面此前无账本"的判断相互印证。

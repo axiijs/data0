@@ -476,9 +476,14 @@ export class RxList<T> extends Computed {
         }
         return low
     }
-    // 在按 compare 有序的数组中定位与 item 引用相等的元素：
-    // 二分到相等区间后线性扫描（同序元素可能有多个）。找不到（比如元素的排序键
-    // 在删除前被外部改写、数组已不完全有序）返回 -1，调用方回退 indexOf 兜底。
+    // 在按 compare 有序的数组中定位与 item 同一身份的元素：
+    // 二分到相等区间后线性扫描（同序元素可能有多个）。
+    // CAUTION 身份比较必须用 Object.is 而不是 ===/indexOf（2026-H2 NaN/-0 值域
+    //  sweep 动态复现的缺陷类，与 RxSet.toList/RxMap.keys 的 F10 同源）：
+    //  - NaN === NaN 为 false，=== 与 indexOf 都永远找不到 NaN → 删除被静默跳过，
+    //    派生列表 NaN 残留；
+    //  - 0 === -0 为 true，compare 等值区间内会命中错误实例（把 -0 当 0 删掉），
+    //    实例组成与全量重算漂移。Object.is 对两者都给出精确身份。
     private static binarySearchFind<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
         let low = 0
         let high = arr.length
@@ -491,13 +496,19 @@ export class RxList<T> extends Computed {
             }
         }
         for (let i = low; i < arr.length && compare(arr[i], item) === 0; i++) {
-            if (arr[i] === item) return i
+            if (Object.is(arr[i], item)) return i
         }
         return -1
     }
+    // 找不到（元素排序键在删除前被外部改写、数组不完全有序）时全数组 Object.is
+    // 扫描兜底；仍找不到返回 -1，调用方必须回退全量重算（增量状态已不可信）。
     private static locateInSorted<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
         const found = RxList.binarySearchFind(arr, item, compare)
-        return found !== -1 ? found : arr.indexOf(item)
+        if (found !== -1) return found
+        for (let i = 0; i < arr.length; i++) {
+            if (Object.is(arr[i], item)) return i
+        }
+        return -1
     }
 
     public toSorted(compare?: (a: T, b: T) => number): RxList<T> {
@@ -531,6 +542,30 @@ export class RxList<T> extends Computed {
                     this.splice(insertIndex, 0, item)
                     return true
                 }
+                // CAUTION 删除侧的 tie 歧义(2026-H2 NaN/-0 值域 sweep 动态复现,与插入
+                //  侧 tie 回退同一等价类):被删值在 tie 组内有 ≥2 个 Object.is 相同的
+                //  副本,且组内还存在 compare-相等但 Object.is 可区分的其他成员(0 与
+                //  -0、compare 按字段相等的不同字符串/对象)时,"删哪个副本"会改变组内
+                //  剩余序——增量无从得知源顺序,而全量稳定排序由源顺序决定。此时回退
+                //  全量重算。纯重复值组(无可区分成员)与身份精确的对象删除不受影响,
+                //  保持增量。定位失败(排序键被外部改写)同样回退。
+                const removeOrBail = (item: T): boolean => {
+                    const idx = RxList.locateInSorted(this.data, item, compare!)
+                    if (idx === -1) return false
+                    let hasDuplicateOfItem = false
+                    let hasDistinctTieMember = false
+                    for (let j = idx - 1; j >= 0 && compare!(this.data[j], item) === 0; j--) {
+                        if (Object.is(this.data[j], item)) hasDuplicateOfItem = true
+                        else hasDistinctTieMember = true
+                    }
+                    for (let j = idx + 1; j < this.data.length && compare!(this.data[j], item) === 0; j++) {
+                        if (Object.is(this.data[j], item)) hasDuplicateOfItem = true
+                        else hasDistinctTieMember = true
+                    }
+                    if (hasDuplicateOfItem && hasDistinctTieMember) return false
+                    this.splice(idx, 1)
+                    return true
+                }
                 // Incremental updates
                 // CAUTION undefined 是 RxList 的合法元素值，但增量路径无法正确处理它：
                 //  1) Array#sort 的全量语义从不对 undefined 调用 compare（undefined 一律
@@ -549,13 +584,10 @@ export class RxList<T> extends Computed {
                         const newItems = argv!.slice(2) as T[]
                         // includes 是 SameValueZero：undefined（含稀疏洞读出的 undefined）可命中
                         if (deletedItems.includes(undefined as T) || newItems.includes(undefined as T)) return false
-                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
-                        deletedItems.forEach((item) => {
-                            const idx = RxList.locateInSorted(this.data, item, compare!)
-                            if (idx !== -1) {
-                                this.splice(idx, 1)
-                            }
-                        })
+                        // 1) remove items（tie 歧义与定位失败都回退全量,见 removeOrBail）
+                        for (const item of deletedItems) {
+                            if (!removeOrBail(item)) return false
+                        }
                         // 2) insert new items in sorted order
                         for (const item of newItems) {
                             if (!insertOrBail(item)) return false
@@ -564,10 +596,7 @@ export class RxList<T> extends Computed {
                         // explicit key change: remove old, insert new
                         // 值为 undefined（含越界 set 的"无旧值"）→ 回退全量重算
                         if (oldValue === undefined || newValue === undefined) return false
-                        const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
-                        if (idx !== -1) {
-                            this.splice(idx, 1)
-                        }
+                        if (!removeOrBail(oldValue as T)) return false
                         if (!insertOrBail(newValue as T)) return false
                     }
                 }
@@ -1129,6 +1158,14 @@ export class RxList<T> extends Computed {
                 // reactive 数据，就用 full recompute 保证每轮依赖集合与搜索区间一致；
                 // 无 reactive predicate 的热路径仍保留增量 patch。
                 if (hasItemReactiveDeps) return false
+                // CAUTION 多 info 重放回退（等价类同 groupBy/slice，2026-H2 fuzzKit 统一
+                //  对抗参数域后由 batchReplayFuzz 动态命中）：splice 分支用
+                //  `source.data.length - 本条净增 + 本条删除` 回推"操作时长度"再归一化
+                //  负/越界 start——单 info 时终态恰等于该 info 之后的状态，回推成立；
+                //  多 info 时终态还包含后续 info 的变化，回推出的长度错误 → 负 start
+                //  归一化出错误起点 → 已被删除的旧 match 被误判为"起点之前未受影响"
+                //  而静默保留。多 info 一律全量重算。
+                if (triggerInfos.length > 1) return false
                 let patchSuccess = undefined
                 // 每次 patch 都需要重新注册所有依赖。
                 this.cleanup()
