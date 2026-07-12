@@ -1511,6 +1511,11 @@ export class RxList<T> extends Computed {
 
     indexBy(inputIndexKey: keyof T|((item: T) => any)) {
         const source = this
+        // CAUTION 稀疏行安全(2026-H2 缺陷类:OOB set × 属性形式 indexBy):越界 set
+        //  产生的洞位读出 undefined——属性读 `(undefined)[key]` 直接 TypeError 且派生
+        //  链永久毒化,违反 sparseSetOperatorsSweep 的"不崩溃且可恢复"等价类。
+        //  洞位行(undefined)一律跳过:全量侧按 hasOwnProperty 跳洞(与 map 一致),
+        //  patch 侧删除/替换遇 undefined 旧值视为"无旧 entry"。
         return new RxMap<any, T>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
@@ -1518,6 +1523,8 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
+                    // 洞位与显式 null/undefined 行统一忽略(无法取 key)
+                    if (item == null) continue
                     const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                     assert(!map.has(indexKey), 'indexBy key is already exist')
                     map.set(indexKey, item)
@@ -1532,6 +1539,7 @@ export class RxList<T> extends Computed {
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
                         deleteItems.forEach((item) => {
+                            if (item == null) return // 稀疏洞/null 行:无 entry 可删
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                             this.delete(indexKey)
                         })
@@ -1543,9 +1551,11 @@ export class RxList<T> extends Computed {
                             this.set(indexKey, item)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
-                        // explicit key change
-                        const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
-                        this.delete(indexKey)
+                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
+                        if (oldValue !== undefined) {
+                            const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
+                            this.delete(indexKey)
+                        }
                         const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as T)[inputIndexKey]
                         this.set(newKey, newValue as T)
                     }
@@ -1560,13 +1570,18 @@ export class RxList<T> extends Computed {
     }
     toMap() {
         const source = this
+        // CAUTION 稀疏行安全(与 indexBy 同一缺陷类):洞位/显式 undefined 行解构
+        //  `const [k,v] = undefined` 直接 TypeError 且派生链永久毒化。undefined 行
+        //  统一忽略(全量与 patch 两侧一致),保持"OOB set 不崩溃且可恢复"等价类。
         return new RxMap<T extends [any, any] ? T[0] : any, T extends [any, any] ? T[1] : any>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
                 for (let i = 0; i < source.data.length; i++) {
-                    const [key, value] = source.data[i] as [any, any]
+                    const entry = source.data[i] as [any, any] | undefined
+                    if (entry === undefined) continue
+                    const [key, value] = entry
                     assert(!map.has(key), 'indexBy key is already exist')
                     map.set(key, value)
                 }
@@ -1578,18 +1593,20 @@ export class RxList<T> extends Computed {
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
-                        const deleteItems = methodResult as [any, any][] || []
-                        deleteItems.forEach(([indexKey]) => {
-                            this.delete(indexKey)
+                        const deleteItems = methodResult as ([any, any] | undefined)[] || []
+                        deleteItems.forEach((entry) => {
+                            if (entry === undefined) return
+                            this.delete(entry[0])
                         })
                         const newItemsInArgs = argv!.slice(2) as [any, any][]
                         newItemsInArgs.forEach(([indexKey, value]) => {
                             this.set(indexKey, value)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
-                        // explicit key change
-                        const indexKey = (oldValue as [any, any])[0]
-                        this.delete(indexKey)
+                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
+                        if (oldValue !== undefined) {
+                            this.delete((oldValue as [any, any])[0])
+                        }
                         const [newKey, newItem] = newValue as [any, any]
                         this.set(newKey, newItem)
                     }
