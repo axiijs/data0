@@ -49,7 +49,9 @@ Review 结论必须分为三类，不得混写：
   3. 固定 seed 差分 fuzz（增量结果 ≡ 全量重算，含重复值域）；
   4. async 敌意调度与完成序交错枚举；
   5. 异常注入（订阅者/回调抛错后全局状态复原检查）；
-  6. 生命周期审计（destroy/孤儿 effect/泄漏计数）。
+  6. 生命周期审计（destroy/孤儿 effect/泄漏计数）；
+  7. batch/延迟调度下的多 info 单次 digest 重放差分（既有差分 fuzz 全部在 batch 外逐操作断言，隐含"每次 digest 恰一条 info"的假设；重放语义本身是独立攻击面，尤其是 EXPLICIT_KEY_CHANGE 与结构操作混排）；
+  8. destroy 僵尸行为横扫 + destroy 事件对称性检查（直接断言"destroy 后不再接收更新"；不依赖 retainedDiagnostics——它只统计 active=true 的 effect，源模式结构在其中完全不可见）。
 
 ### 4. data0 特有的 review 检查（附资产追溯）
 
