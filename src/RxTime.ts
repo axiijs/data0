@@ -2,9 +2,14 @@ import {Atom, isAtom, atom} from "./atom.js";
 import {autorun} from "./common";
 import {assert} from "./util.js";
 
+// CAUTION value 的合法域与 simplifying 的实现严格对齐:add/sub 支持 RxTime 嵌套,
+//  mul/div 只支持标量/atom(旧类型里的 Operation[] 成员从无产出方,已删除)。
 type Operation = {
-    type: | 'add' | 'sub' | 'mul' | 'div'
-    value: number | Atom<number> | Operation[] | RxTime
+    type: 'add' | 'sub'
+    value: number | Atom<number> | RxTime
+} | {
+    type: 'mul' | 'div'
+    value: number | Atom<number>
 }
 /**
  * @category Basic
@@ -86,10 +91,28 @@ export class RxTime {
         return [coefficient, constant]
     }
     public data?: Atom<any>
-    public stopAutorun? : () => void
+    // CAUTION 多入口清理:resolve 与 subscribe 都会注册常驻副作用(autorun/interval)。
+    //  旧实现用单个 stopAutorun 字段,后注册的覆盖先注册的——先 resolve 再 subscribe
+    //  时 resolve 的 autorun 永久泄漏。现在所有清理进 disposers,stopAutorun 保留为
+    //  "停止全部"的公开入口(语义收严,不再只停最后一个)。
+    private disposers: Array<() => void> = []
+    public stopAutorun?: () => void
+    private addDisposer(dispose: () => void) {
+        this.disposers.push(dispose)
+        this.stopAutorun = () => this.disposeAll()
+    }
+    private disposeAll() {
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId)
+            this.timeoutId = null
+        }
+        const disposers = this.disposers
+        this.disposers = []
+        disposers.forEach(dispose => dispose())
+    }
     resolve(compare: (v:number) => boolean): Atom<boolean> {
         const result = atom(false)
-         this.stopAutorun = autorun(() => {
+         const stop = autorun(() => {
              // 立刻计算结果
              const currentTimestamp = Date.now()
              const [coefficient, constant] = this.simplifying()
@@ -114,6 +137,7 @@ export class RxTime {
 
              }
         },true)
+        this.addDisposer(stop)
 
         this.data = result
 
@@ -135,22 +159,14 @@ export class RxTime {
     subscribe(interval: number) {
         this.interval = interval
         const data = atom(Date.now())
-        this.interval = interval
         const intervalId = setInterval(() => {
             data(Date.now())
         }, interval)
-        this.stopAutorun = () => {
-            clearInterval(intervalId)
-            this.timeoutId = null
-        }
+        this.addDisposer(() => clearInterval(intervalId))
 
         return data
     }
     destroy(): void {
-        if (this.timeoutId) {
-            clearTimeout(this.timeoutId)
-            this.timeoutId = null
-        }
-        this.stopAutorun?.()
+        this.disposeAll()
     }
 }
