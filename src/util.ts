@@ -1,15 +1,3 @@
-export function makeMap(
-    str: string,
-    expectsLowerCase?: boolean
-): (key: string) => boolean {
-    const map: Record<string, boolean> = Object.create(null)
-    const list: Array<string> = str.split(',')
-    for (let i = 0; i < list.length; i++) {
-        map[list[i]] = true
-    }
-    return expectsLowerCase ? val => !!map[val.toLowerCase()] : val => !!map[val]
-}
-
 export const extend = Object.assign
 
 const hasOwnProperty = Object.prototype.hasOwnProperty
@@ -53,17 +41,6 @@ export const toRawType = (value: unknown): string => {
 // export const isPlainObject = (val: unknown): val is object => toTypeString(val) === '[object Object]'
 export const isPlainObject = (val: unknown): val is object => (val?.constructor === Object || val?.constructor === Array )
 
-export const isIntegerKeyQuick = (key: unknown) =>
-    isString(key) && (
-        key[0] === '0'|| key[0] === '1' || key[0] === '2' || key[0] === '3' || key[0] === '4' || key[0] === '5' || key[0] === '6' || key[0] === '7' || key[0] === '8' || key[0] === '9'
-    )
-
-export const isIntegerKey = (key: unknown) =>
-    isString(key) &&
-    key !== 'NaN' &&
-    key[0] !== '-' &&
-    '' + parseInt(key, 10) === key
-
 export const def = (obj: object, key: string | symbol, value: any) => {
     Object.defineProperty(obj, key, {
         configurable: true,
@@ -71,25 +48,6 @@ export const def = (obj: object, key: string | symbol, value: any) => {
         value
     })
 }
-
-/**
- * "123-foo" will be parsed to 123
- * This is used for the .number modifier in v-model
- */
-export const looseToNumber = (val: any): any => {
-    const n = parseFloat(val)
-    return isNaN(n) ? val : n
-}
-
-/**
- * Only concerns number-like strings
- * "123-foo" will be returned as-is
- */
-export const toNumber = (val: any): any => {
-    const n = isString(val) ? Number(val) : NaN
-    return isNaN(n) ? val : n
-}
-
 
 export function isStringOrNumber(target: any) {
     return typeof target === 'string' || typeof  target === 'number'

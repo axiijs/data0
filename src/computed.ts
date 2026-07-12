@@ -546,6 +546,15 @@ export class Computed extends ReactiveEffect {
     // 用 console.error 兜底上报，避免错误被完全静默吞掉。
     handleRecomputeError(err: any, willPropagate = false) {
         this.inPatch = false
+        // CAUTION patch 轮次抛错后增量状态不可信：该轮 triggerInfos 已被消费
+        //  （runSimplePatch 的 finally / runAsyncPatch 的轮首快照），且 applyPatch
+        //  可能已部分应用。若 phase 停留在 PATCH_PHASE，下次触发只会增量重放
+        //  新 info——抛错那轮的变更在派生数据里**永久缺失**（静默分叉，违反
+        //  "派生 ≡ 全量重算"不变量）。这里统一回退到 FULL_RECOMPUTE_PHASE 并清空
+        //  残留 info：下次触发走全量重算，错误恢复后结果必然与终态 source 一致。
+        //  （fullRecompute 错误路径本来就处于 FULL 阶段，置位幂等无害。）
+        if (this._triggerInfos) this._triggerInfos.length = 0
+        this.phase = FULL_RECOMPUTE_PHASE
         this.setStatus(STATUS_DIRTY)
         const observable = this._cleanPromise !== undefined || this.hasListener('error')
         this.settleCleanPromiseWithError(err)
@@ -575,6 +584,10 @@ export class Computed extends ReactiveEffect {
     // CAUTION 同步 computed 走完全同步的路径：这样用户 getter 的异常能同步抛到
     //  触发变更的调用点（而不是变成 unhandled rejection），语义上和"非 async 就应该同步计算"一致。
     fullRecompute(): any {
+        // 增量性见证事件（无监听者时 dispatch 零分配零开销）：patch 型结构的
+        // "契约内操作不得回退全量"由 incrementalityWitness 资产断言——差分测试
+        // 只能证明结果正确,无法区分增量与静默回退(mutation 审计暴露的检出盲区)。
+        this.dispatch('fullRecompute')
         const recomputeId = ++this.recomputeId
         // 失败重算必须恢复“上一次成功”的完整依赖集合。prepareTracking 可能在
         // getter 第一次读取前就清掉旧 deps，或在抛错前只收集了一部分新 deps。

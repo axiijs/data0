@@ -476,9 +476,14 @@ export class RxList<T> extends Computed {
         }
         return low
     }
-    // 在按 compare 有序的数组中定位与 item 引用相等的元素：
-    // 二分到相等区间后线性扫描（同序元素可能有多个）。找不到（比如元素的排序键
-    // 在删除前被外部改写、数组已不完全有序）返回 -1，调用方回退 indexOf 兜底。
+    // 在按 compare 有序的数组中定位与 item 同一身份的元素：
+    // 二分到相等区间后线性扫描（同序元素可能有多个）。
+    // CAUTION 身份比较必须用 Object.is 而不是 ===/indexOf（2026-H2 NaN/-0 值域
+    //  sweep 动态复现的缺陷类，与 RxSet.toList/RxMap.keys 的 F10 同源）：
+    //  - NaN === NaN 为 false，=== 与 indexOf 都永远找不到 NaN → 删除被静默跳过，
+    //    派生列表 NaN 残留；
+    //  - 0 === -0 为 true，compare 等值区间内会命中错误实例（把 -0 当 0 删掉），
+    //    实例组成与全量重算漂移。Object.is 对两者都给出精确身份。
     private static binarySearchFind<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
         let low = 0
         let high = arr.length
@@ -491,13 +496,19 @@ export class RxList<T> extends Computed {
             }
         }
         for (let i = low; i < arr.length && compare(arr[i], item) === 0; i++) {
-            if (arr[i] === item) return i
+            if (Object.is(arr[i], item)) return i
         }
         return -1
     }
+    // 找不到（元素排序键在删除前被外部改写、数组不完全有序）时全数组 Object.is
+    // 扫描兜底；仍找不到返回 -1，调用方必须回退全量重算（增量状态已不可信）。
     private static locateInSorted<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
         const found = RxList.binarySearchFind(arr, item, compare)
-        return found !== -1 ? found : arr.indexOf(item)
+        if (found !== -1) return found
+        for (let i = 0; i < arr.length; i++) {
+            if (Object.is(arr[i], item)) return i
+        }
+        return -1
     }
 
     public toSorted(compare?: (a: T, b: T) => number): RxList<T> {
@@ -531,35 +542,62 @@ export class RxList<T> extends Computed {
                     this.splice(insertIndex, 0, item)
                     return true
                 }
+                // CAUTION 删除侧的 tie 歧义(2026-H2 NaN/-0 值域 sweep 动态复现,与插入
+                //  侧 tie 回退同一等价类):被删值在 tie 组内有 ≥2 个 Object.is 相同的
+                //  副本,且组内还存在 compare-相等但 Object.is 可区分的其他成员(0 与
+                //  -0、compare 按字段相等的不同字符串/对象)时,"删哪个副本"会改变组内
+                //  剩余序——增量无从得知源顺序,而全量稳定排序由源顺序决定。此时回退
+                //  全量重算。纯重复值组(无可区分成员)与身份精确的对象删除不受影响,
+                //  保持增量。定位失败(排序键被外部改写)同样回退。
+                const removeOrBail = (item: T): boolean => {
+                    const idx = RxList.locateInSorted(this.data, item, compare!)
+                    if (idx === -1) return false
+                    let hasDuplicateOfItem = false
+                    let hasDistinctTieMember = false
+                    for (let j = idx - 1; j >= 0 && compare!(this.data[j], item) === 0; j--) {
+                        if (Object.is(this.data[j], item)) hasDuplicateOfItem = true
+                        else hasDistinctTieMember = true
+                    }
+                    for (let j = idx + 1; j < this.data.length && compare!(this.data[j], item) === 0; j++) {
+                        if (Object.is(this.data[j], item)) hasDuplicateOfItem = true
+                        else hasDistinctTieMember = true
+                    }
+                    if (hasDuplicateOfItem && hasDistinctTieMember) return false
+                    this.splice(idx, 1)
+                    return true
+                }
                 // Incremental updates
+                // CAUTION undefined 是 RxList 的合法元素值，但增量路径无法正确处理它：
+                //  1) Array#sort 的全量语义从不对 undefined 调用 compare（undefined 一律
+                //     排到尾部），增量二分却会把 undefined 喂给 compare——数值型 compare
+                //     返回 NaN 时二分插到错误位置，与全量重算分叉；
+                //  2) explicit key change 的 oldValue/newValue 用 `!== undefined` 当
+                //     "有无"判断，无法区分"值为 undefined"与"无值"——set 引入 undefined
+                //     会丢行、替换 undefined 会残留行。
+                //  变更涉及 undefined 时一律回退全量重算（结果与 Array#sort 语义一致，
+                //  只损失该次增量性；同 tie 回退的处置）。
                 for (const info of triggerInfos) {
                     const { method, argv, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
-                        // 1) remove items（有序数组用二分定位，indexOf 仅兜底）
                         const deletedItems = (methodResult as T[]) || []
-                        deletedItems.forEach((item) => {
-                            const idx = RxList.locateInSorted(this.data, item, compare!)
-                            if (idx !== -1) {
-                                this.splice(idx, 1)
-                            }
-                        })
-                        // 2) insert new items in sorted order
                         const newItems = argv!.slice(2) as T[]
+                        // includes 是 SameValueZero：undefined（含稀疏洞读出的 undefined）可命中
+                        if (deletedItems.includes(undefined as T) || newItems.includes(undefined as T)) return false
+                        // 1) remove items（tie 歧义与定位失败都回退全量,见 removeOrBail）
+                        for (const item of deletedItems) {
+                            if (!removeOrBail(item)) return false
+                        }
+                        // 2) insert new items in sorted order
                         for (const item of newItems) {
                             if (!insertOrBail(item)) return false
                         }
                     } else {
                         // explicit key change: remove old, insert new
-                        if (oldValue !== undefined) {
-                            const idx = RxList.locateInSorted(this.data, oldValue as T, compare!)
-                            if (idx !== -1) {
-                                this.splice(idx, 1)
-                            }
-                        }
-                        if (newValue !== undefined) {
-                            if (!insertOrBail(newValue as T)) return false
-                        }
+                        // 值为 undefined（含越界 set 的"无旧值"）→ 回退全量重算
+                        if (oldValue === undefined || newValue === undefined) return false
+                        if (!removeOrBail(oldValue as T)) return false
+                        if (!insertOrBail(newValue as T)) return false
                     }
                 }
             }
@@ -1120,6 +1158,14 @@ export class RxList<T> extends Computed {
                 // reactive 数据，就用 full recompute 保证每轮依赖集合与搜索区间一致；
                 // 无 reactive predicate 的热路径仍保留增量 patch。
                 if (hasItemReactiveDeps) return false
+                // CAUTION 多 info 重放回退（等价类同 groupBy/slice，2026-H2 fuzzKit 统一
+                //  对抗参数域后由 batchReplayFuzz 动态命中）：splice 分支用
+                //  `source.data.length - 本条净增 + 本条删除` 回推"操作时长度"再归一化
+                //  负/越界 start——单 info 时终态恰等于该 info 之后的状态，回推成立；
+                //  多 info 时终态还包含后续 info 的变化，回推出的长度错误 → 负 start
+                //  归一化出错误起点 → 已被删除的旧 match 被误判为"起点之前未受影响"
+                //  而静默保留。多 info 一律全量重算。
+                if (triggerInfos.length > 1) return false
                 let patchSuccess = undefined
                 // 每次 patch 都需要重新注册所有依赖。
                 this.cleanup()
@@ -1465,6 +1511,11 @@ export class RxList<T> extends Computed {
 
     indexBy(inputIndexKey: keyof T|((item: T) => any)) {
         const source = this
+        // CAUTION 稀疏行安全(2026-H2 缺陷类:OOB set × 属性形式 indexBy):越界 set
+        //  产生的洞位读出 undefined——属性读 `(undefined)[key]` 直接 TypeError 且派生
+        //  链永久毒化,违反 sparseSetOperatorsSweep 的"不崩溃且可恢复"等价类。
+        //  洞位行(undefined)一律跳过:全量侧按 hasOwnProperty 跳洞(与 map 一致),
+        //  patch 侧删除/替换遇 undefined 旧值视为"无旧 entry"。
         return new RxMap<any, T>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
@@ -1472,6 +1523,8 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
+                    // 洞位与显式 null/undefined 行统一忽略(无法取 key)
+                    if (item == null) continue
                     const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                     assert(!map.has(indexKey), 'indexBy key is already exist')
                     map.set(indexKey, item)
@@ -1486,6 +1539,7 @@ export class RxList<T> extends Computed {
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
                         deleteItems.forEach((item) => {
+                            if (item == null) return // 稀疏洞/null 行:无 entry 可删
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                             this.delete(indexKey)
                         })
@@ -1497,9 +1551,11 @@ export class RxList<T> extends Computed {
                             this.set(indexKey, item)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
-                        // explicit key change
-                        const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
-                        this.delete(indexKey)
+                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
+                        if (oldValue !== undefined) {
+                            const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
+                            this.delete(indexKey)
+                        }
                         const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as T)[inputIndexKey]
                         this.set(newKey, newValue as T)
                     }
@@ -1514,13 +1570,18 @@ export class RxList<T> extends Computed {
     }
     toMap() {
         const source = this
+        // CAUTION 稀疏行安全(与 indexBy 同一缺陷类):洞位/显式 undefined 行解构
+        //  `const [k,v] = undefined` 直接 TypeError 且派生链永久毒化。undefined 行
+        //  统一忽略(全量与 patch 两侧一致),保持"OOB set 不崩溃且可恢复"等价类。
         return new RxMap<T extends [any, any] ? T[0] : any, T extends [any, any] ? T[1] : any>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
                 for (let i = 0; i < source.data.length; i++) {
-                    const [key, value] = source.data[i] as [any, any]
+                    const entry = source.data[i] as [any, any] | undefined
+                    if (entry === undefined) continue
+                    const [key, value] = entry
                     assert(!map.has(key), 'indexBy key is already exist')
                     map.set(key, value)
                 }
@@ -1532,18 +1593,20 @@ export class RxList<T> extends Computed {
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
-                        const deleteItems = methodResult as [any, any][] || []
-                        deleteItems.forEach(([indexKey]) => {
-                            this.delete(indexKey)
+                        const deleteItems = methodResult as ([any, any] | undefined)[] || []
+                        deleteItems.forEach((entry) => {
+                            if (entry === undefined) return
+                            this.delete(entry[0])
                         })
                         const newItemsInArgs = argv!.slice(2) as [any, any][]
                         newItemsInArgs.forEach(([indexKey, value]) => {
                             this.set(indexKey, value)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
-                        // explicit key change
-                        const indexKey = (oldValue as [any, any])[0]
-                        this.delete(indexKey)
+                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
+                        if (oldValue !== undefined) {
+                            this.delete((oldValue as [any, any])[0])
+                        }
                         const [newKey, newItem] = newValue as [any, any]
                         this.set(newKey, newItem)
                     }
@@ -1842,15 +1905,34 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         list.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
     }
 
-    const itemToIndicator: Map<any, Atom<boolean>> = new Map()
+    // CAUTION indicator 记账必须支持重复 item（同值/同引用占多行）：
+    //  旧实现 Map<item, indicator> 在重复行下后写覆盖前写——currentValues 变化只更新
+    //  最后一行（其余行永不更新），删除任一行还会把存活孪生行的条目一并误删
+    //  （该行 indicator 永久失联，可观察为反选后卡 true）。
+    //  存储用 CompactDep 同款紧凑手法：唯一 item（常见场景，axii 大列表按行选中）
+    //  直接存 indicator 本身——零额外分配，与修复前同等内存；出现孪生行才升级 Set。
+    //  indicator 是 atom（函数），与 Set 用 instanceof 可靠区分。
+    const itemToIndicators: Map<any, Atom<boolean> | Set<Atom<boolean>>> = new Map()
 
     function createNewIndicator(item:T) {
         const indicator = atom(isAtom(currentValues) ? currentValues.raw === item : currentValues.data.has(item))
-        itemToIndicator.set(item, indicator)
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) {
+            itemToIndicators.set(item, indicator)
+        } else if (existing instanceof Set) {
+            existing.add(indicator)
+        } else if (existing !== indicator) {
+            itemToIndicators.set(item, new Set([existing, indicator]))
+        }
         return indicator
     }
 
-    function deleteCurrentValueIfItemRemoved(item:T) {
+    // 存活检查的批量优化：单条删除用 includes（零分配），批量删除由调用方传入
+    // 预构建的 survivors Set，避免 O(删除数 × 列表长)。
+    function deleteCurrentValueIfItemRemoved(item:T, survivors?: Set<T>) {
+        // 重复 item：仍有同 item 行存活时不回收选中值，否则存活行会被误反选。
+        // （includes/Set.has 都是 SameValueZero，与 Map/Set 成员语义一致，NaN 亦可命中。）
+        if (survivors ? survivors.has(item) : source.data.includes(item)) return
         if (isAtom(currentValues)) {
             if (item === currentValues.raw) {
                 currentValues(null)
@@ -1862,16 +1944,42 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         }
     }
 
-    function deleteIndicator(item:T) {
-        itemToIndicator.delete(item)
+    function deleteIndicator(item:T, indicator?: Atom<boolean>) {
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) return
+        if (indicator === undefined) {
+            itemToIndicators.delete(item)
+            return
+        }
+        if (existing instanceof Set) {
+            existing.delete(indicator)
+            if (existing.size === 1) {
+                // 降级回紧凑存储（与 CompactDep 的 overflow 收缩一致）
+                const [only] = existing
+                itemToIndicators.set(item, only)
+            } else if (existing.size === 0) {
+                itemToIndicators.delete(item)
+            }
+        } else if (existing === indicator) {
+            itemToIndicators.delete(item)
+        }
     }
 
+    function updateIndicators(item: T, value: boolean) {
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) return
+        if (existing instanceof Set) {
+            existing.forEach(indicator => indicator(value))
+        } else {
+            existing(value)
+        }
+    }
 
     function updateIndicatorsFromCurrentValueChange(triggerInfo: TriggerInfo) {
         const { oldValue, newValue, method } = triggerInfo
         if(isAtom(currentValues)) {
-            itemToIndicator.get(oldValue as T)?.(false)
-            itemToIndicator.get(newValue as T)?.(true)
+            updateIndicators(oldValue as T, false)
+            updateIndicators(newValue as T, true)
         } else {
             // RxSet，有 add/delete/replace method
             let newItems: T[] = []
@@ -1884,12 +1992,10 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                 [newItems, deletedItems] = triggerInfo.methodResult as [T[], T[]]
             }
             newItems.forEach((item) => {
-                const indicator = itemToIndicator?.get(item)
-                indicator?.(true)
+                updateIndicators(item, true)
             })
             deletedItems.forEach((item) => {
-                const indicator = itemToIndicator?.get(item)
-                indicator?.(false)
+                updateIndicators(item, false)
             })
         }
     }
@@ -1909,8 +2015,11 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                     const { method, type, oldValue } = triggerInfo
                     if (method === 'splice') {
                         const deleteItems = triggerInfo.methodResult as T[] || []
+                        // 批量删除时预构建存活集：把存活检查从 O(删除数 × 列表长)
+                        // 摊平为 O(列表长 + 删除数)；单条删除保持零分配的 includes。
+                        const survivors = deleteItems.length > 1 ? new Set(source.data) : undefined
                         deleteItems.forEach((item:T) => {
-                            deleteCurrentValueIfItemRemoved(item)
+                            deleteCurrentValueIfItemRemoved(item, survivors)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         deleteCurrentValueIfItemRemoved(oldValue as T)
@@ -1942,13 +2051,18 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
 
     function updateIndicatorsFromSourceChange(list: RxList<[T, ...Atom<boolean>[]]>, triggerInfo: TriggerInfo) {
         if (triggerInfo.method === 'splice') {
-            const { methodResult , argv } = triggerInfo
+            const { argv } = triggerInfo
             const newItemsInArgs = argv!.slice(2)
-            const deleteItems: T[] = methodResult || []
-            deleteItems.forEach((item) => {
-                inners.forEach(inner => inner.deleteIndicator(item))
+            // CAUTION 先 splice 拿到被删除的行元组，再按 indicator 身份精确清理记账：
+            //  旧实现按 methodResult 的 item 值清理，重复 item 下会把存活孪生行的
+            //  记账一并误删（deleteIndicator 的重复值缺陷类）。
+            const deletedRows = list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
+            deletedRows.forEach((row) => {
+                // 稀疏行安全：越界 set（契约内透传）产生的洞位行是 undefined
+                if (!row) return
+                const [item, ...indicators] = row
+                inners.forEach((inner, i) => inner.deleteIndicator(item, indicators[i]))
             })
-            list.spliceArray(argv![0], argv![1], newItemsInArgs.map((item) => [item, ...inners.map(inner => inner.createNewIndicator(item))] as [T, ...Atom<boolean>[]]))
         } else if (triggerInfo.method === 'reorder') {
             // CAUTION 行必须随源同步重排（indicator 挂在行元组上随行移动，成员与
             //  选中集都不变）。旧实现把 reorder 落进 explicit key change 分支，
@@ -1957,7 +2071,13 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
-            list.set(key as number, [newValue as T, ...inners.map(inner => inner.createNewIndicator(newValue as T))] as [T, Atom<boolean>])
+            const oldRow = list.set(key as number, [newValue as T, ...inners.map(inner => inner.createNewIndicator(newValue as T))] as [T, Atom<boolean>])
+            // 被替换行的记账同步移除（旧实现从不清理：条目泄漏，重复 item 下
+            //  还会让 currentValues 变化继续驱动已离场行的 indicator）
+            if (oldRow) {
+                const [oldItem, ...oldIndicators] = oldRow as [T, ...Atom<boolean>[]]
+                inners.forEach((inner, i) => inner.deleteIndicator(oldItem, oldIndicators[i]))
+            }
         }
     }
 

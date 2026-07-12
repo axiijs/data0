@@ -1,6 +1,6 @@
 import {describe, expect, test} from 'vitest'
 import {atom} from '../src/atom.js'
-import {computed} from '../src/computed.js'
+import {computed, destroyComputed} from '../src/computed.js'
 import {autorun} from '../src/common.js'
 import {batch} from '../src/notify.js'
 import {TrackOpTypes, TriggerOpTypes} from '../src/operations.js'
@@ -147,6 +147,19 @@ describe('fix: batch 中 set+结构操作的派生一致性（等价类：多 in
             for (const g of grouped.data.values()) g.destroy()
             grouped.destroy(); source.destroy()
         }
+    })
+
+    test('findIndex: batch 内多 splice(含负 start)回退全量(操作时长度回推在多 info 下失效)', () => {
+        const source = new RxList<number>([10, 3, 6])
+        const found = source.findIndex(x => x % 5 === 0)
+        expect(found.raw).toBe(0)
+        batch(() => {
+            source.splice(-3, 1, 7, 8) // 操作时长度 3:-3 → 0,删除旧 match 10
+            source.push(15)
+        })
+        expect(found.raw).toBe(source.data.findIndex(x => x % 5 === 0))
+        destroyComputed(found)
+        source.destroy()
     })
 
     test('无 batch 也一致：自定义微任务调度下两次连续写积累重放', async () => {

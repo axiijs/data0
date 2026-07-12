@@ -1,7 +1,7 @@
 import {CompactDep, createCompactDep, createDep, Dep, newTracked, wasTracked} from "./dep";
 import {TrackOpTypes, TriggerOpTypes} from "./operations";
 import {Computed} from "./computed";
-import {assert, extend, isArray, isIntegerKey, toNumber} from "./util";
+import {assert, extend} from "./util";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {
   trackRetainedDepEffectAdded,
@@ -334,15 +334,6 @@ export class Notifier {
       // trigger all effects for target
       deps = [...depsMap.values()]
 
-    } else if (key === 'length' && isArray(source)) {
-      // 数组时，可以直接 set length，相当于直接把后面的部分删掉了。
-      const newLength = toNumber(newValue)
-      depsMap.forEach((dep, key) => {
-        if (key === 'length' || key >= newLength) {
-          deps.push(dep)
-        }
-      })
-
     } else {
       // schedule runs for SET | ADD | DELETE
       if (key !== void 0) {
@@ -350,26 +341,18 @@ export class Notifier {
       }
 
       // also run for iteration key on ADD | DELETE | Map.SET
+      // CAUTION 2026-H2 删除了 Vue 遗留的 raw-array 分支（key==='length' 收缩触发、
+      //  ADD 整数 key 触发 'length' dep）：data0 没有数组 Proxy，所有内部触发源都是
+      //  Rx 类实例或 atom（isArray(source) 恒 false），该分支仅被覆盖率测试喂养。
+      //  以 raw array 为 trigger target 不属于承诺面（README 只承诺 Rx 结构与 atom）。
       switch (type) {
         case TriggerOpTypes.ADD:
-          if (!isArray(source)) {
-            deps.push(depsMap.get(ITERATE_KEY))
-            deps.push(depsMap.get(ITERATE_KEY_KEY_ONLY))
-          } else if (isIntegerKey(key)) {
-            // new index added to array -> length changes
-            deps.push(depsMap.get('length'))
-          }
-          break
         case TriggerOpTypes.DELETE:
-          if (!isArray(source)) {
-            deps.push(depsMap.get(ITERATE_KEY))
-            deps.push(depsMap.get(ITERATE_KEY_KEY_ONLY))
-          }
+          deps.push(depsMap.get(ITERATE_KEY))
+          deps.push(depsMap.get(ITERATE_KEY_KEY_ONLY))
           break
         case TriggerOpTypes.SET:
-          if (!isArray(source)) {
-            deps.push(depsMap.get(ITERATE_KEY))
-          }
+          deps.push(depsMap.get(ITERATE_KEY))
           break
         case TriggerOpTypes.METHOD:
           deps.push(depsMap.get(TriggerOpTypes.METHOD))

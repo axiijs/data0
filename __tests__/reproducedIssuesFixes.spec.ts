@@ -507,8 +507,11 @@ describe('F8: 订阅者异常不泄漏全局追踪状态', () => {
             expect(() => source.push(3)).toThrow('patch boom')
             expect(notifier.trackStack.length).toBe(stackDepthBefore)
             expect(notifier.shouldTrack).toBe(shouldTrackBefore)
-            // clear 路径同样保护
-            expect(() => source.clear()).toThrow('patch boom')
+            // 2026-H2 起,patch 抛错会把 phase 回退到全量重算(增量状态不可信,
+            // 见 handleRecomputeError):下一次变更不再进入 throwing patch,而是
+            // 全量重算恢复一致——错误恢复后派生 ≡ 全量重算。
+            expect(() => source.clear()).not.toThrow()
+            expect(derived.data).toEqual(source.data.slice())
             expect(notifier.trackStack.length).toBe(stackDepthBefore)
             expect(notifier.shouldTrack).toBe(shouldTrackBefore)
         } finally {

@@ -72,6 +72,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 ### 4. RxList 参数契约
 
 - `splice(start, deleteCount, ...items)` 的参数按 `Array.prototype.splice` 规范归一化(ToIntegerOrInfinity:NaN→0、小数截断、负数从尾部回退、越界 clamp、`-0`→`+0`)。
+- **`toSorted(compare)` 的 comparator 必须对元素值域构成一致全序**(与 `Array#sort` 的 consistent-comparator 要求相同)。`NaN` 元素 × 裸数值 comparator(`(a,b)=>a-b` 返回 NaN)违反一致性,属契约外;需要含 `NaN` 的列表请用 NaN 归一化的 comparator。元素身份(增量删除定位)按 `Object.is`(`NaN` 可定位,`0`/`-0` 可区分);等值 tie 组内存在可区分成员时增量删除自动回退全量重算。
 - **`triggerInfo.argv` 透传用户原始参数**(不归一化)。这是 axii/axle 依赖的协议;消费 argv 的派生结构必须自行归一化(内部实现均已如此)。
 - `set(index, value)` 的契约是**替换已存在的稠密行**。越界/负数/非整数 key 属于契约外用法:行为等同普通数组赋值(可能产生稀疏数组、`length` computed 不更新),key 原样透传给下游。若列表已有 `atomIndexes`(`map` 使用了 index 参数),越界 set 会为写入位分配 index atom,派生 `map(index)` 不再因此崩溃;稀疏洞位仍按数组语义保留。
 - `at(index)` 支持负索引;对具体 index 的读取建立细粒度依赖,收缩(如 `pop`)会通知被裁剪的 index。
@@ -99,7 +100,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 |---|---|---|---|
 | `RxList.map` | 增量 | 增量 | 增量 |
 | `RxList.filter` | 增量 | 增量 | 重建(按 indicator 顺序) |
-| `RxList.toSorted` | 增量(等值 tie→重算) | 增量(等值 tie→重算) | 无关 |
+| `RxList.toSorted` | 增量(等值 tie/含 undefined→重算) | 增量(等值 tie/含 undefined→重算) | 无关 |
 | `RxList.slice` | 增量(负边界→重算) | 增量 | 重算 |
 | `RxList.concat` | 增量(批量多条→重算) | 增量 | 重算 |
 | `RxList.groupBy` | 增量 | 增量 | 组内重排 |
@@ -111,9 +112,9 @@ doubled.destroy(); evens.destroy(); list.destroy()
 | `RxList.length`、`RxMap.keys/values/entries/size`、`RxSet.size` | 增量(`clear`/`replace` 部分重算) | 增量 | 无关 |
 | `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量(`replace` 的 `newItems` 按 Set 语义去重) | — | — |
 
-**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致,以下算子自动回退全量重算以保证与全量重算一致:`groupBy`、`slice`(任意多条)、`map`(仅当行使用 index atom——`mapFn(item, index)` 或行含响应式依赖时);`toSorted` 在插入元素与既有元素等值(tie)时同样回退,保证与稳定排序一致。回退是正确性措施,结果不变,只损失该次增量性。
+**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致,以下算子自动回退全量重算以保证与全量重算一致:`groupBy`、`slice`、`findIndex`(及其派生 find/some/every,任意多条——负/越界 start 的"操作时长度"回推在多 info 下失效)、`map`(仅当行使用 index atom——`mapFn(item, index)` 或行含响应式依赖时);`toSorted` 在插入元素与既有元素等值(tie)时同样回退,保证与稳定排序一致;变更涉及 `undefined` 元素值、或增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)时也回退。回退是正确性措施,结果不变,只损失该次增量性。
 
-矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
+矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie,`__tests__/deepReview2026H2Findings.spec.ts` 覆盖 selection 家族的重复 item 域与 toSorted 的 undefined 元素值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
 
 ## 架构语义(不作为缺陷)
 

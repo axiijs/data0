@@ -27,6 +27,11 @@ jobs:
       - name: Test
         run: pnpm test --run
 
+      # 生产语义差分:__DEV__=false 下跑同一套测试(dev 断言/告警被 DCE),
+      # 防 dev-only 分支掩盖 prod 行为漂移(排除清单见 vitest.prod.config.ts)
+      - name: Test (production semantics)
+        run: pnpm test:prod
+
       - name: Type check
         run: pnpm type-check
 
