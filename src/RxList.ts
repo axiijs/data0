@@ -1908,22 +1908,31 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
     // CAUTION indicator 记账必须支持重复 item（同值/同引用占多行）：
     //  旧实现 Map<item, indicator> 在重复行下后写覆盖前写——currentValues 变化只更新
     //  最后一行（其余行永不更新），删除任一行还会把存活孪生行的条目一并误删
-    //  （该行 indicator 永久失联，可观察为反选后卡 true）。改为 Map<item, Set<indicator>>：
-    //  currentValues 变化对同 item 的整组 indicator 广播；删除按 indicator 身份精确移除。
-    const itemToIndicators: Map<any, Set<Atom<boolean>>> = new Map()
+    //  （该行 indicator 永久失联，可观察为反选后卡 true）。
+    //  存储用 CompactDep 同款紧凑手法：唯一 item（常见场景，axii 大列表按行选中）
+    //  直接存 indicator 本身——零额外分配，与修复前同等内存；出现孪生行才升级 Set。
+    //  indicator 是 atom（函数），与 Set 用 instanceof 可靠区分。
+    const itemToIndicators: Map<any, Atom<boolean> | Set<Atom<boolean>>> = new Map()
 
     function createNewIndicator(item:T) {
         const indicator = atom(isAtom(currentValues) ? currentValues.raw === item : currentValues.data.has(item))
-        let indicators = itemToIndicators.get(item)
-        if (!indicators) itemToIndicators.set(item, indicators = new Set())
-        indicators.add(indicator)
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) {
+            itemToIndicators.set(item, indicator)
+        } else if (existing instanceof Set) {
+            existing.add(indicator)
+        } else if (existing !== indicator) {
+            itemToIndicators.set(item, new Set([existing, indicator]))
+        }
         return indicator
     }
 
-    function deleteCurrentValueIfItemRemoved(item:T) {
+    // 存活检查的批量优化：单条删除用 includes（零分配），批量删除由调用方传入
+    // 预构建的 survivors Set，避免 O(删除数 × 列表长)。
+    function deleteCurrentValueIfItemRemoved(item:T, survivors?: Set<T>) {
         // 重复 item：仍有同 item 行存活时不回收选中值，否则存活行会被误反选。
-        // （includes 是 SameValueZero，与 Map/Set 的成员语义一致，NaN 亦可命中。）
-        if (source.data.includes(item)) return
+        // （includes/Set.has 都是 SameValueZero，与 Map/Set 成员语义一致，NaN 亦可命中。）
+        if (survivors ? survivors.has(item) : source.data.includes(item)) return
         if (isAtom(currentValues)) {
             if (item === currentValues.raw) {
                 currentValues(null)
@@ -1936,22 +1945,41 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
     }
 
     function deleteIndicator(item:T, indicator?: Atom<boolean>) {
-        const indicators = itemToIndicators.get(item)
-        if (!indicators) return
-        if (indicator !== undefined) {
-            indicators.delete(indicator)
-        } else {
-            indicators.clear()
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) return
+        if (indicator === undefined) {
+            itemToIndicators.delete(item)
+            return
         }
-        if (indicators.size === 0) itemToIndicators.delete(item)
+        if (existing instanceof Set) {
+            existing.delete(indicator)
+            if (existing.size === 1) {
+                // 降级回紧凑存储（与 CompactDep 的 overflow 收缩一致）
+                const [only] = existing
+                itemToIndicators.set(item, only)
+            } else if (existing.size === 0) {
+                itemToIndicators.delete(item)
+            }
+        } else if (existing === indicator) {
+            itemToIndicators.delete(item)
+        }
     }
 
+    function updateIndicators(item: T, value: boolean) {
+        const existing = itemToIndicators.get(item)
+        if (existing === undefined) return
+        if (existing instanceof Set) {
+            existing.forEach(indicator => indicator(value))
+        } else {
+            existing(value)
+        }
+    }
 
     function updateIndicatorsFromCurrentValueChange(triggerInfo: TriggerInfo) {
         const { oldValue, newValue, method } = triggerInfo
         if(isAtom(currentValues)) {
-            itemToIndicators.get(oldValue as T)?.forEach(indicator => indicator(false))
-            itemToIndicators.get(newValue as T)?.forEach(indicator => indicator(true))
+            updateIndicators(oldValue as T, false)
+            updateIndicators(newValue as T, true)
         } else {
             // RxSet，有 add/delete/replace method
             let newItems: T[] = []
@@ -1964,10 +1992,10 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                 [newItems, deletedItems] = triggerInfo.methodResult as [T[], T[]]
             }
             newItems.forEach((item) => {
-                itemToIndicators.get(item)?.forEach(indicator => indicator(true))
+                updateIndicators(item, true)
             })
             deletedItems.forEach((item) => {
-                itemToIndicators.get(item)?.forEach(indicator => indicator(false))
+                updateIndicators(item, false)
             })
         }
     }
@@ -1987,8 +2015,11 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                     const { method, type, oldValue } = triggerInfo
                     if (method === 'splice') {
                         const deleteItems = triggerInfo.methodResult as T[] || []
+                        // 批量删除时预构建存活集：把存活检查从 O(删除数 × 列表长)
+                        // 摊平为 O(列表长 + 删除数)；单条删除保持零分配的 includes。
+                        const survivors = deleteItems.length > 1 ? new Set(source.data) : undefined
                         deleteItems.forEach((item:T) => {
-                            deleteCurrentValueIfItemRemoved(item)
+                            deleteCurrentValueIfItemRemoved(item, survivors)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         deleteCurrentValueIfItemRemoved(oldValue as T)
