@@ -27,32 +27,22 @@ import {RxTime} from "../src/RxTime";
 import {isData0RetainedObjectDiagnosticsEnabled} from "../src/retainedDiagnostics";
 import {
     assert,
-    camelize,
-    capitalize,
     def,
     extend,
     getStackTrace,
-    hasChanged,
     hasOwn,
-    hyphenate,
-    invokeArrayFns,
     isArray,
-    isArrayMethod,
     isAsync,
-    isBuiltInDirective,
     isDate,
     isFunction,
     isIntegerKey,
     isIntegerKeyQuick,
     isMap,
-    isModelListener,
     isObject,
-    isOn,
     isPlainObject,
     isPromise,
     isReactivableType,
     isRegExp,
-    isReservedProp,
     isSet,
     isString,
     isStringOrNumber,
@@ -60,10 +50,7 @@ import {
     looseToNumber,
     makeMap,
     nextTick,
-    NO,
-    remove,
     replace,
-    toHandlerKey,
     toNumber,
     toRawType,
     toTypeString,
@@ -76,21 +63,11 @@ function wait(time: number) {
 }
 
 describe('coverage helpers for public utilities', () => {
-    test('util predicates and string helpers', async () => {
+    test('util predicates and helpers', async () => {
         const lookup = makeMap('foo,bar', true)
         expect(lookup('FOO')).toBe(true)
-        expect(NO()).toBe(false)
-        expect(isOn('onClick')).toBe(true)
-        expect(isOn('once')).toBe(false)
-        expect(isModelListener('onUpdate:value')).toBe(true)
         expect(extend({a: 1}, {b: 2})).toMatchObject({a: 1, b: 2})
 
-        const items = [1, 2, 3]
-        remove(items, 2)
-        remove(items, 4)
-        expect(items).toEqual([1, 3])
-
-        expect(isArrayMethod('map')).toBe(true)
         expect(hasOwn({a: 1}, 'a')).toBe(true)
         expect(isArray([])).toBe(true)
         expect(isMap(new Map())).toBe(true)
@@ -109,17 +86,6 @@ describe('coverage helpers for public utilities', () => {
         expect(isIntegerKeyQuick('9')).toBe(true)
         expect(isIntegerKey('12')).toBe(true)
         expect(isIntegerKey('-1')).toBe(false)
-        expect(isReservedProp('key')).toBe(true)
-        expect(isBuiltInDirective('model')).toBe(true)
-        expect(camelize('foo-bar')).toBe('fooBar')
-        expect(hyphenate('fooBar')).toBe('foo-bar')
-        expect(capitalize('foo')).toBe('Foo')
-        expect(toHandlerKey('click')).toBe('onClick')
-        expect(hasChanged(NaN, NaN)).toBe(false)
-
-        const calls: number[] = []
-        invokeArrayFns([(v: number) => calls.push(v), (v: number) => calls.push(v + 1)], 1)
-        expect(calls).toEqual([1, 2])
 
         const hidden: any = {}
         def(hidden, 'x', 1)

@@ -13,12 +13,8 @@ function toShallowMatchObject(received: any, toMatch: any) {
             return item == received[key]
         }) && (received as any[]).length === toMatch.length
     } else {
-        // const al = Object.keys(toMatch).length
-        // const bl = Object.keys(received).length
-        // debugger
         passed = Object.keys(toMatch).length === Object.keys(received).length &&
             Object.keys(toMatch).every((key) => {
-                debugger
                 return toMatch[key] == received[key]
             })
     }

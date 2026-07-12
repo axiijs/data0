@@ -605,8 +605,13 @@ export class Computed extends ReactiveEffect {
         try {
             result = this.runEffect()
         } catch (err) {
-            restoreEffectDeps(this, previousDeps)
-            this.handleRecomputeError(err, true)
+            // CAUTION recomputeId 守卫：getter 内同步重入 destroy（延迟销毁在
+            //  completeTracking 已 flush）后 recomputeId 已推进——此时绝不能
+            //  restoreEffectDeps（会把已销毁 effect 重新订阅成僵尸），也不该再写状态。
+            if (this.recomputeId === recomputeId) {
+                restoreEffectDeps(this, previousDeps)
+                this.handleRecomputeError(err, true)
+            }
             throw err
         }
         if (this.recomputeId !== recomputeId) return
@@ -663,7 +668,9 @@ export class Computed extends ReactiveEffect {
         try {
             patchResult = this.runPatch()
         } catch (err) {
-            this.handleRecomputeError(err, true)
+            // recomputeId 守卫：patch 内同步重入 destroy（延迟销毁已 flush）后
+            //  不再回写状态/cleanPromise（destroy 已 settle）。
+            if (recomputeId === this.recomputeId) this.handleRecomputeError(err, true)
             throw err
         }
         if (recomputeId !== this.recomputeId) return
