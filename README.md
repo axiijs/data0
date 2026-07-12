@@ -60,6 +60,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 - batch 内的写入立即生效于**数据本身**(atom 的 `.raw`、`RxList.data`),但订阅者(含 computed 的重算与标脏)推迟到 batch 退出时统一执行。
 - 因此 **batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值**(AGENTS.md A2),batch 退出后恢复一致。需要读写一致时在 batch 外读,或使用 `autorun`(其自身保证一致性)。
+- **batch 退出后,所有派生结构必须等于从终态 source 全量重算的结果**(A1/A2 的"仍属缺陷"边界)。一次 digest 重放多条变更(batch 多操作、自定义延迟调度器积累)时,部分算子会自动回退全量重算以保证该不变量(见支持矩阵脚注),下游只应依赖结果一致性,不应依赖"必然增量"。
 - batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。
 
 ### 4. RxList 参数契约
@@ -73,13 +74,16 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 - **async getter 只追踪第一个 `await` 之前读取的依赖**;需要跨 await 追踪时使用 generator getter(逐段追踪)。
 - **async applyPatch 同样只在同步段建立追踪**;挂起期间到达的源变更会排队,由后续 patch 轮次消化,不丢失。
+- **destroy 取消在途 async patch**:destroy 后已挂起的 applyPatch 恢复执行时,其结果不再被应用,对已销毁实例的写入是 no-op(见 §6)。
 - async 错误经 `cleanPromise` reject 与 `error` 事件派发;两者都无人监听时 `console.error` 兜底,不产生 unhandled rejection。
 
 ### 6. 生命周期
 
 - **谁创建,谁销毁**:派生结构不随 source 自动销毁,需调用 `.destroy()`(或 `destroyComputed`)。派生结构销毁时负责清理自己创建的行级 effect 与惰性 meta(`length`/`keys`/`size` 等)。
-- 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理;不希望被收集时用 `ReactiveEffect.createDetached`。
-- `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次。
+- **destroy 对源模式与计算模式一视同仁**:`new RxList(arr)` 这类无 getter 的源结构同样派发 `destroy` 事件、清理 children 与惰性 meta。destroy 幂等,重复调用安全。
+- **destroy 后结构只读**:已销毁实例的变更方法(`splice`/`set`/`add`/`replace` 等)一律 no-op(dev 构建打印警告),数据保持销毁当刻的快照;destroy 也会取消在途 async patch 的后续应用。销毁的派生结构从此不再接收 source 的任何更新。
+- 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理(包括其 `context.onCleanup` 注册的清理与惰性 meta);不希望被收集时用 `ReactiveEffect.createDetached`。
+- `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次;`map` 回退全量重算时,旧行的 cleanup 同样各执行一次。
 
 ## 派生结构 × 源操作支持矩阵
 
@@ -89,7 +93,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 |---|---|---|---|
 | `RxList.map` | 增量 | 增量 | 增量 |
 | `RxList.filter` | 增量 | 增量 | 重建(按 indicator 顺序) |
-| `RxList.toSorted` | 增量 | 增量 | 无关 |
+| `RxList.toSorted` | 增量(等值 tie→重算) | 增量(等值 tie→重算) | 无关 |
 | `RxList.slice` | 增量(负边界→重算) | 增量 | 重算 |
 | `RxList.concat` | 增量(批量多条→重算) | 增量 | 重算 |
 | `RxList.groupBy` | 增量 | 增量 | 组内重排 |
@@ -99,9 +103,11 @@ doubled.destroy(); evens.destroy(); list.destroy()
 | `createSelection` / `createSelections` | 增量 | 增量 | 增量 |
 | `createIndexKeySelection` | 增量 + 指示器按 index 校正 | 增量 | 增量 + 指示器校正 |
 | `RxList.length`、`RxMap.keys/values/entries/size`、`RxSet.size` | 增量(`clear`/`replace` 部分重算) | 增量 | 无关 |
-| `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量 | — | — |
+| `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量(`replace` 的 `newItems` 按 Set 语义去重) | — | — |
 
-矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
+**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致,以下算子自动回退全量重算以保证与全量重算一致:`groupBy`、`slice`(任意多条)、`map`(仅当行使用 index atom——`mapFn(item, index)` 或行含响应式依赖时);`toSorted` 在插入元素与既有元素等值(tie)时同样回退,保证与稳定排序一致。回退是正确性措施,结果不变,只损失该次增量性。
+
+矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
 
 ## 架构语义(不作为缺陷)
 

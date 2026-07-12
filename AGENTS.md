@@ -59,14 +59,16 @@ Review 结论必须分为三类，不得混写：
 
 - 立案前先对照下方「架构决策与已知语义边界」一节：其中列出的行为是既定架构语义，观察到相关现象时引用该节说明，不得作为缺陷报告或擅自"修复"。
   资产：`__tests__/architectureSemantics.spec.ts`、README「架构语义」节。
-- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果。
-  资产：`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
+- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果，**含 batch/延迟调度下多条 triggerInfo 单次 digest 重放的序列**（triggerInfo 的 key/argv 是操作时位置，source.data 是重放时终态，patch 端凡按终态解释操作时位置都是缺陷；无法安全增量时用 `return false` 回退全量重算，并同步 README 支持矩阵的脚注）。
+  资产：`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）、`__tests__/batchReplayFuzz.spec.ts`（batch 多操作重放差分 + toSorted 等值 tie 差分）、`__tests__/lifecycleAndReplayFixes.spec.ts`（最小复现回归）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
 - mutation 测试至少覆盖 splice 的负数、越界、小数、`NaN`、`-0`，重复值，`set`，`reorder`，batch，以及回调抛错。
-  资产：`broadOperatorsFuzz` 的操作生成器（对抗参数域）、`__tests__/reproducedIssuesFixes.spec.ts`、`__tests__/reviewFixes.spec.ts`。
+  资产：`broadOperatorsFuzz` 的操作生成器（对抗参数域）、`batchReplayFuzz` 的 batch 操作生成器、`__tests__/reproducedIssuesFixes.spec.ts`、`__tests__/reviewFixes.spec.ts`。
 - 响应式回调变更后，除结果外还要验证依赖仍会触发、被删除 effect 已销毁、全局 tracking/session 栈恢复。
   资产：dev 不变量断言（`batch`/effect run 的栈深复原、digest 静止态、`RxList` 行级记账对齐——违约当场抛错，被全套测试被动执行）、`__tests__/invariantAssertions.spec.ts`（断言开火自检）。
-- async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序。
-  资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）。
+- destroy 语义必须对称：destroy 后不再接收更新（僵尸检查）、create+destroy 后活跃 effect 计数回到基线（泄漏检查）、源模式结构与计算模式一视同仁（destroy 事件、children、惰性 meta、`context.onCleanup`）。子类的销毁清理必须放进 `destroyResources` 钩子（唯一会被所有销毁入口——实例 `destroy()`、`destroyChildren`、`destroyComputed`——执行的位置），不得放在 `destroy()` 覆写里。已销毁结构的变更方法是 no-op。
+  资产：`__tests__/destroySemantics.spec.ts`（全派生族僵尸/泄漏横扫）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy 取消在途 async patch、no-op 变更）。
+- async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序；destroy 与在途 async patch 的交错也在此列。
+  资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。
   资产：`deepReviewFixes.spec.ts`（argv 透传契约测试）、README「RxList 参数契约」节。
 
