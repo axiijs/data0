@@ -4,7 +4,6 @@ import {assert, isAsync, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {CleanupFrame} from "./manualCleanup";
 import {
     markRetainedReactiveEffectKind,
     setRetainedReactiveEffectSource,
@@ -161,10 +160,6 @@ export class Computed extends ReactiveEffect {
     _effectFramesArray?: ReactiveEffect[][]
     get effectFramesArray(): ReactiveEffect[][] {
         return this._effectFramesArray ?? (this._effectFramesArray = [])
-    }
-    _keyToEffectFrames?: WeakMap<any, ReactiveEffect[]>
-    get keyToEffectFrames(): WeakMap<any, ReactiveEffect[]> {
-        return this._keyToEffectFrames ?? (this._keyToEffectFrames = new WeakMap())
     }
     manualTracking = false
     // TODO 需要一个更好的约定
@@ -841,9 +836,6 @@ export class Computed extends ReactiveEffect {
 
     }
 
-    hasDeps() {
-        return this.deps.length > 0
-    }
     // 给继承者在 apply catch 中用的 工具函数
     // CAUTION 以下全部是原型方法（原来是每实例的箭头函数字段），调用点都是 this.xxx() 的方法调用
     manualTrack(target: object, type: TrackOpTypes, key: unknown) {
@@ -883,25 +875,9 @@ export class Computed extends ReactiveEffect {
         this.settleCleanPromise()
         super.destroyResources()
     }
-    collectEffect(): () => CleanupFrame {
-        return ReactiveEffect.collectEffect()
-    }
     destroyEffect(effect: ReactiveEffect) {
         // 因为可能是 computed，destroy 和 ReactiveEffect 不一样，所以要调用它自己身的
         effect.destroy()
-    }
-    _cachedValues?: Map<any, any>
-    get cachedValues(): Map<any, any> {
-        return this._cachedValues ?? (this._cachedValues = new Map())
-    }
-    getCachedValue<T>(effect:any, createFn: () => T) : T{
-        // CAUTION 用 has 判断命中：createFn 可能返回 0/''/false/null 等 falsy 值，
-        //  用真值判断会导致这类值每次都重建。
-        const cached = this._cachedValues
-        if (cached?.has(effect)) return cached.get(effect)
-        const value = createFn()
-        this.cachedValues.set(effect, value)
-        return value
     }
 }
 

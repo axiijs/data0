@@ -594,17 +594,6 @@ describe('杂项修复', () => {
         }
     })
 
-    test('getCachedValue 缓存 falsy 值', () => {
-        const c = new Computed(function (this: Computed) { return 1 })
-        c.run([], true)
-        let createCount = 0
-        const key = {}
-        expect(c.getCachedValue(key, () => { createCount++; return 0 })).toBe(0)
-        expect(c.getCachedValue(key, () => { createCount++; return 0 })).toBe(0)
-        expect(createCount).toBe(1)
-        c.destroy()
-    })
-
     test('interceptor atom 持有 null 时属性赋值不抛 TypeError', () => {
         const a = atom<{ x?: number } | null>(null, (updater, handler) => [updater, handler])
         expect(() => { (a as any).x = 1 }).not.toThrow()

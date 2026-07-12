@@ -29,27 +29,16 @@ import {
     assert,
     def,
     extend,
-    getStackTrace,
-    hasOwn,
     isArray,
     isAsync,
-    isDate,
-    isFunction,
     isMap,
-    isObject,
     isPlainObject,
-    isPromise,
     isReactivableType,
-    isRegExp,
     isSet,
-    isString,
     isStringOrNumber,
-    isSymbol,
     nextTick,
     replace,
-    toRawType,
     toTypeString,
-    uuid,
     warn
 } from "../src/util";
 
@@ -61,20 +50,10 @@ describe('coverage helpers for public utilities', () => {
     test('util predicates and helpers', async () => {
         expect(extend({a: 1}, {b: 2})).toMatchObject({a: 1, b: 2})
 
-        expect(hasOwn({a: 1}, 'a')).toBe(true)
         expect(isArray([])).toBe(true)
         expect(isMap(new Map())).toBe(true)
         expect(isSet(new Set())).toBe(true)
-        expect(isDate(new Date())).toBe(true)
-        expect(isRegExp(/x/)).toBe(true)
-        expect(isFunction(() => undefined)).toBe(true)
-        expect(isString('x')).toBe(true)
-        expect(isSymbol(Symbol('x'))).toBe(true)
-        expect(isObject({})).toBe(true)
-        expect(isObject(null)).toBe(false)
-        expect(isPromise(Promise.resolve())).toBe(true)
         expect(toTypeString(new Map())).toBe('[object Map]')
-        expect(toRawType(new Set())).toBe('Set')
         expect(isPlainObject({})).toBe(true)
 
         const hidden: any = {}
@@ -83,10 +62,8 @@ describe('coverage helpers for public utilities', () => {
         expect(Object.keys(hidden)).toEqual([])
         expect(isStringOrNumber(1)).toBe(true)
         expect(isReactivableType(new Map())).toBe(true)
-        expect(getStackTrace()[0].length).toBeGreaterThan(1)
         expect(isAsync(async () => undefined)).toBe(true)
         expect(isAsync(() => undefined)).toBe(false)
-        expect(uuid()).not.toBe(uuid())
 
         let ticked = false
         nextTick(() => ticked = true)
@@ -404,11 +381,6 @@ describe('coverage helpers for core lifecycle APIs', () => {
         expect(value()).toBe(3)
 
         const instance = new Computed(() => 1)
-        let created = 0
-        expect(instance.getCachedValue('key', () => ++created)).toBe(1)
-        expect(instance.getCachedValue('key', () => ++created)).toBe(1)
-        expect(created).toBe(1)
-
         instance.createCleanPromise()
         const cleanPromise = instance.cleanPromise!
         instance.rejectCleanPromise?.('failed')

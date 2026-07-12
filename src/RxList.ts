@@ -1075,42 +1075,19 @@ export class RxList<T> extends Computed {
     }
     findIndex(matchFn:(item: T) => boolean): Atom<number> {
         const source = this
-        const searchedItemAndIndexes: { item:T, index:number, deleted:boolean }[] = []
-
-        let trackTargetToSearchItem: WeakMap<any, Set<{ item:T, index:number, deleted:boolean }>> = new WeakMap()
+        // 谓词是否读取过 reactive 数据：一旦为真，patch 入口一律回退全量重算。
+        // CAUTION 2026-H2 mutation 债务清理删除了这里的逐项增量 cache
+        //  （searchedItemAndIndexes/trackTargetToSearchItem/deleted 标记）：该 cache
+        //  只被"元素内部 reactive 变化"的增量分支消费，而 cache 非空 ⟺ 谓词读过
+        //  reactive 数据 ⟺ 入口的 hasItemReactiveDeps 门已经回退全量——分支构造性
+        //  不可达（mutation 审计中 36 个 no-coverage mutant 的来源），无 reactive
+        //  谓词的热路径还要为它每步搜索白付一次对象分配。
+        //  行为契约不变：README「增量(响应式谓词→重算)」。
         let hasItemReactiveDeps = false
 
-        const disposeAll = () => {
-            searchedItemAndIndexes.length = 0
-            trackTargetToSearchItem = new WeakMap()
-            hasItemReactiveDeps = false
-        }
-
-        function searchAndRemember(start:number, end: number, resultComputed: Computed) {
-            for(let current=start; current < Math.min(end, source.data.length);current++) {
-                const matchResult = matchAndRemember(current, resultComputed)
-                if (matchResult) {
-                    // 删掉后面的（deleted 标记即可；trackTargetToSearchItem 里的
-                    //  旧条目靠 deleted 跳过，reactive 谓词路径已在上方 return false
-                    //  回退全量，此处仅服务无 reactive 依赖的增量热路径）
-                    const deletedItems = searchedItemAndIndexes.splice(current+1)
-                    deletedItems.forEach(item => item.deleted = true)
-                    return current
-                }
-
-            }
-            return -1
-        }
-
-        function matchAndRemember(current:number, resultComputed: Computed) {
-            const previousItem = searchedItemAndIndexes[current]
-            if (previousItem) previousItem.deleted = true
-            const currentItem =  {
-                item: source.data[current],
-                index:current,
-                deleted:false
-            }
-            searchedItemAndIndexes[current] =currentItem
+        // 运行一次谓词并登记其 reactive 读取；track 归属 resultComputed
+        //（reactive 谓词的依赖订阅由此建立，变化时触发 patch → 全量回退）。
+        function matchOne(current:number, resultComputed: Computed) {
             resultComputed.autoTrack()
             const getFrame = notifier.collectTrackTarget()
             let frameClosed = false
@@ -1128,30 +1105,23 @@ export class RxList<T> extends Computed {
             }
 
             if (trackTargets!.length) hasItemReactiveDeps = true
-            trackTargets!.forEach((target) => {
-                let items = trackTargetToSearchItem.get(target)
-                if (!items) {
-                    trackTargetToSearchItem.set(target, items = new Set())
-                }
-                items.add(currentItem)
-            })
             return matchResult!
         }
 
-        function checkOne(index: number, resultComputed: Computed) {
-            if (matchAndRemember(index, resultComputed)) {
-                result(index)
-                const deletedItems = searchedItemAndIndexes.splice(index+1)
-                deletedItems.forEach(item => item.deleted = true)
+        function search(start:number, end: number, resultComputed: Computed) {
+            for(let current=start; current < Math.min(end, source.data.length);current++) {
+                if (matchOne(current, resultComputed)) return current
             }
+            return -1
         }
 
         const result = computed<number>(
             function computation(this: Computed) {
-                disposeAll()
+                // 全量重算重新判定谓词是否 reactive（例如列表被替换成纯值行后回到增量热路径）
+                hasItemReactiveDeps = false
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
-                return searchAndRemember(0, Infinity, this)
+                return search(0, Infinity, this)
             },
             function applyPatch(this: Computed, data: Atom<number>, triggerInfos){
                 // 增量 cache 无法逐 dep 精确退订/重订。只要 predicate 读取过
@@ -1206,60 +1176,25 @@ export class RxList<T> extends Computed {
                             } else if(this.data.raw === -1 || (key as number) < this.data.raw) {
                                 // 当前没有匹配（-1）时任何位置的变化都可能产生新匹配；
                                 // 有匹配时只有更小的 index 才可能替换。快速验证这一个是不是新的 match。
-                                checkOne(key as number, this)
+                                if (matchOne(key as number, this)) data(key as number)
                             }
                         }
 
                         // 需要从 startFindingIndex 开始重找，startFindingIndex 前面不需要
                         if (startFindingIndex !== Infinity) {
-                            data(searchAndRemember(startFindingIndex, Infinity, this))
+                            data(search(startFindingIndex, Infinity, this))
                         }
                     } else {
-                        // 元素内部 reactive 变化：无 reactive 谓词时 trackTargetToSearchItem
-                        // 通常为空，走下方未知来源回退。历史增量 cache 用 deleted 标记淘汰。
-                        const itemCandidateSet = trackTargetToSearchItem.get(triggerSource)
-                        if (itemCandidateSet) {
-                            const itemCandidates = Array.from(itemCandidateSet)
-
-                            let newIndex = -1
-                            let lastMatchedChanged = false
-                            for(const item of itemCandidates) {
-                                if (!item.deleted) {
-                                    // 重算的时候就要把上次的删掉，因为 matchAndRemember 中会重新生成个新对象。
-                                    itemCandidateSet!.delete(item)
-                                    const matchResult = matchAndRemember(item.index, this)
-                                    if (!lastMatchedChanged && item.index ===data.raw) lastMatchedChanged = true
-                                    if (matchResult) {
-                                        const deletedItems = searchedItemAndIndexes.splice(item.index+1)
-                                        deletedItems.forEach(item => item.deleted = true)
-                                        newIndex = item.index
-                                        break
-                                    }
-                                } else {
-                                    itemCandidateSet.delete(item)
-                                }
-                            }
-                            // 只要找到了，index 肯定更小，应为我们是往前面建立的观察
-                            if (newIndex!==-1) {
-                                data(newIndex)
-                            } else if (lastMatchedChanged) {
-                                // 上一次的匹配被弄丢且前面没有新匹配，从旧位置继续往后搜
-                                data(searchAndRemember(data.raw+1, Infinity, this))
-                            }
-                        } else {
-                            // 未知来源的变化，无法增量处理，提前结束并触发全量重算
-                            patchSuccess = false
-                            break
-                        }
+                        // 非 source 的触发只可能来自谓词曾读取的 reactive 数据，该情形
+                        // 已被入口的 hasItemReactiveDeps 全量回退拦截；防御性兜底回退。
+                        patchSuccess = false
+                        break
                     }
                 }
                 // 显式 return false 触发重算
                 return patchSuccess
             },
-            true,
-            {
-                onDestroy:disposeAll
-            }
+            true
         )
 
         return result!
