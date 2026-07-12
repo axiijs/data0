@@ -19,6 +19,7 @@
   "type": "module",
   "scripts": {
     "test": "vitest",
+    "test:prod": "vitest run -c vitest.prod.config.ts",
     "build": "vite build",
     "release": "node scripts/release.js",
     "bench": "vitest bench",

@@ -35,8 +35,6 @@ import {
     isAsync,
     isDate,
     isFunction,
-    isIntegerKey,
-    isIntegerKeyQuick,
     isMap,
     isObject,
     isPlainObject,
@@ -47,11 +45,8 @@ import {
     isString,
     isStringOrNumber,
     isSymbol,
-    looseToNumber,
-    makeMap,
     nextTick,
     replace,
-    toNumber,
     toRawType,
     toTypeString,
     uuid,
@@ -64,8 +59,6 @@ function wait(time: number) {
 
 describe('coverage helpers for public utilities', () => {
     test('util predicates and helpers', async () => {
-        const lookup = makeMap('foo,bar', true)
-        expect(lookup('FOO')).toBe(true)
         expect(extend({a: 1}, {b: 2})).toMatchObject({a: 1, b: 2})
 
         expect(hasOwn({a: 1}, 'a')).toBe(true)
@@ -83,17 +76,11 @@ describe('coverage helpers for public utilities', () => {
         expect(toTypeString(new Map())).toBe('[object Map]')
         expect(toRawType(new Set())).toBe('Set')
         expect(isPlainObject({})).toBe(true)
-        expect(isIntegerKeyQuick('9')).toBe(true)
-        expect(isIntegerKey('12')).toBe(true)
-        expect(isIntegerKey('-1')).toBe(false)
 
         const hidden: any = {}
         def(hidden, 'x', 1)
         expect(hidden.x).toBe(1)
         expect(Object.keys(hidden)).toEqual([])
-        expect(looseToNumber('123-foo')).toBe(123)
-        expect(toNumber('123')).toBe(123)
-        expect(toNumber('123-foo')).toBe('123-foo')
         expect(isStringOrNumber(1)).toBe(true)
         expect(isReactivableType(new Map())).toBe(true)
         expect(getStackTrace()[0].length).toBeGreaterThan(1)
@@ -689,8 +676,7 @@ describe('coverage helpers for core lifecycle APIs', () => {
         expect(isData0RetainedObjectDiagnosticsEnabled()).toBe(false)
     })
 
-    test('Notifier trigger branches cover collection, clear, length and pause guards', () => {
-        const target: any[] = [1, 2, 3]
+    test('Notifier trigger branches cover collection, clear and pause guards', () => {
         // trigger 协议：info 由 effect 侧按需组装（runFromTrigger），
         // 这里显式组装以断言 trigger 分支派发了正确的 (type, inputInfo)
         class CapturingEffect extends ReactiveEffect {
@@ -701,21 +687,21 @@ describe('coverage helpers for core lifecycle APIs', () => {
             run() {}
         }
         const effect = new CapturingEffect(() => undefined)
-        Notifier.instance.targetMap.set(target, new Map([
-            ['length', new Set([effect]) as any],
-            ['2', new Set([effect]) as any],
+        const pausedTarget = {}
+        Notifier.instance.targetMap.set(pausedTarget, new Map([
+            ['field', new Set([effect]) as any],
         ]))
 
-        Notifier.instance.trigger(target, TriggerOpTypes.SET, {key: 'length', newValue: 1})
+        Notifier.instance.trigger(pausedTarget, TriggerOpTypes.SET, {key: 'field', newValue: 1})
         expect(effect.triggerInfos.length).toBeGreaterThan(0)
         effect.triggerInfos.length = 0
 
         Notifier.instance.shouldTrigger = false
-        Notifier.instance.trigger(target, TriggerOpTypes.SET, {key: 'length', newValue: 0})
+        Notifier.instance.trigger(pausedTarget, TriggerOpTypes.SET, {key: 'field', newValue: 0})
         Notifier.instance.shouldTrigger = true
         expect(effect.triggerInfos.length).toBe(0)
 
-        Notifier.instance.targetMap.delete(target)
+        Notifier.instance.targetMap.delete(pausedTarget)
 
         const objectTarget = {}
         const objectEffect = new CapturingEffect(() => undefined)

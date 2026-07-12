@@ -54,6 +54,7 @@ Review 结论必须分为三类，不得混写：
   8. destroy 僵尸行为横扫 + destroy 事件对称性检查（直接断言"destroy 后不再接收更新"；不依赖 retainedDiagnostics——它只统计 active=true 的 effect，源模式结构在其中完全不可见）。
   9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`（实例回归）、`__tests__/sparseSetOperatorsSweep.spec.ts`（"OOB set × 全派生算子族不崩溃且可恢复"的等价类横扫，含 batch 多 info 回退路径）。
   10. 既有攻击轴 × 未覆盖算子族的组合横扫（重复值域 × selection 家族、undefined 合法元素 × toSorted 的 EXPLICIT_KEY_CHANGE 路径、链式深层管道差分、回调重入）；发现并修复 createSelection 重复 item indicator 漂移（`itemToIndicators` 改 Set 广播 + 按身份精确移除）与 toSorted 变更含 undefined 时与全量 sort 分叉（回退全量重算）两个缺陷类；资产：`__tests__/deepReview2026H2Findings.spec.ts`（实例回归 + 两个等价类的常驻差分 sweep：重复 item 域 × selection 的"indicator ≡ currentValues 成员"不变量、undefined 值域 × toSorted 的"增量 ≡ 全量 sort"不变量，双 compare 形态）。既有 fuzz 的盲区模式：差分 fuzz 只喂"单一算子 × 唯一/重复数值域"，selection（值→indicator 的 Map 记账）与"undefined 作为合法元素值"两个维度都不在任何生成器的值域里。
+  11. 模型比对（系统级管道网 ≡ 朴素参考模型）：多源 × 多派生 × 链式管道 × selection × RxSet/RxMap 派生组成一张网，随机操作序列（约 1/3 打包进 batch 形成多 info 重放）后逐节点与朴素 JS 全量重算比对；同轮引入生产语义 CI 差分（`pnpm test:prod`，`__DEV__:false` 编译源码跑同套测试，dev 特化文件排除清单见 `vitest.prod.config.ts`）。首跑均未发现反例。资产：`__tests__/modelComparisonFuzz.spec.ts`（同时是 RxSet 运算族/RxMap 派生/createSelection 的 batchReplay 列与链式管道的对账资产）、`vitest.prod.config.ts` + CI 步骤。
 
 ### 3.3 覆盖清单纪律（盲格必须可见）
 
@@ -82,6 +83,8 @@ Review 结论必须分为三类，不得混写：
   资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。
   资产：`deepReviewFixes.spec.ts`（argv 透传契约测试）、README「RxList 参数契约」节。
+- 消费 `triggerInfo.oldValue`/`newValue` 的派生结构不得用 `!== undefined` 判断"有无"——undefined 是 RxList 的合法元素值，协议里"值为 undefined"与"无值"带内不可区分。无法按 key/methodResult 定位时回退全量重算（toSorted 先例）。加性 `hasOldValue` 字段的提案经 2026-H2 评估暂不引入：回退已保证正确性、无消费者需要 undefined 的增量处理，单方面加协议面属投机设计；若未来出现真实需求，须与 axii/axle 同步做加性扩展。
+  资产：`deepReview2026H2Findings.spec.ts`（undefined 值域 sweep）、本条规则。
 
 ### 5. Review 输出格式
 
@@ -127,6 +130,7 @@ Review 结论必须分为三类，不得混写：
 ```bash
 pnpm install --frozen-lockfile
 pnpm test --run
+pnpm test:prod        # 生产语义差分(__DEV__:false,排除 dev 特化文件)
 pnpm type-check
 pnpm build
 pnpm exec vitest run --coverage
