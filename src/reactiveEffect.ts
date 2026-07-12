@@ -310,9 +310,13 @@ export class ReactiveEffect extends ManualCleanup {
             throw new Error('recursive effect call')
         }
 
-        // FIXME 执行到一般的 generator 如何处理？？应该形成队列还是直接取消？如果是 fullComputed，应该取消。
-        //  如果是当成副作用，那么应该形成队列。
-        if (this.isRunningAsync) {}
+        // FIXME 执行到一半的 generator 被再次 trigger 时：允许重入启动新一轮
+        //  runGenerator（不在此处排队或取消）。Computed 靠 recomputeId 丢弃过期轮次的
+        //  结果；基类 ReactiveEffect 的并发 generator 由调用方自行避免或容忍。
+        //  （曾考虑排队/取消，与 Computed 的 force/recomputeId 模型冲突更大。）
+        if (this.isRunningAsync) {
+            // 有意空：不短路，落入下方重新启动 async 路径。
+        }
 
         if(!this.isAsync) {
             // CAUTION dev 不变量：一次同步 run 结束后，全局作用域栈与追踪开关栈的

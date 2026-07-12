@@ -191,6 +191,18 @@ describe('atom basic', () => {
         expect(Object.getPrototypeOf(value)).toBe(Object.prototype)
     })
 
+    test('object atom proxy property set notifies subscribers', () => {
+        const value = atom({count: 1})
+        let seen = 0
+        const stop = autorun(() => {
+            seen = value.count
+        }, true)
+        expect(seen).toBe(1)
+        value.count = 5
+        expect(seen).toBe(5)
+        stop()
+    })
+
     test('atom with interceptor keeps proxy path', () => {
         const value = atom(1, (updater, handler) => {
             return [updater, {

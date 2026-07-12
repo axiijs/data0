@@ -10,31 +10,7 @@ export function makeMap(
     return expectsLowerCase ? val => !!map[val.toLowerCase()] : val => !!map[val]
 }
 
-
-/**
- * Always return false.
- */
-export const NO = () => false
-
-const onRE = /^on[^a-z]/
-export const isOn = (key: string) => onRE.test(key)
-
-export const isModelListener = (key: string) => key.startsWith('onUpdate:')
-
 export const extend = Object.assign
-
-export const remove = <T>(arr: T[], el: T) => {
-    const i = arr.indexOf(el)
-    if (i > -1) {
-        arr.splice(i, 1)
-    }
-}
-
-
-const arrayProperties = Object.getOwnPropertyNames(Array.prototype);
-const arrayMethods = new Set(arrayProperties.filter(prop => typeof Array.prototype[prop as keyof typeof Array.prototype] === 'function'))
-export const isArrayMethod = (key: string) => arrayMethods.has(key)
-
 
 const hasOwnProperty = Object.prototype.hasOwnProperty
 export const hasOwn = (
@@ -87,67 +63,6 @@ export const isIntegerKey = (key: unknown) =>
     key !== 'NaN' &&
     key[0] !== '-' &&
     '' + parseInt(key, 10) === key
-
-export const isReservedProp = /*#__PURE__*/ makeMap(
-    // the leading comma is intentional so empty string "" is also included
-    ',key,ref,ref_for,ref_key,' +
-    'onVnodeBeforeMount,onVnodeMounted,' +
-    'onVnodeBeforeUpdate,onVnodeUpdated,' +
-    'onVnodeBeforeUnmount,onVnodeUnmounted'
-)
-
-export const isBuiltInDirective = /*#__PURE__*/ makeMap(
-    'bind,cloak,else-if,else,for,html,if,model,on,once,pre,show,slot,text,memo'
-)
-
-const cacheStringFunction = <T extends (str: string) => string>(fn: T): T => {
-    // @ts-ignore
-    const cache: Record<string, string> = Object.create(null)
-    return ((str: string) => {
-        const hit = cache[str]
-        return hit || (cache[str] = fn(str))
-    }) as T
-}
-
-const camelizeRE = /-(\w)/g
-/**
- * @private
- */
-export const camelize = cacheStringFunction((str: string): string => {
-    return str.replace(camelizeRE, (_, c) => (c ? c.toUpperCase() : ''))
-})
-
-const hyphenateRE = /\B([A-Z])/g
-/**
- * @private
- */
-export const hyphenate = cacheStringFunction((str: string) =>
-    str.replace(hyphenateRE, '-$1').toLowerCase()
-)
-
-/**
- * @private
- */
-export const capitalize = cacheStringFunction(
-    (str: string) => str.charAt(0).toUpperCase() + str.slice(1)
-)
-
-/**
- * @private
- */
-export const toHandlerKey = cacheStringFunction((str: string) =>
-    str ? `on${capitalize(str)}` : ``
-)
-
-// compare whether a value has changed, accounting for NaN.
-export const hasChanged = (value: any, oldValue: any): boolean =>
-    !Object.is(value, oldValue)
-
-export const invokeArrayFns = (fns: Function[], arg?: any) => {
-    for (let i = 0; i < fns.length; i++) {
-        fns[i](arg)
-    }
-}
 
 export const def = (obj: object, key: string | symbol, value: any) => {
     Object.defineProperty(obj, key, {

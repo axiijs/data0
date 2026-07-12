@@ -72,7 +72,8 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
                 return arguments.length > 1 ? finalUpdater.call(_this, newValue): finalUpdater.call(_this)
             }
 
-            // TODO 是不是也要像 reactive 一样层层包装才行？？？，不然当把这个值传给 dom 元素的时候，它就已经不能被识别出来，也就不能 reactive 了。
+            // TODO 深包装：嵌套 plain object 目前不会自动变成 atom；深路径直写不触发。
+            //  顶层属性经本 proxy 的 set 陷阱会触发（见下方 set）。
             if (isPlainObject(value)) {
                 trackAtomValue(finalProxy)
             }
@@ -80,17 +81,30 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
             return Reflect.get(isPlainObject(value) ? value : finalUpdater, key)
         },
         set(target, key, newValue) {
-            // CAUTION 注意这里是不 trigger 的
             // CAUTION 必须排除 null（typeof null === 'object'）：Reflect.set(null, ...)
             //  会直接 TypeError。
             if (value !== null && typeof value === 'object') {
-                return Reflect.set(value, key, newValue)
+                // 浅属性写入：通过 atom proxy 的 set 陷阱修改对象属性时通知订阅者。
+                // 只覆盖顶层属性（obj.x = ...）；深路径直写（obj.raw.nested.n = ...
+                // 或先取出嵌套对象再改）仍无 Proxy 包裹，不会触发——需 atom(新对象)
+                // 整替换。这与"方法/proxy 陷阱即变更边界"一致。
+                const oldProp = Reflect.get(value, key)
+                const ok = Reflect.set(value, key, newValue)
+                if (ok && !Object.is(oldProp, newValue)) {
+                    notifier.trigger(finalProxy, TriggerOpTypes.ATOM, {
+                        key: 'value',
+                        newValue: value,
+                        oldValue: value,
+                    })
+                }
+                return ok
             }
             // 与不带 interceptor 的 primitive atom 行为一致：属性落在 updater 函数
             // 对象上（get 分支对非对象值也是转发到 finalUpdater，读写对称）。
             return Reflect.set(finalUpdater, key, newValue)
         },
-        // TODO 有必要要吗？？？
+        // Proxy 对象 atom 的原型转发：让 Object.getPrototypeOf(atom({})) === Object.prototype，
+        // 便于下游做 plain-object 识别。
         getPrototypeOf(): object | null {
             if (value && typeof value === 'object') return Reflect.getPrototypeOf(value as object)
             return null

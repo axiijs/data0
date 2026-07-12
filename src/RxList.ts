@@ -79,8 +79,8 @@ const EMPTY_ITEM_FRAME = Object.freeze([]) as unknown as ReactiveEffect[]
  * 而不是等下游行为漂移。模块级函数且仅在 __DEV__ 分支引用：
  * 生产构建连函数体一起被 DCE 移除，零运行时与零体积开销。
  * 全量值扫描是 O(n)，仅存在 atomIndexes（有行级 index 订阅）时发生。
- * CAUTION 容忍稀疏：越界 set（契约内透传）会让 data 变长/出洞而不维护 atomIndexes,
- *  "更短/有洞"不算违约；"更长"或"存在的值漂移"才是 splice/reorder 记账缺陷。
+ * CAUTION 容忍稀疏：越界 set 会让 data 出洞；set 只为**写入的** index 分配
+ *  atomIndex（洞位可空）。"更长"或"存在的值漂移"才是 splice/reorder 记账缺陷。
  */
 function assertAtomIndexesAligned(list: RxList<any>) {
     if (!list.atomIndexes) return
@@ -355,6 +355,9 @@ export class RxList<T> extends Computed {
     //  行为与普通数组赋值一致（可能产生稀疏数组、length computed 不会更新），trigger 原样透传
     //  key，由下游（axii/axle 等渲染框架）自行拒绝或归一化。不要在这里改走 splice 语义：
     //  下游的结构化错误契约（以及 set(Infinity) 这类 key）都依赖透传行为。
+    // CAUTION 若已有 atomIndexes（map 使用了 index），越界 set 必须在 trigger 前为写入位
+    //  分配 index atom，并允许 atomIndexes 出洞与 data 对齐——否则 map(index) patch/
+    //  全量重算会对 undefined 调用 mapFn，抛 TypeError 并永久毒化派生链。
     set(index: number, value: T) {
         if (!this.active) {
             warn('mutating a destroyed RxList is a no-op')
@@ -363,12 +366,26 @@ export class RxList<T> extends Computed {
         const oldValue = this.data[index]
         this.data[index] = value
 
+        if (this.atomIndexes && Number.isInteger(index) && index >= 0) {
+            this.ensureAtomIndex(index)
+        }
+
         // 这里还是用 trigger TriggerOpTypes.SET，因为系统在处理 TriggerOpTypes.SET 的时候还会对 listLike 的数据 触发 ITERATE_KEY。
         this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: value, oldValue})
         this.trigger(this, TriggerOpTypes.EXPLICIT_KEY_CHANGE, { key: index, newValue: value, oldValue, methodResult: oldValue})
         this.sendTriggerInfos()
 
+        if (__DEV__) assertAtomIndexesAligned(this)
         return oldValue
+    }
+    /**
+     * @internal
+     * 保证 atomIndexes[index] 存在（必要时撑长并分配）。洞位不预先分配。
+     */
+    ensureAtomIndex(index: number): Atom<number> {
+        if (!this.atomIndexes) this.atomIndexes = []
+        if (this.atomIndexes.length <= index) this.atomIndexes.length = index + 1
+        return this.atomIndexes[index] ?? (this.atomIndexes[index] = atom(index))
     }
     reorder(newOrder: Order[], reorderInfo = createReorderPatchInfo('reorder', newOrder)) {
         if (!this.active) {
@@ -647,9 +664,15 @@ export class RxList<T> extends Computed {
         // 探测一行：mapFn 恰好执行一次；捕获到依赖/子 effect 时升级为常驻的行级
         // Computed（探测期间建立的订阅原样转移），无依赖行零对象分配。
         // 返回 [mapFn 返回值, 行级 effect frame]。
+        function indexAtomFor(index: number): Atom<number> {
+            // useIndex 或行级依赖升级后都会需要可靠的 index atom；越界 set 造成的
+            // 稀疏洞不能把 undefined 传给用户 mapFn。
+            return source.ensureAtomIndex(index)
+        }
+
         function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined): [U, ReactiveEffect[]] {
             const probe = itemProbe ?? (itemProbe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe()))
-            const value = probe.probe(() => mapFn(item, source.atomIndexes?.[index]!, mapContext!)) as U
+            const value = probe.probe(() => mapFn(item, useIndex || addedAtomIndexesDep ? indexAtomFor(index) : source.atomIndexes?.[index]!, mapContext!)) as U
             if (!probe.hasCaptures()) return [value, EMPTY_ITEM_FRAME]
 
             // CAUTION 只有依赖变化需要重算的行才需要 index atom（重算时行的位置可能已变化）；
@@ -660,7 +683,7 @@ export class RxList<T> extends Computed {
                     source.addAtomIndexesDep()
                     addedAtomIndexesDep = true
                 }
-                newItemIndex = source.atomIndexes![index]!
+                newItemIndex = indexAtomFor(index)
             }
             const rowComputed: Computed = new Computed(() => {
                 // CAUTION 特别注意这里面的变量，我们只希望 track 用户 mapFn 里面用到的外部 reactive 对象，不希望 track 到自己的 key/index。
@@ -720,7 +743,14 @@ export class RxList<T> extends Computed {
 
                 const result: U[] = []
                 const sourceData = source.data
+                // 与 Array#map 一致：跳过稀疏洞，避免对洞位传 undefined index atom /
+                // 把洞物化成显式 undefined 行（与增量 set 越界路径的稀疏结果分歧）。
+                result.length = sourceData.length
+                if (useContext) cleanupSlots!.length = sourceData.length
+                this.effectFramesArray!.length = sourceData.length
                 for (let i = 0; i < sourceData.length; i++) {
+                    if (!Object.prototype.hasOwnProperty.call(sourceData, i)) continue
+
                     let mapContext: MapContext|undefined
                     if (useContext) {
                         const row = createRowContext()
@@ -729,7 +759,7 @@ export class RxList<T> extends Computed {
                     }
 
                     if (options?.skipItemEffect) {
-                        result[i] = mapFn(sourceData[i], source.atomIndexes?.[i]!, mapContext!)
+                        result[i] = mapFn(sourceData[i], useIndex ? indexAtomFor(i) : source.atomIndexes?.[i]!, mapContext!)
                         // 共享的 frozen 空 frame：skipItemEffect 模式下每行必然无 effect，
                         // 不为对齐 splice 索引的占位再逐行分配空数组
                         this.effectFramesArray![i] = EMPTY_ITEM_FRAME
@@ -787,7 +817,7 @@ export class RxList<T> extends Computed {
                             let newItem: U
                             const newIndex = index + spliceStart
                             if (options?.skipItemEffect) {
-                                newItem = mapFn(newItemsInArg, source.atomIndexes?.[newIndex]!, mapContext!)
+                                newItem = mapFn(newItemsInArg, useIndex || addedAtomIndexesDep ? indexAtomFor(newIndex) : source.atomIndexes?.[newIndex]!, mapContext!)
                                 effectFrames![index] = EMPTY_ITEM_FRAME
                             } else {
                                 const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext)
@@ -1022,8 +1052,9 @@ export class RxList<T> extends Computed {
             for(let current=start; current < Math.min(end, source.data.length);current++) {
                 const matchResult = matchAndRemember(current, resultComputed)
                 if (matchResult) {
-                    // 删掉后面的
-                    // FIXME 似乎没有处理 trackTargetToSearchItem 中的 cache
+                    // 删掉后面的（deleted 标记即可；trackTargetToSearchItem 里的
+                    //  旧条目靠 deleted 跳过，reactive 谓词路径已在上方 return false
+                    //  回退全量，此处仅服务无 reactive 依赖的增量热路径）
                     const deletedItems = searchedItemAndIndexes.splice(current+1)
                     deletedItems.forEach(item => item.deleted = true)
                     return current
@@ -1138,10 +1169,8 @@ export class RxList<T> extends Computed {
                             data(searchAndRemember(startFindingIndex, Infinity, this))
                         }
                     } else {
-                        // 任何其他变化都完全重算
-                        // 元素计算的内部变化。找到受影响的 items，从小的开始计算。一旦找到就停下。
-                        //  一直到所有响应完还有没有找到的话，就继续 search。
-                        // CAUTION 一定要切片，否则后面 matchAndRemember 会死循环
+                        // 元素内部 reactive 变化：无 reactive 谓词时 trackTargetToSearchItem
+                        // 通常为空，走下方未知来源回退。历史增量 cache 用 deleted 标记淘汰。
                         const itemCandidateSet = trackTargetToSearchItem.get(triggerSource)
                         if (itemCandidateSet) {
                             const itemCandidates = Array.from(itemCandidateSet)
@@ -1155,26 +1184,21 @@ export class RxList<T> extends Computed {
                                     const matchResult = matchAndRemember(item.index, this)
                                     if (!lastMatchedChanged && item.index ===data.raw) lastMatchedChanged = true
                                     if (matchResult) {
-                                        // 删掉后面的
-                                        // FIXME 更好地处理 trackTargetToSearchItem 中的 cache
                                         const deletedItems = searchedItemAndIndexes.splice(item.index+1)
                                         deletedItems.forEach(item => item.deleted = true)
                                         newIndex = item.index
                                         break
                                     }
                                 } else {
-                                    // FIXME 顺便删除一下，应该有更好的方式
-                                    trackTargetToSearchItem.get(triggerSource)!.delete(item)
+                                    itemCandidateSet.delete(item)
                                 }
                             }
                             // 只要找到了，index 肯定更小，应为我们是往前面建立的观察
                             if (newIndex!==-1) {
                                 data(newIndex)
-                            } else {
-                                // TODO 上一次的值如果也受影响了变成不匹配的了，并且受影的也没有匹配的，就要从上一次继续往后搜索
-                                if (lastMatchedChanged) {
-                                    data(searchAndRemember(data.raw+1, Infinity, this))
-                                }
+                            } else if (lastMatchedChanged) {
+                                // 上一次的匹配被弄丢且前面没有新匹配，从旧位置继续往后搜
+                                data(searchAndRemember(data.raw+1, Infinity, this))
                             }
                         } else {
                             // 未知来源的变化，无法增量处理，提前结束并触发全量重算
@@ -1581,7 +1605,9 @@ export class RxList<T> extends Computed {
         }))
     }
 
-    // FIXME onUntrack 的时候要把 indexKeyDeps 里面的 dep 都删掉。因为 Effect 没管这种情况。
+    // indexKeyDeps 的退订清扫：Notifier 不会在 effect 退订时回调 RxList，
+    // 因此改为在结构变更入口 pruneIndexKeyDeps 惰性删除空 dep（见该方法注释）。
+    // onUntrack 钩子保留为空，以兼容可能的外部调用。
     /**
      * @internal
      */
@@ -1979,7 +2005,7 @@ export function createSelections<T>(source: RxList<T>, ...args: SelectionArgs<T>
     return createRxListWithSelectionInners(source, ...args.map(arg => createSelectionInner(source, ...arg)))
 }
 
-// TODO multiple
+// 按 index 选中：currentValues 为 Atom 时单选，为 RxSet 时多选（选中的是位置，不随 item 移动）。
 export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxSet<number>|Atom<null|number>, autoResetValue = false): RxList<[T, Atom<boolean>]> {
 
     function trackCurrentValues(list: Computed) {
