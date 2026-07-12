@@ -14,15 +14,7 @@ import {RxList} from '../src/RxList.js'
  * source.data 全量重算。这正是 A1/A2 划出的"仍属缺陷"边界（batch 结束后必须
  * 与全量重算一致）。
  */
-function mulberry32(seed: number) {
-    let a = seed >>> 0
-    return function () {
-        a |= 0; a = (a + 0x6D2B79F5) | 0
-        let t = Math.imul(a ^ (a >>> 15), 1 | a)
-        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-    }
-}
+import {mulberry32} from './fuzzKit.js'
 
 describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', () => {
     for (const seed of [7, 8, 9, 101, 20260712]) {

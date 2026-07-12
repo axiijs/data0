@@ -2,6 +2,8 @@ import {describe, expect, test} from 'vitest'
 import {createSelection, createSelections, RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
 import {atom} from '../src/atom.js'
+import {destroyComputed} from '../src/computed.js'
+import {mulberry32, withUndefined} from './fuzzKit.js'
 
 /**
  * 2026-07 深度评估轮（方法 10：既有攻击轴 × 未覆盖算子族的组合横扫）发现并修复的
@@ -12,16 +14,6 @@ import {atom} from '../src/atom.js'
  *        currentValues 是否含该行 item）；
  *      - undefined 合法元素值域 × toSorted 的差分 fuzz（不变量：增量 ≡ 全量重算）。
  */
-
-function mulberry32(seed: number) {
-    let a = seed >>> 0
-    return function () {
-        a |= 0; a = (a + 0x6D2B79F5) | 0
-        let t = Math.imul(a ^ (a >>> 15), 1 | a)
-        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
-    }
-}
 
 describe('defect class 1 (fixed): createSelection 家族在重复 item 下 indicator 漂移', () => {
     // 机制（修复前）：itemToIndicator 是 Map<item, 单个 indicator>，重复行后写覆盖前写；
@@ -293,7 +285,7 @@ describe('resident sweep: undefined 合法元素值域 × toSorted 差分 fuzz',
         for (const seed of [81, 82, 83]) {
             test(`${name} seed=${seed}`, () => {
                 const rand = mulberry32(seed)
-                const val = (): number | undefined => (rand() < 0.25 ? undefined : Math.floor(rand() * 5))
+                const val = withUndefined(rand, () => Math.floor(rand() * 5), 0.25)
                 const source = new RxList<number | undefined>([val(), val(), val(), val()])
                 const sorted = source.toSorted(compare)
                 const history: string[] = []
@@ -330,5 +322,74 @@ describe('resident sweep: undefined 合法元素值域 × toSorted 差分 fuzz',
                 }
             })
         }
+    }
+})
+
+describe('resident sweep: undefined 合法元素值域 × 核心派生算子差分 fuzz', () => {
+    // 覆盖清单 undefinedVal 列的对账资产:map/filter/slice/concat/toSet/groupBy/findIndex
+    // 在 undefined 作为合法元素值的值域下,增量结果 ≡ 全量重算。
+    for (const seed of [91, 92, 93]) {
+        test(`seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            const val = withUndefined(rand, () => Math.floor(rand() * 5), 0.25)
+            const source = new RxList<number | undefined>([val(), val(), val(), val()])
+            const mapped = source.map(x => (x === undefined ? 'U' : x * 10))
+            const filtered = source.filter(x => x !== undefined && x % 2 === 0)
+            const sliced = source.slice(1, 3)
+            const other = new RxList<number | undefined>([undefined, 2])
+            const concated = source.concat(other)
+            const asSet = source.toSet()
+            const grouped = source.groupBy(x => (x === undefined ? 'u' : x % 2))
+            const found = source.findIndex(x => x === undefined)
+            const history: string[] = []
+            try {
+                for (let step = 0; step < 120; step++) {
+                    const r = rand()
+                    const len = source.data.length
+                    if (r < 0.3) {
+                        const start = Math.floor(rand() * (len + 1))
+                        const dc = Math.floor(rand() * 3)
+                        const items = Array.from({length: Math.floor(rand() * 3)}, val)
+                        history.push(`splice(${start},${dc},[${items}])`)
+                        source.splice(start, dc, ...items)
+                    } else if (r < 0.55 && len > 0) {
+                        const i = Math.floor(rand() * len)
+                        const v = val()
+                        history.push(`set(${i},${v})`)
+                        source.set(i, v)
+                    } else if (r < 0.7 && len >= 2) {
+                        const a = Math.floor(rand() * len)
+                        const b = Math.floor(rand() * len)
+                        if (a !== b) {
+                            history.push(`reposition(${a},${b})`)
+                            source.reposition(a, b, 1)
+                        }
+                    } else {
+                        const v = val()
+                        history.push(`push(${v})`)
+                        source.push(v)
+                    }
+
+                    const src = source.data
+                    const ctx = `seed=${seed} step=${step} src=${JSON.stringify(src)} recent=${history.slice(-6).join(';')}`
+                    expect(mapped.data, `map ${ctx}`).toEqual(src.map(x => (x === undefined ? 'U' : x * 10)))
+                    expect(filtered.data, `filter ${ctx}`).toEqual(src.filter(x => x !== undefined && x % 2 === 0))
+                    expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 3))
+                    expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    expect([...asSet.data].sort(), `toSet ${ctx}`).toEqual([...new Set(src)].sort())
+                    for (const [k, g] of grouped.data) {
+                        expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => (x === undefined ? 'u' : x % 2) === k))
+                    }
+                    expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x === undefined))
+                }
+            } finally {
+                mapped.destroy(); filtered.destroy(); sliced.destroy(); concated.destroy()
+                asSet.destroy()
+                for (const g of grouped.data.values()) g.destroy()
+                grouped.destroy()
+                destroyComputed(found)
+                other.destroy(); source.destroy()
+            }
+        })
     }
 })

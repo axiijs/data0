@@ -55,6 +55,15 @@ Review 结论必须分为三类，不得混写：
   9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`（实例回归）、`__tests__/sparseSetOperatorsSweep.spec.ts`（"OOB set × 全派生算子族不崩溃且可恢复"的等价类横扫，含 batch 多 info 回退路径）。
   10. 既有攻击轴 × 未覆盖算子族的组合横扫（重复值域 × selection 家族、undefined 合法元素 × toSorted 的 EXPLICIT_KEY_CHANGE 路径、链式深层管道差分、回调重入）；发现并修复 createSelection 重复 item indicator 漂移（`itemToIndicators` 改 Set 广播 + 按身份精确移除）与 toSorted 变更含 undefined 时与全量 sort 分叉（回退全量重算）两个缺陷类；资产：`__tests__/deepReview2026H2Findings.spec.ts`（实例回归 + 两个等价类的常驻差分 sweep：重复 item 域 × selection 的"indicator ≡ currentValues 成员"不变量、undefined 值域 × toSorted 的"增量 ≡ 全量 sort"不变量，双 compare 形态）。既有 fuzz 的盲区模式：差分 fuzz 只喂"单一算子 × 唯一/重复数值域"，selection（值→indicator 的 Map 记账）与"undefined 作为合法元素值"两个维度都不在任何生成器的值域里。
 
+### 3.3 覆盖清单纪律（盲格必须可见）
+
+2026-H2 教训：两个存活多轮的缺陷类都落在"攻击轴已存在、但没和该算子/值域相乘"的盲格上（重复值域 × selection、undefined 值域 × toSorted）。方法轮换有清单，覆盖矩阵却没有清单，盲格因此不可见。规则：
+
+- `__tests__/coverageInventory.spec.ts` 是「公开派生算子 × 对抗维度 → 防线资产」的常驻账本，机械强制：引用的资产文件必须存在、清单键必须在原型上、原型新增公开成员必须被分类（派生算子必须逐维度登记覆盖资产，或显式写 `UNCOVERED`/`NA:<构造性理由>`）。
+- **禁止把无覆盖的格子谎报为有资产**；`UNCOVERED` 是显式登记的债务，其汇总是每轮深度 review 的第一立项来源（先盘点盲格，再发明新方法）。
+- 新增对抗值域维度时：生成器加进 `__tests__/fuzzKit.ts`（所有 fuzz 共享，"加一次、全算子可用"），清单加一列，全部算子重新过账。禁止在单个 fuzz 文件里私藏值域。
+- 每轮 review 至少消掉一批盲格或给出 NA 论证；账本只允许经论证的增长（新算子落地时）。
+
 ### 4. data0 特有的 review 检查（附资产追溯）
 
 每条检查项必须指向实现它的常驻资产；新增检查项而不补资产，视为该项未完成。
@@ -138,8 +147,10 @@ pnpm exec stryker run --mutate 'src/dep.ts'      # 指定其他模块
 ```
 
 - 建议在每轮深度 review 前对本轮重点模块跑一次，幸存的 mutant 即测试盲区，优先补差分/性质测试而不是逐 mutant 补例子。
+- **排期按风险而不是按轮换**：体积 × 分支密度 × 距上次审计时间。RxList.ts（最大、分支最密的模块）2026-H2 首跑即暴露 479 个幸存 mutant——绝对量远超先审的小模块，验证了风险优先的必要性。
 - 幸存 mutant 涉及「架构决策」语义的，对照该节判断是否属于刻意未断言的行为；命中长期无人使用的辅助代码（如 Vue 继承的字符串工具）时，优先考虑删除死代码而不是补测试。
 - 基线记录（用于观察趋势）：
   - 2026-07 首跑 `src/util.ts` —— 行覆盖 98.66%，mutation score **65.94%**（240 killed / 113 survived / 12 no-coverage，48s）。行覆盖与检出能力的差距即测试盲区的量化。
   - 2026-07 修复轮跑 `src/reactiveEffect.ts`（destroy 核心重构后）—— 行覆盖 96.1%，mutation score **73.10%**（209 killed / 3 timeout / 71 survived / 7 no-coverage，94s）。
   - 2026-07 评估修复轮：删除 Vue 遗留且无生产引用的字符串/指令辅助（`isOn`/`camelize`/`isReservedProp` 等），降低 util 中"无人使用却撑高幸存 mutant"的死代码面。
+  - 2026-07 方法 10 轮首跑 `src/RxList.ts` —— mutation score **72.08%**（1401 killed / 37 timeout / 479 survived / 78 no-coverage，4m52s；测试套为 selection/undefined 修复后、duplicates/undefined 扩展 sweep 落地前）。479 个幸存 mutant 为当前最大单模块盲区账本，下轮 review 与 coverageInventory 的 UNCOVERED 格子共同作为立项来源。
