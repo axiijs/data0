@@ -13,7 +13,7 @@ import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {Atom} from "./atom.js";
 import {RxList} from "./RxList.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
-import {assert, isMap} from "./util.js";
+import {assert, isMap, warn} from "./util.js";
 
 type EntryType = [any, any][]
 type PlainObjectType = {
@@ -45,6 +45,11 @@ export class RxMap<K, V> extends Computed{
         }
     }
     replace = (source: EntryType|PlainObjectType|Map<K,V>) => {
+        // 已销毁实例的变更是 no-op（复活写入防线，见 RxList.spliceArray 的说明）
+        if (!this.active) {
+            warn('mutating a destroyed RxMap is a no-op')
+            return
+        }
         let entries: EntryType
 
         const oldKeys = new Set(this.data.keys())
@@ -80,6 +85,10 @@ export class RxMap<K, V> extends Computed{
 
     // set methods
     set(key: K, value: V) {
+        if (!this.active) {
+            warn('mutating a destroyed RxMap is a no-op')
+            return
+        }
         const hasValue = this.data.has(key)
         const oldValue = this.data.get(key)
         this.data.set(key, value)
@@ -96,6 +105,10 @@ export class RxMap<K, V> extends Computed{
     }
 
     delete(key: K) {
+        if (!this.active) {
+            warn('mutating a destroyed RxMap is a no-op')
+            return
+        }
         const hasValue = this.data.has(key)
         let oldValue:V|undefined
         if (hasValue) {
@@ -110,6 +123,10 @@ export class RxMap<K, V> extends Computed{
     }
 
     clear() {
+        if (!this.active) {
+            warn('mutating a destroyed RxMap is a no-op')
+            return
+        }
         const entries = Array.from(this.data.entries())
         this.data.clear()
         entries.forEach(([key, value]) => {
@@ -205,13 +222,17 @@ export class RxMap<K, V> extends Computed{
             )
         }))
     }
-    destroy() {
+    /**
+     * @internal
+     * 统一资源清理钩子（见 ReactiveEffect.destroyResources）。
+     */
+    destroyResources() {
         // CAUTION 只销毁真正创建过的派生结构（getter 惰性，直接访问会先创建再销毁）。
         //  values/entries 派生自 keys，先销毁派生者。
         if (this._values) this._values.destroy()
         if (this._entries) this._entries.destroy()
         if (this._keys) this._keys.destroy()
         if (this._size) destroyComputed(this._size)
-        super.destroy()
+        super.destroyResources()
     }
 }

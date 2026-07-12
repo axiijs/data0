@@ -80,10 +80,14 @@ export class AsyncRxSlice<T> extends RxList<T>{
     async moveBackward(length? : number, start?: number) {
         return this.update(this.getCursor!(this.data.at(0)), length, start,true, true)
     }
-    destroy() {
+    /**
+     * @internal
+     * 统一资源清理钩子（见 ReactiveEffect.destroyResources）。
+     */
+    destroyResources() {
         if (this.autoFetchPromise) {
             destroyComputed(this.autoFetchPromise)
         }
-        super.destroy()
+        super.destroyResources()
     }
 }

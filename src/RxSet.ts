@@ -3,6 +3,7 @@ import {Atom} from "./atom.js";
 import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
+import {warn} from "./util.js";
 import {RxList} from "./RxList";
 /**
  * @category Basic
@@ -33,6 +34,11 @@ export class RxSet<T> extends Computed {
     }
 
     replace(newData: T[]|Set<T>): [T[], T[]]{
+        // 已销毁实例的变更是 no-op（复活写入防线，见 RxList.spliceArray 的说明）
+        if (!this.active) {
+            warn('mutating a destroyed RxSet is a no-op')
+            return [[], []]
+        }
         const old = this.data
         // CAUTION 架构语义（AGENTS.md A3）：传入 Set 时直接采纳引用（所有权移交），
         //  调用方之后复用该 Set 直接增删不会触发任何通知。
@@ -48,7 +54,10 @@ export class RxSet<T> extends Computed {
             }
         });
 
-        [...newData].forEach((value) => {
+        // CAUTION 新增项必须基于采纳后的 Set（SameValueZero 去重）而不是原始入参：
+        //  数组含重复值（[2,2]）时按数组遍历会触发重复 ADD，methodResult.newItems
+        //  含重复项，toList 等按事件重放的派生结构会出现重复行。
+        this.data.forEach((value) => {
             if(!old.has(value)) {
                 this.trigger(this, TriggerOpTypes.ADD, { key: value, newValue: value})
                 newItems.push(value)
@@ -62,6 +71,10 @@ export class RxSet<T> extends Computed {
 
     // 显式 set 某一个 index 的值
     add(value: T) {
+        if (!this.active) {
+            warn('mutating a destroyed RxSet is a no-op')
+            return this
+        }
         if (!this.data.has(value)) {
             this.data.add(value)
             this.trigger(this, TriggerOpTypes.ADD, { key: value, newValue: value})
@@ -74,6 +87,10 @@ export class RxSet<T> extends Computed {
         return this.replace([])
     }
     delete(value:T) {
+        if (!this.active) {
+            warn('mutating a destroyed RxSet is a no-op')
+            return this
+        }
         if (this.data.has(value)) {
             this.data.delete(value)
             this.trigger(this, TriggerOpTypes.DELETE, { key: value, argv: [value]})
@@ -360,10 +377,14 @@ export class RxSet<T> extends Computed {
             )
         }))
     }
-    destroy() {
+    /**
+     * @internal
+     * 统一资源清理钩子（见 ReactiveEffect.destroyResources）。
+     */
+    destroyResources() {
         // 只销毁真正创建过的 size（getter 惰性，直接访问会先创建再销毁）
         if (this._size) destroyComputed(this._size)
-        super.destroy()
+        super.destroyResources()
     }
 }
 

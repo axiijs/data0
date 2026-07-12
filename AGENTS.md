@@ -49,7 +49,9 @@ Review 结论必须分为三类，不得混写：
   3. 固定 seed 差分 fuzz（增量结果 ≡ 全量重算，含重复值域）；
   4. async 敌意调度与完成序交错枚举；
   5. 异常注入（订阅者/回调抛错后全局状态复原检查）；
-  6. 生命周期审计（destroy/孤儿 effect/泄漏计数）。
+  6. 生命周期审计（destroy/孤儿 effect/泄漏计数）；
+  7. batch/延迟调度下的多 info 单次 digest 重放差分（既有差分 fuzz 全部在 batch 外逐操作断言，隐含"每次 digest 恰一条 info"的假设；重放语义本身是独立攻击面，尤其是 EXPLICIT_KEY_CHANGE 与结构操作混排）；
+  8. destroy 僵尸行为横扫 + destroy 事件对称性检查（直接断言"destroy 后不再接收更新"；不依赖 retainedDiagnostics——它只统计 active=true 的 effect，源模式结构在其中完全不可见）。
 
 ### 4. data0 特有的 review 检查（附资产追溯）
 
@@ -57,14 +59,16 @@ Review 结论必须分为三类，不得混写：
 
 - 立案前先对照下方「架构决策与已知语义边界」一节：其中列出的行为是既定架构语义，观察到相关现象时引用该节说明，不得作为缺陷报告或擅自"修复"。
   资产：`__tests__/architectureSemantics.spec.ts`、README「架构语义」节。
-- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果。
-  资产：`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
+- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果，**含 batch/延迟调度下多条 triggerInfo 单次 digest 重放的序列**（triggerInfo 的 key/argv 是操作时位置，source.data 是重放时终态，patch 端凡按终态解释操作时位置都是缺陷；无法安全增量时用 `return false` 回退全量重算，并同步 README 支持矩阵的脚注）。
+  资产：`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）、`__tests__/batchReplayFuzz.spec.ts`（batch 多操作重放差分 + toSorted 等值 tie 差分）、`__tests__/lifecycleAndReplayFixes.spec.ts`（最小复现回归）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
 - mutation 测试至少覆盖 splice 的负数、越界、小数、`NaN`、`-0`，重复值，`set`，`reorder`，batch，以及回调抛错。
-  资产：`broadOperatorsFuzz` 的操作生成器（对抗参数域）、`__tests__/reproducedIssuesFixes.spec.ts`、`__tests__/reviewFixes.spec.ts`。
+  资产：`broadOperatorsFuzz` 的操作生成器（对抗参数域）、`batchReplayFuzz` 的 batch 操作生成器、`__tests__/reproducedIssuesFixes.spec.ts`、`__tests__/reviewFixes.spec.ts`。
 - 响应式回调变更后，除结果外还要验证依赖仍会触发、被删除 effect 已销毁、全局 tracking/session 栈恢复。
   资产：dev 不变量断言（`batch`/effect run 的栈深复原、digest 静止态、`RxList` 行级记账对齐——违约当场抛错，被全套测试被动执行）、`__tests__/invariantAssertions.spec.ts`（断言开火自检）。
-- async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序。
-  资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）。
+- destroy 语义必须对称：destroy 后不再接收更新（僵尸检查）、create+destroy 后活跃 effect 计数回到基线（泄漏检查）、源模式结构与计算模式一视同仁（destroy 事件、children、惰性 meta、`context.onCleanup`）。子类的销毁清理必须放进 `destroyResources` 钩子（唯一会被所有销毁入口——实例 `destroy()`、`destroyChildren`、`destroyComputed`——执行的位置），不得放在 `destroy()` 覆写里。已销毁结构的变更方法是 no-op。
+  资产：`__tests__/destroySemantics.spec.ts`（全派生族僵尸/泄漏横扫）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy 取消在途 async patch、no-op 变更）。
+- async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序；destroy 与在途 async patch 的交错也在此列。
+  资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。
   资产：`deepReviewFixes.spec.ts`（argv 透传契约测试）、README「RxList 参数契约」节。
 
@@ -133,4 +137,6 @@ pnpm exec stryker run --mutate 'src/dep.ts'      # 指定其他模块
 
 - 建议在每轮深度 review 前对本轮重点模块跑一次，幸存的 mutant 即测试盲区，优先补差分/性质测试而不是逐 mutant 补例子。
 - 幸存 mutant 涉及「架构决策」语义的，对照该节判断是否属于刻意未断言的行为；命中长期无人使用的辅助代码（如 Vue 继承的字符串工具）时，优先考虑删除死代码而不是补测试。
-- 基线记录（用于观察趋势）：2026-07 首跑 `src/util.ts` —— 行覆盖 98.66%，mutation score **65.94%**（240 killed / 113 survived / 12 no-coverage，48s）。行覆盖与检出能力的差距即测试盲区的量化。
+- 基线记录（用于观察趋势）：
+  - 2026-07 首跑 `src/util.ts` —— 行覆盖 98.66%，mutation score **65.94%**（240 killed / 113 survived / 12 no-coverage，48s）。行覆盖与检出能力的差距即测试盲区的量化。
+  - 2026-07 修复轮跑 `src/reactiveEffect.ts`（destroy 核心重构后）—— 行覆盖 96.1%，mutation score **73.10%**（209 killed / 3 timeout / 71 survived / 7 no-coverage，94s）。
