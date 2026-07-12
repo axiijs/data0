@@ -52,7 +52,7 @@ Review 结论必须分为三类，不得混写：
   6. 生命周期审计（destroy/孤儿 effect/泄漏计数）；
   7. batch/延迟调度下的多 info 单次 digest 重放差分（既有差分 fuzz 全部在 batch 外逐操作断言，隐含"每次 digest 恰一条 info"的假设；重放语义本身是独立攻击面，尤其是 EXPLICIT_KEY_CHANGE 与结构操作混排）；
   8. destroy 僵尸行为横扫 + destroy 事件对称性检查（直接断言"destroy 后不再接收更新"；不依赖 retainedDiagnostics——它只统计 active=true 的 effect，源模式结构在其中完全不可见）。
-  9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`。
+  9. 生产构建（`__DEV__:false`）契约差分 + 对抗探针（object-atom 浅写、indexKeyDeps 惰性清扫、generator 异步重入、稀疏 set × map(index)、API/文档漂移）；资产：`__tests__/verifiedReviewFixes.spec.ts`（实例回归）、`__tests__/sparseSetOperatorsSweep.spec.ts`（"OOB set × 全派生算子族不崩溃且可恢复"的等价类横扫，含 batch 多 info 回退路径）。
 
 ### 4. data0 特有的 review 检查（附资产追溯）
 
