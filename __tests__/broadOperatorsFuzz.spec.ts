@@ -207,6 +207,9 @@ describe('broad fuzz: RxSet operations and RxMap derivations', () => {
             const inter = a.intersection(b)
             const sym = a.symmetricDifference(b)
             const uni = a.union(b)
+            // toList 是 methodResult（replace 的 [newItems, deletedItems]）的消费方：
+            // replace 收到含重复值的数组时 newItems 必须已按 Set 语义去重
+            const asList = a.toList()
             try {
                 for (let step = 0; step < 150; step++) {
                     const target = rand() < 0.5 ? a : b
@@ -216,6 +219,7 @@ describe('broad fuzz: RxSet operations and RxMap derivations', () => {
                         const arr = [...target.data]
                         if (arr.length) target.delete(arr[Math.floor(rand() * arr.length)])
                     } else {
+                        // 值域窄（0..9）+ 长度 4：replace 数组高频包含重复值
                         target.replace(Array.from({length: Math.floor(rand() * 4)}, val))
                     }
                     const A = [...a.data], B = [...b.data]
@@ -225,9 +229,11 @@ describe('broad fuzz: RxSet operations and RxMap derivations', () => {
                     expect(sortNum([...inter.data]), ctx).toEqual(sortNum(A.filter(x => B.includes(x))))
                     expect(sortNum([...sym.data]), ctx).toEqual(sortNum([...A.filter(x => !B.includes(x)), ...B.filter(x => !A.includes(x))]))
                     expect(sortNum([...uni.data]), ctx).toEqual(sortNum([...new Set([...A, ...B])]))
+                    expect(sortNum([...asList.data]), `toList ${ctx}`).toEqual(sortNum(A))
                 }
             } finally {
                 diff.destroy(); inter.destroy(); sym.destroy(); uni.destroy()
+                asList.destroy()
                 a.destroy(); b.destroy()
             }
         })

@@ -1706,6 +1706,11 @@ export class RxList<T> extends Computed {
 
             /** 2) Incremental Patch: interpret splices/sets to update our slice accordingly. */
             function applyPatch(this: RxList<T>, _data, triggerInfos) {
+                // CAUTION 多 info 重放回退（等价类同 groupBy）：区间差量以 info 的
+                //  操作时位置做区间算术，却从重放时的终态 source.data 取补元素；
+                //  同一次 digest 多条 info（batch/延迟调度）时两者不一致，窗口内容
+                //  会错位/重复。多 info 一律全量重算。
+                if (triggerInfos.length > 1) return false
                 for(const info of triggerInfos) {
                     // ensure it's from this source
                     if (info.source !== source) return false
