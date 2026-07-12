@@ -31,12 +31,33 @@ export class ReactiveEffect extends ManualCleanup {
     //  （见 class 定义后的赋值），实例只在真正改写时才产生自有属性。
     //  渲染框架里每个绑定都是一个 effect，这些"恒定默认值"的实例槽位在长列表下是可观的常驻内存。
     declare public isRunningAsync: boolean
+    // 栈内销毁的延迟标记（见 static destroy 的 CAUTION）。位掩码：
+    // 1=pending, 2=fromParent, 4=ignoreChildren——flush 时按原调用参数重放
+    // （fromParent 尤其重要：destroyChildren 发起的延迟销毁若按 false 重放，
+    // 会拿陈旧 index 在父亲重建后的 children 数组上做 swap-pop，删错兄弟）。
+    // 默认值在原型上，只有"run 栈内被 destroy"的错误边界路径才写实例位。
+    declare public _pendingDestroy: number
     private _eventToCallbacks?: Map<string, Set<Function>>
     private _asyncTracks?: Array<() => void>
     private _children?: ReactiveEffect[]
     static destroy(effect: ReactiveEffect, fromParent = false, ignoreChildren = false) {
         if (!effect.active) return
-        assert(ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1] !== effect, 'cannot destroy an active effect inside self')
+        // CAUTION 正在执行中的 effect（在 activeScopes 上）不能就地拆除：
+        //  立刻 cleanup() 会把本轮 run 已置位的 dep marker（dep.n/w 的本深度位）留成
+        //  脏位——deps 已清空，completeTracking 的 finalizeDepMarkers 无从复位，之后
+        //  同一深度 track 同一 dep 的其他 effect 会被 newTracked 误判为已订阅而
+        //  **静默漏订阅**（once() 注释里记载的同一缺陷类）。v2.7.0 曾用断言直接禁止
+        //  "栈内销毁"，但同步重入整树销毁是下游错误边界的既定写法（axle 的 error
+        //  钩子 → root.destroy() → destroyComputed 正在 patch 的 computed，其
+        //  doc/02 §4；data0 <= 2.6 一直允许），断言把该模式全部打崩。
+        //  两全方案：延迟销毁——置 _pendingDestroy 并立即返回，completeTracking
+        //  在栈展开、marker 复位之后按原参数重放真正的销毁。对调用方语义仍是
+        //  "销毁已生效"：flush 先于本段同步栈之后的一切外部代码执行。
+        //  回归钉在 __tests__/verifiedReviewFixes.spec.ts 的 destroy-inside-run 组。
+        if (ReactiveEffect.activeScopes.includes(effect)) {
+            effect._pendingDestroy = 1 | (fromParent ? 2 : 0) | (ignoreChildren ? 4 : 0)
+            return
+        }
 
         // CAUTION 先置 inactive 再执行清理：destroyResources 会运行用户 cleanup，
         //  其中的响应式写入若再触发本 effect（或重入 destroy），都以 active === false
@@ -290,6 +311,14 @@ export class ReactiveEffect extends ManualCleanup {
 
             this.removeFromActiveScopes()
         }
+
+        // 栈内销毁的延迟执行点（见 static destroy 的 CAUTION）：此刻本段 run 的
+        // marker/作用域栈已复原；仍在更外层栈上（嵌套/async 交错）时等下一个收尾。
+        if (this._pendingDestroy !== 0 && !ReactiveEffect.activeScopes.includes(this)) {
+            const flags = this._pendingDestroy
+            this._pendingDestroy = 0
+            ReactiveEffect.destroy(this, (flags & 2) !== 0, (flags & 4) !== 0)
+        }
     }
     // 依赖触发时由 notifier 调用（非 session 路径）。基类 effect 不消费 TriggerInfo，
     // 直接重跑；Computed 覆写此方法，按 needsTriggerInfo 惰性组装 info。
@@ -458,6 +487,7 @@ export class ReactiveEffect extends ManualCleanup {
 
 // 恒定默认值放在原型上：实例只在真正改写时才产生自有属性（见类顶部 declare 说明）
 ReactiveEffect.prototype.isRunningAsync = false
+ReactiveEffect.prototype._pendingDestroy = 0
 ReactiveEffect.prototype.useDepMarker = true
 ReactiveEffect.prototype.index = 0
 ReactiveEffect.prototype.shouldCollectChild = true

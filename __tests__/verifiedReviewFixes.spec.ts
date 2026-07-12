@@ -6,7 +6,8 @@
  * 3. setupVitestEnv 不得残留 debugger（由 reviewFixes / 卫生检查覆盖路径）
  */
 import {describe, expect, test} from 'vitest'
-import {atom, autorun, RxList} from '../src'
+import {atom, autorun, computed, Computed, destroyComputed, ReactiveEffect, RxList} from '../src'
+import {TrackOpTypes, TriggerOpTypes} from '../src/operations'
 import {readFileSync} from 'node:fs'
 import {resolve} from 'node:path'
 
@@ -93,6 +94,79 @@ describe('F2: object atom 浅属性写入触发通知', () => {
         obj.x = 1
         expect(runs).toBe(1)
         stop()
+    })
+})
+
+describe('F4: destroy-inside-run（下游错误边界的同步重入销毁）', () => {
+    test('destroyComputed inside own sync applyPatch defers, then fully destroys', () => {
+        const list = new RxList<string>(['a'])
+        let patchRan = 0
+        let insidePatchError: unknown = null
+        // 与 axle RxListHost 相同的工厂形态
+        const c = computed(
+            function computation(this: Computed) {
+                this.manualTrack(list, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                return list.data.slice()
+            },
+            function applyPatch(this: Computed) {
+                patchRan++
+                // axle 模式：行错误 → error 钩子 → root.destroy() → destroyComputed(正在 patch 的自己)
+                try {
+                    destroyComputed(c)
+                } catch (e) {
+                    insidePatchError = e
+                }
+            }
+        )
+
+        expect(() => list.push('x')).not.toThrow()
+        expect(insidePatchError).toBeNull()
+        expect(patchRan).toBe(1)
+        // 栈展开后销毁已生效：不再接收更新
+        expect(() => list.push('y')).not.toThrow()
+        expect(patchRan).toBe(1)
+        // 全局栈无泄漏
+        expect(ReactiveEffect.activeScopes.length).toBe(0)
+        list.destroy()
+    })
+
+    test('destroy inside own getter (initial run) defers and does not corrupt sibling tracking', () => {
+        const dep = atom(0)
+        let selfDestroyed!: Computed
+        const c = new Computed(function (this: Computed) {
+            const v = dep()
+            if (v === 0) {
+                selfDestroyed = this
+                this.destroy()
+            }
+            return v
+        })
+        expect(() => c.run([], true)).not.toThrow()
+        expect(selfDestroyed.active).toBe(false)
+
+        // 同一 dep 的其他订阅者不受 marker 污染：正常建立订阅并接收更新
+        let seen = -1
+        const stop = autorun(() => { seen = dep() }, true)
+        dep(5)
+        expect(seen).toBe(5)
+        stop()
+        expect(ReactiveEffect.activeScopes.length).toBe(0)
+    })
+
+    test('destroy() of a running autorun from inside itself is safe and final', () => {
+        const a = atom(0)
+        let runs = 0
+        let stop!: () => void
+        stop = autorun(() => {
+            runs++
+            a()
+            if (runs === 2) stop()
+        }, true)
+        a(1) // triggers second run which self-stops
+        const runsAfterStop = runs
+        a(2)
+        expect(runs).toBe(runsAfterStop)
+        expect(ReactiveEffect.activeScopes.length).toBe(0)
     })
 })
 
