@@ -13,7 +13,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity} from "./util.js";
+import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, warn} from "./util.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -206,6 +206,10 @@ export class RxList<T> extends Computed {
         return this.splice(this.data.length, 0, ...items)
     }
     clear() {
+        if (!this.active) {
+            warn('mutating a destroyed RxList is a no-op')
+            return []
+        }
         const length = this.data.length
         if (length === 0) return []
         const hasIndexKeyDeps = this.pruneIndexKeyDeps()
@@ -241,6 +245,13 @@ export class RxList<T> extends Computed {
     // splice 的数组参数版：内部所有批量写入都走这里，规避 spread 实参上限
     // （大列表 replaceData/concat 等场景 spread 会 RangeError）与 O(n) 实参拷贝。
     spliceArray(start: number, deleteCount: number, items: T[] = []) {
+        // CAUTION 已销毁实例的变更是 no-op：destroy 无法中止已挂起的用户 async
+        //  applyPatch，其恢复后对 this 的写入必须在这里被拦截（复活写入防线）。
+        //  同时兜住所有"销毁后仍持有引用继续写"的契约外用法。
+        if (!this.active) {
+            warn('mutating a destroyed RxList is a no-op')
+            return []
+        }
         this.pauseAutoTrack()
         // CAUTION try/finally：trigger/digest 会同步执行订阅者，订阅者抛错时必须
         //  复位追踪状态，否则 trackStack 每次异常泄漏一个槽位、顶层 shouldTrack
@@ -345,6 +356,10 @@ export class RxList<T> extends Computed {
     //  key，由下游（axii/axle 等渲染框架）自行拒绝或归一化。不要在这里改走 splice 语义：
     //  下游的结构化错误契约（以及 set(Infinity) 这类 key）都依赖透传行为。
     set(index: number, value: T) {
+        if (!this.active) {
+            warn('mutating a destroyed RxList is a no-op')
+            return undefined as T
+        }
         const oldValue = this.data[index]
         this.data[index] = value
 
@@ -356,6 +371,10 @@ export class RxList<T> extends Computed {
         return oldValue
     }
     reorder(newOrder: Order[], reorderInfo = createReorderPatchInfo('reorder', newOrder)) {
+        if (!this.active) {
+            warn('mutating a destroyed RxList is a no-op')
+            return
+        }
         const originIndexes = newOrder.map(item => item[0])
         const newIndexes = newOrder.map(item => item[1])
         const oldIndexAtoms = this.atomIndexes ? originIndexes.map(index => this.atomIndexes![index]) : null
@@ -484,8 +503,19 @@ export class RxList<T> extends Computed {
                 return cloned
             },
             function applyPatch(this: RxList<T>, _data, triggerInfos) {
+                // CAUTION tie 回退：全量重算是稳定排序（等 key 按源顺序），增量二分插入
+                //  无法得知新元素相对既有等 key 元素的源顺序。等 key 元素存在时直接
+                //  return false 走全量重算，保证"增量 ≡ 全量重算"的差分不变量
+                //  （否则同一份数据的呈现顺序取决于到达历史）。binarySearchInsert
+                //  返回等值区间之后的位置，因此只需检查前一个元素是否等值。
+                const insertOrBail = (item: T): boolean => {
+                    const insertIndex = RxList.binarySearchInsert(this.data, item, compare!)
+                    if (insertIndex > 0 && compare!(this.data[insertIndex - 1], item) === 0) return false
+                    this.splice(insertIndex, 0, item)
+                    return true
+                }
                 // Incremental updates
-                triggerInfos.forEach((info) => {
+                for (const info of triggerInfos) {
                     const { method, argv, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
@@ -499,10 +529,9 @@ export class RxList<T> extends Computed {
                         })
                         // 2) insert new items in sorted order
                         const newItems = argv!.slice(2) as T[]
-                        newItems.forEach((item) => {
-                            const insertIndex = RxList.binarySearchInsert(this.data, item, compare!)
-                            this.splice(insertIndex, 0, item)
-                        })
+                        for (const item of newItems) {
+                            if (!insertOrBail(item)) return false
+                        }
                     } else {
                         // explicit key change: remove old, insert new
                         if (oldValue !== undefined) {
@@ -512,11 +541,10 @@ export class RxList<T> extends Computed {
                             }
                         }
                         if (newValue !== undefined) {
-                            const insertIndex = RxList.binarySearchInsert(this.data, newValue as T, compare!)
-                            this.splice(insertIndex, 0, newValue as T)
+                            if (!insertOrBail(newValue as T)) return false
                         }
                     }
-                })
+                }
             }
         )
     }
@@ -634,10 +662,32 @@ export class RxList<T> extends Computed {
                 }
                 newItemIndex = source.atomIndexes![index]!
             }
-            const rowComputed = new Computed(() => {
+            const rowComputed: Computed = new Computed(() => {
                 // CAUTION 特别注意这里面的变量，我们只希望 track 用户 mapFn 里面用到的外部 reactive 对象，不希望 track 到自己的 key/index。
                 if (newItemIndex) {
-                    list.set(newItemIndex.raw, mapFn(source.data[newItemIndex.raw], newItemIndex, mapContext!))
+                    const finalIndex = newItemIndex.raw
+                    // CAUTION 位置契约守卫：newItemIndex 反映 source 的当前（终态）位置。
+                    //  同一 digest 中行依赖可能先于本列表的结构 patch 被触发（batch 内
+                    //  先写行依赖再 splice / 自定义调度器延迟 patch），此刻 list 还停留在
+                    //  结构变更前的形态，按终态位置定点写会写错行。
+                    const hasPendingStructuralInfos =
+                        (list._triggerInfos !== undefined && list._triggerInfos.length > 0) ||
+                        (list._inSession && list._sessionInfos !== undefined && list._sessionInfos.length > 0)
+                    if (!hasPendingStructuralInfos) {
+                        list.set(finalIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
+                    } else {
+                        // 行是否仍存活：终态 atomIndexes 里该位置的 atom 必须是自己
+                        // （身份比较）。不是自己说明本行已被待重放的结构操作移除，
+                        // 不能再用它的 item 运行 mapFn。
+                        if (source.atomIndexes?.[finalIndex] !== newItemIndex) return
+                        // 按行 effect frame 的身份定位行的当前（pre-patch）位置：
+                        // 新值写在旧位置上，随后的结构重放会把它随行搬到终态位置。
+                        const frames = list._effectFramesArray
+                        const currentIndex = frames ? frames.findIndex(frame => frame !== undefined && frame.indexOf(rowComputed) !== -1) : -1
+                        if (currentIndex !== -1) {
+                            list.set(currentIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
+                        }
+                    }
                 }
             }, undefined, true)
             probe.transferCapturesTo(rowComputed)
@@ -646,10 +696,26 @@ export class RxList<T> extends Computed {
             return [value, [rowComputed]]
         }
 
+        // 全量重算是否是"重建"（首算之后的任何一次重算）：重建前要像删除行一样
+        // 执行旧行的 cleanup（行级 effect 由 destroyChildren 统一销毁，但 cleanup
+        // 槽位与 options.onCleanup 归本结构管理）。
+        let hasComputedOnce = false
+
         return new RxList(
             function computation(this: RxList<U>) {
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD);
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
+                if (hasComputedOnce) {
+                    // 重建 = 所有旧行被替换：逐行执行 cleanup（与 splice 删除行的语义一致）
+                    cleanupSlots?.forEach((slot) => { slot?.fn?.() })
+                    if (options?.onCleanup) {
+                        this.data.forEach((item) => options.onCleanup!(item))
+                    }
+                    // 旧行级 effect 已由 prepareTracking 的 destroyChildren 销毁，
+                    // 记账数组必须清空重建，否则新列表更短时尾部残留悬垂 frame。
+                    this.effectFramesArray!.length = 0
+                }
+                hasComputedOnce = true
                 cleanupSlots = useContext ? [] : undefined
 
                 const result: U[] = []
@@ -677,7 +743,16 @@ export class RxList<T> extends Computed {
                 return result
             },
             function applyMapArrayPatch(this: RxList<U>, _data, triggerInfos) {
-                triggerInfos.forEach((triggerInfo) => {
+                // CAUTION 多 info 重放 × 行级 index atom 的位置契约：triggerInfo 的
+                //  key/argv 是"操作时"的位置，而 source.atomIndexes 反映"终态"位置。
+                //  单 info 时两者相同；同一次 digest 重放多条 info（batch/延迟调度）时，
+                //  按操作时位置去取终态 atom 会拿到相邻行的 atom（行从此追踪错误位置）。
+                //  数据本身的重放（值来自 argv/newValue，位置对本列表顺序重放）不受影响，
+                //  因此只有真正使用 index atom 的 map 需要回退全量重算。
+                if (triggerInfos.length > 1 && addedAtomIndexesDep) return false
+                const hadIndexAtomsAtPatchStart = addedAtomIndexesDep
+
+                for (const triggerInfo of triggerInfos) {
 
                     const { method , argv  ,key } = triggerInfo
                     if (__DEV__) {
@@ -761,7 +836,11 @@ export class RxList<T> extends Computed {
                         this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
                     } else {
                         // explicit key change
-                        // CAUTION add/update 一定都要全部重新从 source 里面取，因为这样才能得到正确的 proxy。newValue 是 raw data，和 mapFn 里面预期拿到的不一致。
+                        // CAUTION 新行的 item 必须取 info.newValue（操作时的值），不能读
+                        //  source.data[key]：key 是"操作时"的位置，而 source.data 是重放时
+                        //  的终态——同一次 digest 里 set 之后还有结构操作（batch 中
+                        //  set+shift）时，终态位置上是别的元素甚至越界 undefined，
+                        //  mapFn 会算出 NaN/undefined 且顺序永久错乱。
                         // 没有 method 说明是 explicit_key_change 变化
                         const index = key as number
                         const oldSlot = cleanupSlots?.[index]
@@ -778,7 +857,7 @@ export class RxList<T> extends Computed {
                         // 转移到新的 rowComputed；set 后该行会永久失去响应。
                         const [newItem, newFrame] = runItemAndCollectEffect(
                             this,
-                            source.data[index],
+                            triggerInfo.newValue as T,
                             index,
                             mapContext,
                         )
@@ -796,7 +875,12 @@ export class RxList<T> extends Computed {
                         }
 
                     }
-                })
+                }
+                // CAUTION 见函数开头的位置契约说明：若本轮重放中途第一次出现了
+                //  需要 index atom 的行（addedAtomIndexesDep 由 false 变 true），
+                //  这些行按操作时位置取的终态 atom 同样不可信，整体回退全量重算
+                //  （full recompute 会先清理本轮已建的行再重建）。
+                if (triggerInfos.length > 1 && !hadIndexAtomsAtPatchStart && addedAtomIndexesDep) return false
                 options?.afterPatch?.(triggerInfos)
                 if (__DEV__) {
                     // dev 不变量：行级记账结构必须与数据严格等长对齐。
@@ -1286,6 +1370,12 @@ export class RxList<T> extends Computed {
                 return groups
             },
             function applyPatch(this: RxMap<any, RxList<T>>, _data, triggerInfos) {
+                // CAUTION 多 info 重放回退：insertInSourceOrder/removeAtSourcePosition 的
+                //  组内定位依赖"前缀 [0, index) 未被本次触及"，前缀按重放时的 source.data
+                //  计数。同一次 digest 有多条 info（batch/延迟调度）时 source.data 是
+                //  终态，操作时位置的前缀计数不再成立（例：batch 内两次 splice 触及
+                //  同 key 前缀 → 删错组内实例）。多 info 一律全量重算。
+                if (triggerInfos.length > 1) return false
                 const sameKey = (a: any, b: any) => a === b || (a !== a && b !== b)
                 const insertInSourceOrder = (item: T, sourceIndex: number) => {
                     const groupKey = getKey(item)
@@ -1498,11 +1588,15 @@ export class RxList<T> extends Computed {
     onUntrack(_effect: ReactiveEffect) {
 
     }
-    destroy() {
+    /**
+     * @internal
+     * 统一资源清理钩子（见 ReactiveEffect.destroyResources）：实例 destroy()、
+     * destroyChildren、destroyComputed 三个入口都恰好执行一次。
+     */
+    destroyResources() {
         // CAUTION 用 _length 判断：length 是惰性 getter，直接访问会先创建再销毁
         if (this._length) destroyComputed(this._length)
-        super.destroy()
-        this.effectFramesArray?.forEach((frames) => {
+        this._effectFramesArray?.forEach((frames) => {
           // 稀疏行安全：越界 set + reorder 会在记账数组中留下显式 undefined 项
           frames?.forEach((frame) => {
             this.destroyEffect(frame)
@@ -1510,6 +1604,7 @@ export class RxList<T> extends Computed {
         })
         this._indexKeyDeps?.clear()
         this.atomIndexes = undefined
+        super.destroyResources()
     }
 
     createSelection(currentValues: RxSet<T|number>|Atom<T|null|number>, autoResetValue?: boolean) {

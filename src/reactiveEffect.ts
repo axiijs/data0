@@ -36,10 +36,20 @@ export class ReactiveEffect extends ManualCleanup {
     private _children?: ReactiveEffect[]
     static destroy(effect: ReactiveEffect, fromParent = false, ignoreChildren = false) {
         if (!effect.active) return
+        assert(ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1] !== effect, 'cannot destroy an active effect inside self')
 
-        effect.cleanup()
+        // CAUTION 先置 inactive 再执行清理：destroyResources 会运行用户 cleanup，
+        //  其中的响应式写入若再触发本 effect（或重入 destroy），都以 active === false
+        //  被安全拦截，不会出现"销毁中重算/重复销毁"。
         effect.active = false
         trackRetainedReactiveEffectDestroyed(effect)
+        // CAUTION 子类资源清理钩子（惰性 meta、lastCleanupFn、cleanPromise、行级
+        //  effect frame 等）。所有销毁入口——实例 destroy()、destroyChildren、
+        //  destroyComputed——都汇聚到本静态核心，钩子恰好执行一次。旧实现把这些
+        //  清理放在各子类的 destroy() 覆写里，destroyChildren/destroyComputed 走
+        //  静态函数时全部被绕过（子 computed 的 onCleanup 从不执行、惰性 meta 泄漏）。
+        effect.destroyResources()
+        effect.cleanup()
 
         // 如果不是 fromParent，就要从父亲中移除。如果是，父亲会自己清空 children
         if (effect.parent && !fromParent) {
@@ -164,7 +174,9 @@ export class ReactiveEffect extends ManualCleanup {
         if (!children) return
         if (children.length) {
             children.forEach(child => {
-                ReactiveEffect.destroy(child, true)
+                // CAUTION 走实例方法（fromParent=true）：destroy 可能被子类覆写，
+                //  静态调用会绕过覆写与 destroyResources 钩子链。
+                child.destroy(false, true)
             })
         }
         this._children = undefined
@@ -368,6 +380,16 @@ export class ReactiveEffect extends ManualCleanup {
         }
     }
     /**
+     * 子类资源清理钩子：惰性 meta、lastCleanupFn、cleanPromise、行级 effect frame 等
+     * 归子类所有的资源在这里释放。由静态 ReactiveEffect.destroy 核心在 active 置 false
+     * 之后调用，所有销毁入口（实例 destroy()、destroyChildren、destroyComputed）都汇聚
+     * 到该核心，钩子恰好执行一次。
+     * CAUTION 子类清理逻辑必须放在本钩子（而不是 destroy() 覆写）里：destroy() 覆写
+     *  只有直接调用实例方法时才执行，经 destroyChildren/destroyComputed 销毁时会被绕过。
+     */
+    destroyResources() {
+    }
+    /**
      * @internal
      * 把本 effect 在一次探测运行中捕获的 deps 与 children 原样转移给 target，
      * 自身清空。用于 RxList.map 的行级依赖探测：mapFn 只执行一次（在探测 effect 中），
@@ -402,8 +424,8 @@ export class ReactiveEffect extends ManualCleanup {
             this._children = undefined
         }
     }
-    destroy(ignoreChildren = false) {
-        ReactiveEffect.destroy(this, false, ignoreChildren)
+    destroy(ignoreChildren = false, fromParent = false) {
+        ReactiveEffect.destroy(this, fromParent, ignoreChildren)
     }
     async runGenerator(generator: Generator<any, string, boolean>, beforeRun: (isFirst?:boolean) => any, afterRun: (isLast?:boolean) => any)   {
         // run generator，每次之前要调用 beforeRun，每次之后要调用 afterRun

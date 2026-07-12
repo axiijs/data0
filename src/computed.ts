@@ -5,7 +5,11 @@ import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {CleanupFrame} from "./manualCleanup";
-import {markRetainedReactiveEffectKind, setRetainedReactiveEffectSource} from "./retainedDiagnostics";
+import {
+    markRetainedReactiveEffectKind,
+    setRetainedReactiveEffectSource,
+    trackRetainedReactiveEffectCreated
+} from "./retainedDiagnostics";
 import {restoreEffectDeps} from "./dep.js";
 
 export const computedToInternal = new WeakMap<any, Computed>()
@@ -42,7 +46,9 @@ export type SkipIndicator = { skip: boolean }
 
 export function destroyComputed(computedItem: ComputedData) {
     const internal = computedToInternal.get(computedItem)!
-    ReactiveEffect.destroy(internal)
+    // CAUTION 走实例方法而不是静态 ReactiveEffect.destroy：子类（RxList/RxMap/RxSet）
+    //  可能覆写 destroy 附加行为，绕过实例方法会跳过它们。
+    internal.destroy()
 }
 
 export function getComputedInternal(computedItem: ComputedData) {
@@ -203,10 +209,27 @@ export class Computed extends ReactiveEffect {
         if (callbacks !== undefined) this.callbacks = callbacks
         if (skipIndicator !== undefined) this.skipIndicator = skipIndicator
         if (preventEffectSession) this.preventEffectSession = true
-        markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
         this._status = typeof getter === 'function' ? STATUS_DIRTY : STATUS_CLEAN
+        // CAUTION 回调注册对源模式（无 getter）与计算模式一视同仁：
+        //  源模式结构的 onDestroy/onTrack 同样是有效契约。
+        if (callbacks?.onDestroy) this.on('destroy', callbacks.onDestroy)
+        if (callbacks?.onTrack) this.on('track', callbacks.onTrack)
+        if (callbacks?.onRecompute) this.on('recompute', callbacks.onRecompute)
+        if (callbacks?.onCleanup) this.on('cleanup', callbacks.onCleanup)
 
-        if (!getter) return
+        if (!getter) {
+            // CAUTION 源模式（无 getter 的 RxList/RxMap/RxSet 以及占位 Computed）也是
+            //  完整的生命周期对象：active 必须为 true，否则静态 ReactiveEffect.destroy
+            //  对 inactive 直接 return——destroy 事件从不派发、children/资源从不清理。
+            //  历史缺陷：filter() 把内部 mapList 的销毁挂在 filtered.on('destroy') 上，
+            //  filtered 是源模式列表，destroy() 完全无效（僵尸更新 + 订阅泄漏）。
+            //  这里补上 base 构造器里因无 getter 而跳过的创建登记，销毁登记对称。
+            this.active = true
+            trackRetainedReactiveEffectCreated(this)
+            markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
+            return
+        }
+        markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
 
         this.isAsyncGetter = isAsync(getter)
         this.isGeneratorGetter = isGenerator(getter)
@@ -247,11 +270,6 @@ export class Computed extends ReactiveEffect {
         // 只有 patch 型 computed（applyPatch 消费 triggerInfos）和要求 infos 的自定义
         // 调度器需要 trigger 路径构造 info 对象；其余情况 notifier 走零分配路径。
         if (this.applyPatch || this.scheduleNeedsInfos) this.needsTriggerInfo = true
-
-        if (callbacks?.onDestroy) this.on('destroy', callbacks.onDestroy)
-        if (callbacks?.onTrack) this.on('track', callbacks.onTrack)
-        if (callbacks?.onRecompute) this.on('recompute', callbacks.onRecompute)
-        if (callbacks?.onCleanup) this.on('cleanup', callbacks.onCleanup)
     }
     getRetainedDiagnosticSource() {
         const constructorName = this.constructor?.name || 'Computed'
@@ -631,7 +649,8 @@ export class Computed extends ReactiveEffect {
 
             return Promise.resolve(this.runPatch()).then((patchResult: any) => {
                 // 虽然 patch 的 recompute 是串行的，但是有可能被用户强制的 fullRecompute 打断。
-                // 这个时候就不用管了。
+                // 这个时候就不用管了。destroy 会推进 recomputeId（destroyResources），
+                // 因此已销毁实例的在途收尾也在这里被丢弃。
                 if (recomputeId !== this.recomputeId) return
                 return this.finishPatchRecompute(patchResult)
             }, (err: any) => {
@@ -682,7 +701,9 @@ export class Computed extends ReactiveEffect {
     //  async 错误静默吞掉。只有外部调用 recompute()/读取 cleanPromise 才创建。
     // CAUTION 不能声明为 async：同步 computed 的重算（以及其中的用户异常）必须保持同步语义。
     recomputeInternal(forceRecompute = false) {
-        if ((this._status === STATUS_CLEAN && !forceRecompute) || !this.active) return
+        // CAUTION !this.getter：源模式结构/占位 Computed 没有计算可言。它们现在
+        //  active === true（生命周期可销毁），不能再依赖 active 来挡住重算路径。
+        if (!this.getter || (this._status === STATUS_CLEAN && !forceRecompute) || !this.active) return
 
         // 四种类型计算：
         // async/sync * full/patchable
@@ -736,7 +757,10 @@ export class Computed extends ReactiveEffect {
     }
     async runAsyncPatch() {
         let patchResult
-        while(this.triggerInfos.length) {
+        // CAUTION 每轮循环（以及每个 await 恢复点）都要检查 active：destroy 不会中止
+        //  已挂起的 applyPatch，但必须阻止其结果被继续应用/续跑（否则已销毁实例的
+        //  data 会被在途 patch 复活改写）。
+        while(this.active && this.triggerInfos.length) {
             const waitingTriggerInfos = [...this.triggerInfos]
             this.triggerInfos.length = 0
             let patchPromise
@@ -765,7 +789,8 @@ export class Computed extends ReactiveEffect {
     async runGeneratorPatch() {
         let patchResult
 
-        while(this.triggerInfos.length) {
+        // active 检查与 runAsyncPatch 相同：destroy 后不再续跑
+        while(this.active && this.triggerInfos.length) {
             const waitingTriggerInfos = [...this.triggerInfos]
             this.triggerInfos.length =0
             const generator = (this.applyPatch! as GeneratorApplyPatchType<any>).call(this, this.data, waitingTriggerInfos)
@@ -822,13 +847,21 @@ export class Computed extends ReactiveEffect {
     resetAutoTrack() {
         notifier.resetTracking()
     }
-    destroy(ignoreChildren = false) {
-        assert(ReactiveEffect.activeScopes[ReactiveEffect.activeScopes.length - 1] !== this, 'cannot destroy an active effect inside self')
+    /**
+     * @internal
+     * 由静态 ReactiveEffect.destroy 核心调用（见基类说明）：无论销毁入口是实例
+     * destroy()、父 effect 的 destroyChildren 还是 destroyComputed，都恰好执行一次。
+     */
+    destroyResources() {
+        // CAUTION 推进 recomputeId 使一切在途 async fullRecompute/patch 的收尾分支
+        //  （recomputeId 比对）失效；配合 runAsyncPatch/runGeneratorPatch 的 active
+        //  检查与 Rx 结构变更方法的 active 守卫，destroy 之后在途 patch 不再改写数据。
+        this.recomputeId++
         this.lastCleanupFn?.()
         delete this.lastCleanupFn
         // 计算尚未完成就被销毁时，解除所有 await cleanPromise 的等待方
         this.settleCleanPromise()
-        super.destroy( ignoreChildren)
+        super.destroyResources()
     }
     collectEffect(): () => CleanupFrame {
         return ReactiveEffect.collectEffect()
@@ -870,7 +903,10 @@ export class AtomComputed extends Computed{
     constructor(getter?: GetterType, applyPatch?: ApplyPatchType, dirtyCallback?: DirtyCallback|true, callbacks?: CallbacksType, skipIndicator?: SkipIndicator) {
         super(getter, applyPatch, dirtyCallback, callbacks, skipIndicator)
         this.data = atom(null)
-        this.run([], true)
+        // 无 getter 的占位实例（reduce 的 placeholder 等）没有计算可跑
+        if (getter) {
+            this.run([], true)
+        }
     }
     replaceData(newData: any) {
         if(isAtom(newData)) {
