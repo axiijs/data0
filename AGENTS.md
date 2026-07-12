@@ -137,4 +137,6 @@ pnpm exec stryker run --mutate 'src/dep.ts'      # 指定其他模块
 
 - 建议在每轮深度 review 前对本轮重点模块跑一次，幸存的 mutant 即测试盲区，优先补差分/性质测试而不是逐 mutant 补例子。
 - 幸存 mutant 涉及「架构决策」语义的，对照该节判断是否属于刻意未断言的行为；命中长期无人使用的辅助代码（如 Vue 继承的字符串工具）时，优先考虑删除死代码而不是补测试。
-- 基线记录（用于观察趋势）：2026-07 首跑 `src/util.ts` —— 行覆盖 98.66%，mutation score **65.94%**（240 killed / 113 survived / 12 no-coverage，48s）。行覆盖与检出能力的差距即测试盲区的量化。
+- 基线记录（用于观察趋势）：
+  - 2026-07 首跑 `src/util.ts` —— 行覆盖 98.66%，mutation score **65.94%**（240 killed / 113 survived / 12 no-coverage，48s）。行覆盖与检出能力的差距即测试盲区的量化。
+  - 2026-07 修复轮跑 `src/reactiveEffect.ts`（destroy 核心重构后）—— 行覆盖 96.1%，mutation score **73.10%**（209 killed / 3 timeout / 71 survived / 7 no-coverage，94s）。
