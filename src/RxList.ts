@@ -14,6 +14,7 @@ import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, warn} from "./util.js";
+import {reconstructDigestStates} from "./digestReplay.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
@@ -1087,14 +1088,16 @@ export class RxList<T> extends Computed {
 
         // 运行一次谓词并登记其 reactive 读取；track 归属 resultComputed
         //（reactive 谓词的依赖订阅由此建立，变化时触发 patch → 全量回退）。
-        function matchOne(current:number, resultComputed: Computed) {
+        // dataArr 是"该条 info 操作时"的源状态：单 info 时即 source.data，
+        // 多 info 时来自 digestReplay 重建的快照（见 applyPatch）。
+        function matchOne(dataArr: T[], current:number, resultComputed: Computed) {
             resultComputed.autoTrack()
             const getFrame = notifier.collectTrackTarget()
             let frameClosed = false
             let matchResult: boolean
             let trackTargets: any[]
             try {
-                matchResult = matchFn(source.data[current])
+                matchResult = matchFn(dataArr[current])
                 trackTargets = getFrame()
                 frameClosed = true
             } finally {
@@ -1108,9 +1111,9 @@ export class RxList<T> extends Computed {
             return matchResult!
         }
 
-        function search(start:number, end: number, resultComputed: Computed) {
-            for(let current=start; current < Math.min(end, source.data.length);current++) {
-                if (matchOne(current, resultComputed)) return current
+        function search(dataArr: T[], start:number, end: number, resultComputed: Computed) {
+            for(let current=start; current < Math.min(end, dataArr.length);current++) {
+                if (matchOne(dataArr, current, resultComputed)) return current
             }
             return -1
         }
@@ -1121,21 +1124,19 @@ export class RxList<T> extends Computed {
                 hasItemReactiveDeps = false
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
-                return search(0, Infinity, this)
+                return search(source.data, 0, Infinity, this)
             },
             function applyPatch(this: Computed, data: Atom<number>, triggerInfos){
                 // 增量 cache 无法逐 dep 精确退订/重订。只要 predicate 读取过
                 // reactive 数据，就用 full recompute 保证每轮依赖集合与搜索区间一致；
                 // 无 reactive predicate 的热路径仍保留增量 patch。
                 if (hasItemReactiveDeps) return false
-                // CAUTION 多 info 重放回退（等价类同 groupBy/slice，2026-H2 fuzzKit 统一
-                //  对抗参数域后由 batchReplayFuzz 动态命中）：splice 分支用
-                //  `source.data.length - 本条净增 + 本条删除` 回推"操作时长度"再归一化
-                //  负/越界 start——单 info 时终态恰等于该 info 之后的状态，回推成立；
-                //  多 info 时终态还包含后续 info 的变化，回推出的长度错误 → 负 start
-                //  归一化出错误起点 → 已被删除的旧 match 被误判为"起点之前未受影响"
-                //  而静默保留。多 info 一律全量重算。
-                if (triggerInfos.length > 1) return false
+                // CAUTION 多 info 重放（缺陷类：操作时位置 × 重放终态，曾由 batchReplayFuzz
+                //  动态命中）：splice 的负/越界 start 归一化与 match 扫描都必须发生在
+                //  "该条 info 操作时"的源状态上。digestReplay 内核从终态逆推出逐条
+                //  快照；不可重建（EKC 旧值 undefined 歧义等）回退全量重算。
+                const multi = triggerInfos.length > 1 ? reconstructDigestStates(source.data, triggerInfos) : null
+                if (triggerInfos.length > 1 && !multi) return false
                 let patchSuccess = undefined
                 // 每次 patch 都需要重新注册所有依赖。
                 this.cleanup()
@@ -1144,7 +1145,9 @@ export class RxList<T> extends Computed {
 
                 // CAUTION 用 for...of 而不是 every：every 的回调若不显式 return true 会提前终止，
                 //  导致一次 batch 里的多条 triggerInfo 只处理第一条。
-                for (const triggerInfo of triggerInfos) {
+                for (let infoIndex = 0; infoIndex < triggerInfos.length; infoIndex++) {
+                    const triggerInfo = triggerInfos[infoIndex]
+                    const stateNow = multi ? multi.after(infoIndex) : source.data
                     const { method , argv  ,key, source: triggerSource } = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
@@ -1161,7 +1164,9 @@ export class RxList<T> extends Computed {
                             //  越界 start 会漏掉"append 产生新匹配"的场景。
                             const insertedCount = argv!.length - 2
                             const deletedCount = (triggerInfo.methodResult as unknown[] | undefined)?.length ?? 0
-                            const lengthBeforeSplice = source.data.length - insertedCount + deletedCount
+                            const lengthBeforeSplice = multi
+                                ? multi.lengthBefore(infoIndex)
+                                : source.data.length - insertedCount + deletedCount
                             const startIndex = normalizeSpliceStart(argv![0], lengthBeforeSplice)
                             // 可能新增了更小的能找到的，都从 startIndex 开始重新算。
                             if (this.data.raw == -1 || startIndex <= this.data.raw) {
@@ -1176,13 +1181,13 @@ export class RxList<T> extends Computed {
                             } else if(this.data.raw === -1 || (key as number) < this.data.raw) {
                                 // 当前没有匹配（-1）时任何位置的变化都可能产生新匹配；
                                 // 有匹配时只有更小的 index 才可能替换。快速验证这一个是不是新的 match。
-                                if (matchOne(key as number, this)) data(key as number)
+                                if (matchOne(stateNow, key as number, this)) data(key as number)
                             }
                         }
 
                         // 需要从 startFindingIndex 开始重找，startFindingIndex 前面不需要
                         if (startFindingIndex !== Infinity) {
-                            data(search(startFindingIndex, Infinity, this))
+                            data(search(stateNow, startFindingIndex, Infinity, this))
                         }
                     } else {
                         // 非 source 的触发只可能来自谓词曾读取的 reactive 数据，该情形
@@ -1375,12 +1380,14 @@ export class RxList<T> extends Computed {
                 return groups
             },
             function applyPatch(this: RxMap<any, RxList<T>>, _data, triggerInfos) {
-                // CAUTION 多 info 重放回退：insertInSourceOrder/removeAtSourcePosition 的
-                //  组内定位依赖"前缀 [0, index) 未被本次触及"，前缀按重放时的 source.data
-                //  计数。同一次 digest 有多条 info（batch/延迟调度）时 source.data 是
-                //  终态，操作时位置的前缀计数不再成立（例：batch 内两次 splice 触及
-                //  同 key 前缀 → 删错组内实例）。多 info 一律全量重算。
-                if (triggerInfos.length > 1) return false
+                // CAUTION 多 info 重放：insertInSourceOrder/removeAtSourcePosition 的
+                //  组内定位依赖"前缀 [0, index) 未被本次触及"，前缀必须按**该条 info
+                //  操作时**的源状态计数——重放时 source.data 已是终态。digestReplay
+                //  内核从终态逆推出每条 info 应用后的快照（stateNow），逐条与单 info
+                //  语义对齐；不可重建（EKC 旧值 undefined 歧义等）回退全量重算。
+                const multi = triggerInfos.length > 1 ? reconstructDigestStates(source.data, triggerInfos) : null
+                if (triggerInfos.length > 1 && !multi) return false
+                let stateNow: T[] = source.data
                 const sameKey = (a: any, b: any) => a === b || (a !== a && b !== b)
                 const insertInSourceOrder = (item: T, sourceIndex: number) => {
                     const groupKey = getKey(item)
@@ -1389,7 +1396,7 @@ export class RxList<T> extends Computed {
                     }
                     let groupIndex = 0
                     for (let i = 0; i < sourceIndex; i++) {
-                        if (sameKey(getKey(source.data[i]), groupKey)) groupIndex++
+                        if (sameKey(getKey(stateNow[i]), groupKey)) groupIndex++
                     }
                     this.data.get(groupKey)!.splice(groupIndex, 0, item)
                 }
@@ -1403,9 +1410,9 @@ export class RxList<T> extends Computed {
                     const group = this.data.get(groupKey)
                     if (!group) return
                     let pos = 0
-                    const bound = Math.min(sourceIndex, source.data.length)
+                    const bound = Math.min(sourceIndex, stateNow.length)
                     for (let i = 0; i < bound; i++) {
-                        if (sameKey(getKey(source.data[i]), groupKey)) pos++
+                        if (sameKey(getKey(stateNow[i]), groupKey)) pos++
                     }
                     if (pos < group.data.length) group.splice(pos, 1)
                     // 空组必须删键：全量 computation 不会保留空组，增量路径若只
@@ -1416,14 +1423,18 @@ export class RxList<T> extends Computed {
                     }
                 }
 
-                for (const triggerInfo of triggerInfos) {
+                for (let infoIndex = 0; infoIndex < triggerInfos.length; infoIndex++) {
+                    const triggerInfo = triggerInfos[infoIndex]
+                    stateNow = multi ? multi.after(infoIndex) : source.data
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
                         const newItemsInArgs = argv!.slice(2)
-                        const lengthBeforeSplice = source.data.length - newItemsInArgs.length + deleteItems.length
+                        const lengthBeforeSplice = multi
+                            ? multi.lengthBefore(infoIndex)
+                            : source.data.length - newItemsInArgs.length + deleteItems.length
                         const startIndex = normalizeSpliceStart(argv![0], lengthBeforeSplice)
                         deleteItems.forEach((item) => {
                             // 所有删除项都从 startIndex 起：前缀 [0, startIndex) 未被本次触及
@@ -1434,10 +1445,10 @@ export class RxList<T> extends Computed {
                         })
 
                     } else if (method === 'reorder') {
-                        // membership 不变，只按最终 source 顺序重排现有 group，保持
-                        // group RxList 引用稳定。
+                        // membership 不变，只按该 info 操作时的 source 顺序重排现有 group，
+                        // 保持 group RxList 引用稳定。
                         this.data.forEach((group, groupKey) => {
-                            const nextItems = source.data.filter(item => sameKey(getKey(item), groupKey))
+                            const nextItems = stateNow.filter(item => sameKey(getKey(item), groupKey))
                             group.spliceArray(0, group.data.length, nextItems)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
@@ -1736,12 +1747,15 @@ export class RxList<T> extends Computed {
 
             /** 2) Incremental Patch: interpret splices/sets to update our slice accordingly. */
             function applyPatch(this: RxList<T>, _data, triggerInfos) {
-                // CAUTION 多 info 重放回退（等价类同 groupBy）：区间差量以 info 的
-                //  操作时位置做区间算术，却从重放时的终态 source.data 取补元素；
-                //  同一次 digest 多条 info（batch/延迟调度）时两者不一致，窗口内容
-                //  会错位/重复。多 info 一律全量重算。
-                if (triggerInfos.length > 1) return false
-                for(const info of triggerInfos) {
+                // CAUTION 多 info 重放（缺陷类：操作时位置 × 重放终态）：区间差量以
+                //  info 的操作时位置做区间算术，补元素也必须取自**该条 info 操作时**
+                //  的源状态。digestReplay 内核从终态逆推出逐条快照（stateNow），
+                //  与单 info 语义逐条对齐；不可重建时回退全量重算。
+                const multi = triggerInfos.length > 1 ? reconstructDigestStates(source.data, triggerInfos) : null
+                if (triggerInfos.length > 1 && !multi) return false
+                for (let infoIndex = 0; infoIndex < triggerInfos.length; infoIndex++) {
+                    const info = triggerInfos[infoIndex]
+                    const stateNow = multi ? multi.after(infoIndex) : source.data
                     // ensure it's from this source
                     if (info.source !== source) return false
                     // reorder（sortSelf/reposition/swap）会改变区间内元素的相对顺序，
@@ -1750,7 +1764,7 @@ export class RxList<T> extends Computed {
                     // 负 slice 边界会随 source.length 变化整体平移；现有绝对区间
                     // patch 无法安全表达，回退 full computation。
                     if (info.method === 'splice' && (start! < 0 || end! < 0)) return false
-                    const idxs = clampIndexes(source.data.length)
+                    const idxs = clampIndexes(stateNow.length)
                     // 现在不合法了，清空
                     if (!idxs || !lastIndexes) {
                         return false
@@ -1761,9 +1775,13 @@ export class RxList<T> extends Computed {
 
                     if (method === 'splice') {
                         const insertedItems = argv!.slice(2) as T[]
-                        if (deletedItems.length === 0 && insertedItems.length === 0) return
+                        // CAUTION 必须 continue 而不是 return：多 info 重放中 return 会
+                        //  静默丢弃后续 info（单 info 时代的遗留写法，multi 下是缺陷）。
+                        if (deletedItems.length === 0 && insertedItems.length === 0) continue
 
-                        const lastSourceLength = source.data.length - insertedItems.length + deletedItems.length
+                        const lastSourceLength = multi
+                            ? multi.lengthBefore(infoIndex)
+                            : source.data.length - insertedItems.length + deletedItems.length
                         const spliceStart = normalizeSpliceStart(argv![0], lastSourceLength)
                         const spliceEffectEnd = spliceStart + deletedItems.length
                         const lengthChange = insertedItems.length  - deletedItems.length
@@ -1781,7 +1799,7 @@ export class RxList<T> extends Computed {
                         if ((ucHead || ucTail) && !(spliceStart > idxs[1] || spliceEffectEnd < idxs[0])) {
                             // 1.如果 splice 影响的是中间，先把中间处理了，并且仍然在有效范围内。才有处理的必要
                             if (ucHead && ucTail) {
-                                this.splice(ucHead[1]-ucHead[0], ucTailOldIndex! - (ucHead[1]-ucHead[0]), ...source.data.slice(ucHead[1], ucTail[0]))
+                                this.splice(ucHead[1]-ucHead[0], ucTailOldIndex! - (ucHead[1]-ucHead[0]), ...stateNow.slice(ucHead[1], ucTail[0]))
                             } else if (ucHead) {
                                 this.splice(ucHead[1]-ucHead[0], Infinity)
                             } else {
@@ -1796,13 +1814,13 @@ export class RxList<T> extends Computed {
                         }
 
                         if(oldStart! > idxs[0]) {
-                            this.spliceArray(0, 0, source.data.slice(idxs[0], oldStart))
+                            this.spliceArray(0, 0, stateNow.slice(idxs[0], oldStart))
                         } else if(oldStart! < idxs[0]) {
                             this.splice(0, idxs[0]-oldStart!)
                         }
 
                         if (oldEnd! < idxs[1]) {
-                            this.spliceArray(this.data.length, 0, source.data.slice(oldEnd, idxs[1]))
+                            this.spliceArray(this.data.length, 0, stateNow.slice(oldEnd, idxs[1]))
                         } else if(oldEnd! > idxs[1]) {
                             this.splice(idxs[1] - idxs[0], Infinity)
                         }
