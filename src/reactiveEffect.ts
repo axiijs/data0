@@ -1,4 +1,4 @@
-import {Dep, finalizeDepMarkers, initDepMarkers} from "./dep.js";
+import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost} from "./dep.js";
 import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
 import type {TriggerOpTypes} from "./operations.js";
@@ -407,7 +407,10 @@ export class ReactiveEffect extends ManualCleanup {
         if (deps.length) {
             for (let i = 0; i < deps.length; i++) {
                 const dep = deps[i]
-                if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
+                if (dep.delete(this)) {
+                    trackRetainedDepEffectRemoved(dep)
+                    pruneEmptyDepFromHost(dep)
+                }
             }
             deps.length = 0
         }

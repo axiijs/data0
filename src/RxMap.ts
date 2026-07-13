@@ -93,7 +93,11 @@ export class RxMap<K, V> extends Computed{
         const oldValue = this.data.get(key)
         this.data.set(key, value)
         if (hasValue) {
-            if (value === oldValue) return
+            // CAUTION Object.is 而不是 ===（与 atom 判等、toSorted 身份定位的库内
+            //  语义一致）：0 → -0 是可观察变化（此刻 data 已写入 -0），=== 会静默
+            //  吞掉触发导致派生 values/entries 与 source 分叉；NaN → NaN 无变化，
+            //  === 却会重复触发两次。
+            if (Object.is(value, oldValue)) return
 
             this.trigger(this, TriggerOpTypes.SET, { key, newValue: value, oldValue})
         } else {

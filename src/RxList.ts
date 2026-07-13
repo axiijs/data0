@@ -615,7 +615,11 @@ export class RxList<T> extends Computed {
             return this.data[this.data.length + index]
         }
         const dep = notifier.track(this, TrackOpTypes.GET, index)
-        if (dep && !this.indexKeyDeps.has(index)) {
+        // CAUTION 按身份刷新缓存：该 index 的订阅者全部退订后，notifier 会把空 dep
+        //  从 depsMap 摘除（pruneEmptyDepFromHost），此后重新订阅会创建新 dep——
+        //  只判 has(index) 会让缓存停留在旧的空 dep 上，splice 的受影响区间
+        //  计算（按 _indexKeyDeps 遍历）从此漏掉这个 index（订阅者静默陈旧）。
+        if (dep && this._indexKeyDeps?.get(index) !== dep) {
             this.indexKeyDeps.set(index, dep)
         }
         // CAUTION 这里不做深度的 reactive 包装

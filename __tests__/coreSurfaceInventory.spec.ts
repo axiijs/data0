@@ -155,7 +155,7 @@ const EXPORT_CLASSIFICATION: Record<string, string[]> = {
     // 外围模块(弱覆盖已知,盘点在案:rxTime/rxSlice/linkedList spec 为示例级)
     peripheral: ['RxTime', 'AsyncRxSlice', 'LinkedList', 'ManualCleanup'],
     // 工具与常量
-    utils: ['isAtom', 'isReactivableType', 'replace', 'setComputedRetainedDiagnosticSource', 'TrackOpTypes', 'TriggerOpTypes', 'ITERATE_KEY', 'ITERATE_KEY_KEY_ONLY', 'maxMarkerBits', 'STATUS_DIRTY', 'STATUS_RECOMPUTING_DEPS', 'STATUS_RECOMPUTING', 'STATUS_CLEAN'],
+    utils: ['isAtom', 'isReactivableType', 'replace', 'setComputedRetainedDiagnosticSource', 'TrackOpTypes', 'TriggerOpTypes', 'ITERATE_KEY', 'ITERATE_KEY_KEY_ONLY', 'METHOD_TRACK_KEY', 'EXPLICIT_KEY_CHANGE_TRACK_KEY', 'maxMarkerBits', 'STATUS_DIRTY', 'STATUS_RECOMPUTING_DEPS', 'STATUS_RECOMPUTING', 'STATUS_CLEAN'],
     // 诊断与调试
     diagnostics: [
         'enableData0RetainedObjectDiagnostics', 'disableData0RetainedObjectDiagnostics', 'resetData0RetainedObjectDiagnostics', 'isData0RetainedObjectDiagnosticsEnabled', 'getData0RetainedObjectDiagnosticsSnapshot',

@@ -17,7 +17,7 @@ import {
 } from "../src/debug";
 import {LinkedList} from "../src/LinkedList";
 import {ManualCleanup} from "../src/manualCleanup";
-import {ITERATE_KEY, ITERATE_KEY_KEY_ONLY, Notifier} from "../src/notify";
+import {EXPLICIT_KEY_CHANGE_TRACK_KEY, ITERATE_KEY, ITERATE_KEY_KEY_ONLY, METHOD_TRACK_KEY, Notifier} from "../src/notify";
 import {TrackOpTypes, TriggerOpTypes} from "../src/operations";
 import {ReactiveEffect} from "../src/reactiveEffect";
 import {RxList} from "../src/RxList";
@@ -677,12 +677,14 @@ describe('coverage helpers for core lifecycle APIs', () => {
 
         const objectTarget = {}
         const objectEffect = new CapturingEffect(() => undefined)
+        // METHOD/EXPLICIT_KEY_CHANGE 的记账 key 是内部 Symbol(协议命名空间与用户
+        // 数据 key 隔离,见 notify.ts normalizeTrackKey),不再是字符串枚举值
         Notifier.instance.targetMap.set(objectTarget, new Map<any, any>([
             ['field', new Set([objectEffect]) as any],
             [ITERATE_KEY, new Set([objectEffect]) as any],
             [ITERATE_KEY_KEY_ONLY, new Set([objectEffect]) as any],
-            [TriggerOpTypes.METHOD, new Set([objectEffect]) as any],
-            [TriggerOpTypes.EXPLICIT_KEY_CHANGE, new Set([objectEffect]) as any],
+            [METHOD_TRACK_KEY, new Set([objectEffect]) as any],
+            [EXPLICIT_KEY_CHANGE_TRACK_KEY, new Set([objectEffect]) as any],
         ]))
 
         Notifier.instance.trigger(objectTarget, TriggerOpTypes.ADD, {key: 'field', newValue: 1})
