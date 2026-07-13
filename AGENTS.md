@@ -71,6 +71,7 @@ Review 结论必须分为三类，不得混写：
 - **禁止把无覆盖的格子谎报为有资产**；`UNCOVERED` 是显式登记的债务，其汇总是每轮深度 review 的第一立项来源（先盘点盲格，再发明新方法）。
 - 新增对抗值域维度时：生成器加进 `__tests__/fuzzKit.ts`（所有 fuzz 共享，"加一次、全算子可用"），清单加一列，全部算子重新过账。禁止在单个 fuzz 文件里私藏值域。
 - 每轮 review 至少消掉一批盲格或给出 NA 论证；账本只允许经论证的增长（新算子落地时）。
+- **Oracle 完备性纪律（2026-H3 教训，对偶于 UNCOVERED 规则）**：差分比较默认走 `__tests__/stateOracle.ts` 的**全可观察状态**规范化比对（键集 + 逐键内容 + size），禁止手写"只遍历已存在键比内容"式的部分投影——groupBy 空组键残留曾因该投影（空 ≡ 空恒真）在五个 fuzz 资产下存活多轮，方法 11 的朴素参考模型也被同一投影消费掉。任何弱化（只比部分面）必须在断言处显式注释理由；新增派生结构类型先在 stateOracle 补规范化器再写 fuzz。输入维度有账本（coverageInventory），观察维度同样要有清单：oracle 的强度决定差分测试的上界。
 
 ### 4. data0 特有的 review 检查（附资产追溯）
 
@@ -78,8 +79,8 @@ Review 结论必须分为三类，不得混写：
 
 - 立案前先对照下方「架构决策与已知语义边界」一节：其中列出的行为是既定架构语义，观察到相关现象时引用该节说明，不得作为缺陷报告或擅自"修复"。
   资产：`__tests__/architectureSemantics.spec.ts`、README「架构语义」节。
-- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果，**含 batch/延迟调度下多条 triggerInfo 单次 digest 重放的序列**（triggerInfo 的 key/argv 是操作时位置，source.data 是重放时终态，patch 端凡按终态解释操作时位置都是缺陷；无法安全增量时用 `return false` 回退全量重算，并同步 README 支持矩阵的脚注）。
-  资产：`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）、`__tests__/batchReplayFuzz.spec.ts`（batch 多操作重放差分 + toSorted 等值 tie 差分）、`__tests__/lifecycleAndReplayFixes.spec.ts`（最小复现回归）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
+- `RxList` 派生算子必须验证：每步增量结果等于从当前 `source.data` 全量重算的结果，**含 batch/延迟调度下多条 triggerInfo 单次 digest 重放的序列**（triggerInfo 的 key/argv 是操作时位置，source.data 是重放时终态，patch 端凡按终态解释操作时位置都是缺陷）。多 info 重放**必须经 `src/digestReplay.ts` 内核**取每条 info 操作时的源状态快照（构造性关死该缺陷类；2026-H3 起 groupBy/slice/findIndex 由此从"多 info 回退全量"升级为增量），禁止在 patch 里手写终态回推；内核判不可重建或语义仍无法增量时用 `return false` 回退全量重算，并同步 README 支持矩阵的脚注。
+  资产：`__tests__/digestReplay.spec.ts`（内核逆操作 + batch 内逐操作实录的差分地面真值）、`__tests__/broadOperatorsFuzz.spec.ts`（全算子差分）、`__tests__/duplicateValuesFuzz.spec.ts`（重复值域差分）、`__tests__/batchReplayFuzz.spec.ts`（batch 多操作重放差分 + toSorted 等值 tie 差分）、`__tests__/lifecycleAndReplayFixes.spec.ts`（最小复现回归）。README 的支持矩阵中每个"增量"格子必须有差分覆盖。
 - mutation 测试至少覆盖 splice 的负数、越界、小数、`NaN`、`-0`，重复值，`set`，`reorder`，batch，以及回调抛错。
   资产：`broadOperatorsFuzz` 的操作生成器（对抗参数域）、`batchReplayFuzz` 的 batch 操作生成器、`__tests__/reproducedIssuesFixes.spec.ts`、`__tests__/reviewFixes.spec.ts`。
 - 响应式回调变更后，除结果外还要验证依赖仍会触发、被删除 effect 已销毁、全局 tracking/session 栈恢复。
@@ -169,4 +170,5 @@ pnpm exec stryker run --mutate 'src/dep.ts'      # 指定其他模块
   - 2026-07 燃尽轮重测（coreLedgerBurndown/collectionLedgerBurndown/consumerContractReplay/weirdNumbersFuzz 落地后）——`computed.ts` **70.13%**（381 killed / 11 timeout / 146 survived / 21 no-coverage，+2.09pt，no-cov 29→21）；`RxList.ts` **72.19%**（1440 killed / 37 timeout / 490 survived / 79 no-coverage，+0.11pt；总 mutant 数随新代码路径增加，killed +39）。账本燃尽对核心模块的检出提升显著、对 RxList 的边际提升有限——RxList 的 490 幸存 mutant 需要按等价类专项消化（差分 fuzz 的断言粒度问题），而不是继续加维度，此为下轮立项方向。
   - 2026-07 幸存 mutant 等价类分析（490 个全量分类）：**最大等价类（约 70%，ConditionalExpression 222 + EqualityOperator 91 + LogicalOperator 28，集中在 slice/map/doSplice/toSorted/concat 的增量路径条件与区间算术）= "把增量 patch 变异成回退全量/等价慢路径"——结果仍 ≡ 全量重算，差分 fuzz 构造性杀不死（差分只证结果不证增量性）**。对策：`Computed` 增加 `fullRecompute` 见证事件（无监听者零开销），新资产 `__tests__/incrementalityWitness.spec.ts` 对 README 矩阵逐格断言「增量格子契约内单 info 操作零回退 + 重算格子回退确实发生」，双向钉死增量性语义。次大类：StringLiteral 30（断言/警告消息文本，行为等价，接受不杀）；其余 BlockStatement/OptionalChaining 多为防御性清理路径，由 destroy/稀疏 sweep 渐进覆盖。
   - 2026-07 见证资产落地后重测 `RxList.ts` —— mutation score **74.93%**（1507 killed / 41 timeout / 439 survived / 79 no-coverage，+2.74pt，killed +67，survived 490→439）。增量性见证单资产杀掉 51 个幸存 mutant，验证等价类判断；剩余 439 中约 30 为行为等价（消息文本/性能快慢路径选择），其余作为渐进债务随各 sweep 演进。
+  - 2026-07 `src/digestReplay.ts` 内核落地跑 —— 首跑 70.00%（91 killed / 38 survived / 1 no-cov）；补"协议外合成 info 直喂内核"的守卫可达性测试后 **83.85%**（109 killed / 20 survived / 1 no-cov，30s）。剩余幸存为防御等价类：`methodResult ?? []` 与可选链（协议内恒存在）、reorder 越界检查的单子句变异（其余子句仍拦截）、`new Array(n)` 容量提示（按索引赋值语义等价）——均归入「安全方向/防御分支」接受项。
   - 2026-07 方法 15 债务消化轮。立项前重跑基线（环境漂移校准）：`RxList.ts` 74.70%（1523 killed / 39 timeout / 449 survived / 80 no-coverage）、`computed.ts` 70.18%（382 killed / 11 timeout / 146 survived / 21 no-coverage）。资产 + 死代码清偿落地后——`RxList.ts` **81.47%**（1617 killed / 41 timeout / 345 survived / 32 no-coverage，+6.77pt；no-cov 80→32 主要来自 findIndex 死缓存删除）；`computed.ts` **76.37%**（406 killed / 11 timeout / 119 survived / 10 no-coverage，+6.19pt，no-cov 21→10）。**等价类裁定修正**：此前"剩余约 30 为行为等价"严重低估——本轮逐 mutant 分类确认剩余幸存以「安全方向变异」为主体：(a) 把增量条件变异成"强制回退全量/强制慢路径"（结果仍 ≡ 全量重算，如 doSplice 的 isPureAppend/isPureClear 快路径与慢路径可观察等价、slice 的负 end 单 info 回退是保守而非必要）；(b) 把校正区间变异成"放宽为全量重写"（幂等写 + atom 判等去重使超集校正不可观察，如 createIndexKeySelection 的 affectedRange）；(c) 被构造性防线遮蔽的内部错误（binarySearchFind 的二分变异被 Object.is 线性兜底修正、atomIndexes 初值变异被后续校正循环覆写）；(d) dev 断言消息文本与断言子项（可达状态下其余子项仍然成立）。这些类**定义上不可由行为测试杀死**，属于接受项而非债务；真实债务（守卫可达性、协议字段值、触发精确性、状态机转换序）已由本轮资产钉住。后续轮次不应再以"分数逼近 100%"为目标，而以"新幸存 mutant 必须能归入上述四类之一，否则立案"为验收标准。

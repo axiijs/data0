@@ -2,6 +2,7 @@ import {describe, expect, test} from 'vitest'
 import {destroyComputed} from '../src/computed.js'
 import {RxList} from '../src/RxList.js'
 import {duplicateInts, mulberry32} from './fuzzKit.js'
+import {expectGroupByEqualsModel} from './stateOracle.js'
 
 /**
  * 差分 fuzz:重复原始值域(0..4)下,派生列表的增量结果必须等于
@@ -62,11 +63,7 @@ describe('differential fuzz: duplicate primitive values', () => {
                     expect(filtered.data, `filter ${ctx}`).toEqual(src.filter(x => x % 2 === 0))
                     expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
                     expect([...asSet.data].sort(), `toSet ${ctx}`).toEqual([...new Set(src)].sort())
-                    const expectedGroupKeys = [...new Set(src.map(x => x % 2))].sort((a, b) => a - b)
-                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
-                    for (const [k, g] of grouped.data) {
-                        expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => x % 2 === k))
-                    }
+                    expectGroupByEqualsModel(grouped, src, x => x % 2, ctx)
                     expect(mapped.data, `map ${ctx}`).toEqual(src.map(x => x * 10))
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 3))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])

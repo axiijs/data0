@@ -4,6 +4,7 @@ import {createSelection, RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
 import {duplicateInts, mulberry32} from './fuzzKit.js'
+import {expectGroupByEqualsModel} from './stateOracle.js'
 
 /**
  * 方法 11:模型比对(model comparison)。
@@ -108,11 +109,7 @@ describe('model comparison: 系统级管道网 ≡ 朴素参考模型', () => {
                     expect(mapped.data, `mapped ${ctx}`).toEqual(model.mapped())
                     expect(filtered.data, `filtered ${ctx}`).toEqual(model.filtered())
                     expect(sorted.data, `sorted ${ctx}`).toEqual(model.sorted())
-                    const expectedGroupKeys = [...new Set(list.data.map(x => x % 2))].sort((a, b) => a - b)
-                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
-                    for (const [k, g] of grouped.data) {
-                        expect(g.data, `group[${k}] ${ctx}`).toEqual(model.group(k as number))
-                    }
+                    expectGroupByEqualsModel(grouped, list.data, x => x % 2, ctx)
                     expect(selection.data.length, `selection.len ${ctx}`).toBe(list.data.length)
                     selection.data.forEach(([item, indicator], i) => {
                         expect(item, `selection.item[${i}] ${ctx}`).toBe(list.data[i])

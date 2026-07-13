@@ -184,20 +184,54 @@ describe('README 矩阵「重算」格子:回退确实发生(防双向漂移)', 
         sliced.destroy(); negSliced.destroy(); source.destroy()
     })
 
-    test('groupBy/slice/map(index)/findIndex:batch 多 info 回退', () => {
+    test('map(index):batch 多 info 回退;groupBy/slice/findIndex 经 digestReplay 内核不再回退', () => {
         const source = new RxList<number>([1, 2, 3, 4])
         const grouped = source.groupBy(x => x % 2)
         const sliced = source.slice(1, 3)
         const mappedIdx = source.map((x, i) => x + i.raw)
         const found = source.findIndex(x => x === 3)
-        const w = [witness(grouped), witness(sliced), witness(mappedIdx), witness(found)]
+        const wIncremental = [witness(grouped), witness(sliced), witness(found)]
+        const wMapIdx = witness(mappedIdx)
         batch(() => {
             source.push(5)
             source.splice(0, 1)
         })
-        expect(w.map(f => f()).every(c => c >= 1)).toBe(true)
+        // digestReplay 内核重建操作时源状态:可重建的多 info 保持增量
+        expect(wIncremental.map(f => f())).toEqual([0, 0, 0])
+        // map(index) 的行级 index atom 记账仍回退
+        expect(wMapIdx()).toBeGreaterThanOrEqual(1)
+        // 增量结果 ≡ 全量重算
+        expect([...grouped.data.keys()].sort()).toEqual([...new Set(source.data.map(x => x % 2))].sort())
+        for (const [k, g] of grouped.data) {
+            expect(g.data).toEqual(source.data.filter(x => x % 2 === k))
+        }
+        expect(sliced.data).toEqual(source.data.slice(1, 3))
+        expect(found.raw).toBe(source.data.findIndex(x => x === 3))
         for (const g of grouped.data.values()) g.destroy()
         grouped.destroy(); sliced.destroy(); mappedIdx.destroy()
+        ;(getComputedInternal(found) as Computed).destroy()
+        source.destroy()
+    })
+
+    test('groupBy/slice/findIndex:多 info 含歧义 EKC(旧值 undefined)时回退全量', () => {
+        const source = new RxList<number | undefined>([undefined, 2, 3, 4])
+        const grouped = source.groupBy(x => (x ?? 0) % 2)
+        const sliced = source.slice(1, 3)
+        const found = source.findIndex(x => x === 3)
+        const w = [witness(grouped), witness(sliced), witness(found)]
+        batch(() => {
+            source.splice(2, 1)     // 让 set 不是首条,凑成多 info
+            source.set(0, 9)        // oldValue === undefined → digestReplay 判不可重建
+        })
+        expect(w.map(f => f()).every(c => c >= 1)).toBe(true)
+        // 回退是正确性措施:终值仍 ≡ 全量重算
+        expect(sliced.data).toEqual(source.data.slice(1, 3))
+        expect(found.raw).toBe(source.data.findIndex(x => x === 3))
+        for (const [k, g] of grouped.data) {
+            expect(g.data).toEqual(source.data.filter(x => (x ?? 0) % 2 === k))
+        }
+        for (const g of grouped.data.values()) g.destroy()
+        grouped.destroy(); sliced.destroy()
         ;(getComputedInternal(found) as Computed).destroy()
         source.destroy()
     })

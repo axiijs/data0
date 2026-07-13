@@ -2,6 +2,7 @@ import {describe, expect, test} from 'vitest'
 import {destroyComputed} from '../src/computed.js'
 import {RxList} from '../src/RxList.js'
 import {duplicateInts, mulberry32, withWeirdNumbers} from './fuzzKit.js'
+import {expectGroupByEqualsModel} from './stateOracle.js'
 
 /**
  * NaN/-0 元素值域 × 列表派生算子差分 fuzz(2026-H2 契约裁定后的对账资产)。
@@ -72,18 +73,7 @@ describe('differential fuzz: NaN/-0 element values', () => {
                     // Set 语义:SameValueZero(NaN 归一为单成员,-0/0 合并)
                     const modelSet = [...new Set(src)]
                     expect([...asSet.data].sort(nanAwareCompare), `toSet ${ctx}`).toEqual(modelSet.sort(nanAwareCompare))
-                    const expectedGroupKeys = [...new Set(src.map(x => Number.isNaN(x) ? 'nan' : x % 2))]
-                        .sort((a, b) => String(a).localeCompare(String(b)))
-                    expect(
-                        [...grouped.data.keys()].sort((a, b) => String(a).localeCompare(String(b))),
-                        `group keys ${ctx}`,
-                    ).toEqual(expectedGroupKeys)
-                    for (const [k, g] of grouped.data) {
-                        expect(g.data, `group[${String(k)}] ${ctx}`).toEqual(src.filter(x => {
-                            const key = Number.isNaN(x) ? 'nan' : x % 2
-                            return key === k || (Number.isNaN(key as number) && Number.isNaN(k as number))
-                        }))
-                    }
+                    expectGroupByEqualsModel(grouped, src, x => (Number.isNaN(x) ? 'nan' : x % 2), ctx)
                     expect(foundNaN.raw, `findIndex(NaN) ${ctx}`).toBe(src.findIndex(x => Number.isNaN(x)))
                 }
             } finally {

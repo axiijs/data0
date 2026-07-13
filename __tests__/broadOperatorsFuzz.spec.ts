@@ -4,6 +4,7 @@ import {RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
 import {adversarialSpliceStart, mulberry32, uniqueInts} from './fuzzKit.js'
+import {expectGroupByEqualsModel} from './stateOracle.js'
 
 type Op =
     | { kind: 'splice', start: number, deleteCount: number, items: number[] }
@@ -94,11 +95,7 @@ describe('broad fuzz: unique values, all operators', () => {
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
                     expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
-                    const expectedGroupKeys = [...new Set(src.map(x => x % 3))].sort((a, b) => a - b)
-                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
-                    for (const [k, g] of grouped.data) {
-                        expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => x % 3 === k))
-                    }
+                    expectGroupByEqualsModel(grouped, src, x => x % 3, ctx)
                     expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x % 5 === 0))
                     expect(len.raw, `length ${ctx}`).toBe(src.length)
                 }
