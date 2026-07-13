@@ -108,6 +108,8 @@ describe('model comparison: 系统级管道网 ≡ 朴素参考模型', () => {
                     expect(mapped.data, `mapped ${ctx}`).toEqual(model.mapped())
                     expect(filtered.data, `filtered ${ctx}`).toEqual(model.filtered())
                     expect(sorted.data, `sorted ${ctx}`).toEqual(model.sorted())
+                    const expectedGroupKeys = [...new Set(list.data.map(x => x % 2))].sort((a, b) => a - b)
+                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
                     for (const [k, g] of grouped.data) {
                         expect(g.data, `group[${k}] ${ctx}`).toEqual(model.group(k as number))
                     }

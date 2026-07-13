@@ -75,7 +75,7 @@ describe('M16-5 RxTime disposer interleaving', () => {
 
     test('stopAutorun after mixed entries then late timer advance', () => {
         const t = new RxTime()
-        const passed = t.eq(Date.now()) // may be true immediately depending on simplifying
+        t.eq(Date.now()) // register a resolve-side autorun alongside subscribe
         const ticker = t.subscribe(30)
         const snap = ticker.raw
         t.stopAutorun!()

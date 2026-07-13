@@ -78,7 +78,7 @@ describe('M16-extra CompactDep / scheduleNeedsInfos / destroy race', () => {
         c2.destroy()
     })
 
-    test.fails('fetch success after destroy must not write isLoading (destroyed inert)', async () => {
+    test('fetch success after destroy must not write isLoading (destroyed inert)', async () => {
         const pending: Deferred<number[]>[] = []
         const slice = new AsyncRxSlice<number>([0], () => {
             const d = deferred<number[]>()
@@ -88,35 +88,13 @@ describe('M16-extra CompactDep / scheduleNeedsInfos / destroy race', () => {
         slice.fetch()
         expect(slice.isLoading.raw).toBe(true)
         slice.destroy()
-        // Freeze loading at destroy-time expectation: either leave true or clear via
-        // destroyResources — but late promise must not be the one mutating control atoms.
-        // Stronger contract: destroy should bump receipt or gate on active.
-        const loadingAtDestroy = slice.isLoading.raw
-        pending[0].resolve([1])
-        await tick()
-        await tick()
-        // If destroy left loading true and finally cleared it — still a post-destroy write.
-        // Fail if ANY post-destroy mutation of isLoading occurred.
-        // We detect by: destroy should set isLoading false itself OR bump receipt.
-        // Current: destroy leaves isLoading true, finally writes false → post-destroy write.
-        expect(loadingAtDestroy).toBe(false)
+        // destroyResources clears isLoading and bumps receipt so late finally is a no-op.
         expect(slice.isLoading.raw).toBe(false)
-    })
-
-    test('document: destroy leaves isLoading true until late finally clears it', async () => {
-        const pending: Deferred<number[]>[] = []
-        const slice = new AsyncRxSlice<number>([0], () => {
-            const d = deferred<number[]>()
-            pending.push(d)
-            return d.promise
-        })
-        slice.fetch()
-        slice.destroy()
-        expect(slice.isLoading.raw).toBe(true) // still true right after destroy
         pending[0].resolve([1])
         await tick()
         await tick()
-        expect(slice.isLoading.raw).toBe(false) // cleared by zombie finally
+        expect(slice.isLoading.raw).toBe(false)
+        expect(slice.data).toEqual([0])
     })
 
     test('sync scheduler during batch: recomputes at schedule time still sees A2 stale reads of other computeds', () => {

@@ -85,6 +85,11 @@ export class AsyncRxSlice<T> extends RxList<T>{
      * 统一资源清理钩子（见 ReactiveEffect.destroyResources）。
      */
     destroyResources() {
+        // 作废一切在途 fetch/update：回调只认 receipt 匹配。不 bump 的话，
+        // destroy 后仍可能写入 loadError / isLoading（僵尸控制态）。
+        this.fetchReceipt++
+        this.isLoading(false)
+        this.loadError(null)
         if (this.autoFetchPromise) {
             destroyComputed(this.autoFetchPromise)
         }

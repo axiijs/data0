@@ -1408,6 +1408,12 @@ export class RxList<T> extends Computed {
                         if (sameKey(getKey(source.data[i]), groupKey)) pos++
                     }
                     if (pos < group.data.length) group.splice(pos, 1)
+                    // 空组必须删键：全量 computation 不会保留空组，增量路径若只
+                    // 清内容不删键，has/size/keys 与全量分叉，空 RxList 子结构泄漏。
+                    if (group.data.length === 0) {
+                        this.delete(groupKey)
+                        group.destroy()
+                    }
                 }
 
                 for (const triggerInfo of triggerInfos) {
