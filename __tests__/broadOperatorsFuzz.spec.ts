@@ -94,6 +94,8 @@ describe('broad fuzz: unique values, all operators', () => {
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
                     expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
+                    const expectedGroupKeys = [...new Set(src.map(x => x % 3))].sort((a, b) => a - b)
+                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
                     for (const [k, g] of grouped.data) {
                         expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => x % 3 === k))
                     }

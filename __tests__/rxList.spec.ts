@@ -832,7 +832,9 @@ describe('RxList', () => {
 
         list.splice(2, Infinity)
         expect(grouped.get('low')!.toArray()).toMatchObject([{id:1, score: 1}, {id:2, score: 2}])
-        expect(grouped.get('high')!.toArray()).toMatchObject([])
+        // 空组键必须删除（≡ 全量重算；增量不得保留幽灵 key）
+        expect(grouped.data.has('high')).toBe(false)
+        expect([...grouped.data.keys()]).toEqual(['low'])
     })
 
     test('every with true to false', () => {

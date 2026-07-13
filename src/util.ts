@@ -11,9 +11,16 @@ export const objectToString = Object.prototype.toString
 export const toTypeString = (value: unknown): string =>
     objectToString.call(value)
 
-// CAUTION 这个判断不能识别是不是自己创建的对象
-// export const isPlainObject = (val: unknown): val is object => toTypeString(val) === '[object Object]'
-export const isPlainObject = (val: unknown): val is object => (val?.constructor === Object || val?.constructor === Array )
+// CAUTION 用原型链而非 constructor 字段：
+//  - Object.create(null) 无 constructor，旧实现会误判为非 plain，导致 object-atom
+//    的 get 转发到 updater 函数、属性读永远 undefined 且不 track。
+//  - 用户可写 `obj.constructor = null` 同样绕过 constructor===Object 门闩。
+//  - class 实例的原型不是 Object/Array/null，仍被排除（与 atom 浅包装契约一致）。
+export const isPlainObject = (val: unknown): val is object => {
+    if (val === null || typeof val !== 'object') return false
+    const proto = Object.getPrototypeOf(val)
+    return proto === Object.prototype || proto === Array.prototype || proto === null
+}
 
 export const def = (obj: object, key: string | symbol, value: any) => {
     Object.defineProperty(obj, key, {

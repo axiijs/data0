@@ -34,9 +34,7 @@ describe('M16-4 object-atom proxy edges', () => {
         stop()
     })
 
-    test.fails('null-prototype object atom: properties must be readable via proxy', () => {
-        // DYNAMIC REPRO: isPlainObject requires constructor===Object|Array;
-        // Object.create(null) is misclassified → get forwards to updater fn → undefined.
+    test('null-prototype object atom: properties must be readable via proxy', () => {
         const raw = Object.create(null) as Record<string, number>
         raw.x = 1
         const obj = atom(raw)
@@ -56,9 +54,7 @@ describe('M16-4 object-atom proxy edges', () => {
         }
     })
 
-    test.fails('constructor key overwrite breaks subsequent object-atom property access', () => {
-        // DYNAMIC REPRO: set constructor=null via proxy → isPlainObject becomes false
-        // → further gets hit the updater function, not the stored object.
+    test('constructor key overwrite does not break subsequent object-atom property access', () => {
         const obj = atom({n: 1} as Record<string, unknown>)
         ;(obj as any).constructor = null
         expect(obj.raw.n).toBe(1)
@@ -66,18 +62,6 @@ describe('M16-4 object-atom proxy edges', () => {
         ;(obj as any).n = 2
         expect(obj.raw.n).toBe(2)
         expect((obj as any).n).toBe(2)
-    })
-
-    test('constructor overwrite: document actual broken reads', () => {
-        const obj = atom({n: 1} as Record<string, unknown>)
-        ;(obj as any).constructor = null
-        // After overwrite, proxy get no longer surfaces value fields:
-        expect((obj as any).n).toBeUndefined()
-        expect(obj.raw.n).toBe(1) // raw still intact
-        // set trap still writes into value (typeof object), but get path is broken
-        ;(obj as any).n = 2
-        expect(obj.raw.n).toBe(2)
-        expect((obj as any).n).toBeUndefined()
     })
 
     test('array atom: length shrink notifies subscribers', () => {
@@ -101,16 +85,16 @@ describe('M16-4 object-atom proxy edges', () => {
         expect((obj as any).n).toBeUndefined()
     })
 
-    test('null-proto atom: set trap still writes value but get remains blind', () => {
+    test('null-proto atom: set + get stay coherent', () => {
         const raw = Object.create(null) as Record<string, number>
         raw.x = 1
         const obj = atom(raw)
         ;(obj as any).x = 5
         expect(obj.raw.x).toBe(5)
-        expect((obj as any).x).toBeUndefined()
+        expect((obj as any).x).toBe(5)
     })
 
-    test.fails('null-proto atom: property reads must establish subscriptions', () => {
+    test('null-proto atom: property reads establish subscriptions', () => {
         const raw = Object.create(null) as Record<string, number>
         raw.x = 1
         const obj = atom(raw)
@@ -121,21 +105,6 @@ describe('M16-4 object-atom proxy edges', () => {
         expect(seen).toBe(1)
         ;(obj as any).x = 9
         expect(seen).toBe(9)
-        stop()
-    })
-
-    test('null-proto atom: document that autorun never tracks property path', () => {
-        const raw = Object.create(null) as Record<string, number>
-        raw.x = 1
-        const obj = atom(raw)
-        let seen = -1
-        const stop = autorun(() => {
-            seen = (obj as any).x ?? -99
-        }, true)
-        expect(seen).toBe(-99) // read was undefined, never tracked value
-        ;(obj as any).x = 9
-        expect(seen).toBe(-99) // set notifies nobody subscribed via property get
-        expect(obj.raw.x).toBe(9)
         stop()
     })
 })

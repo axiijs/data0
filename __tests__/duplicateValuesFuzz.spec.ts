@@ -62,6 +62,8 @@ describe('differential fuzz: duplicate primitive values', () => {
                     expect(filtered.data, `filter ${ctx}`).toEqual(src.filter(x => x % 2 === 0))
                     expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
                     expect([...asSet.data].sort(), `toSet ${ctx}`).toEqual([...new Set(src)].sort())
+                    const expectedGroupKeys = [...new Set(src.map(x => x % 2))].sort((a, b) => a - b)
+                    expect([...grouped.data.keys()].sort((a, b) => a - b), `group keys ${ctx}`).toEqual(expectedGroupKeys)
                     for (const [k, g] of grouped.data) {
                         expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => x % 2 === k))
                     }

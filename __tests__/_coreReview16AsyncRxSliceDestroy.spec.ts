@@ -116,9 +116,7 @@ describe('M16-6 AsyncRxSlice destroy × overlapping fetch/update', () => {
         }
     })
 
-    test.fails('update reject after destroy must not set loadError (zombie write)', async () => {
-        // destroy does not bump fetchReceipt; in-flight update.catch still sees matching
-        // receipt and writes loadError/isLoading on the destroyed instance.
+    test('update reject after destroy must not set loadError', async () => {
         const pending: Deferred<number[]>[] = []
         const slice = new AsyncRxSlice<number>([1], () => {
             const d = deferred<number[]>()
@@ -131,23 +129,8 @@ describe('M16-6 AsyncRxSlice destroy × overlapping fetch/update', () => {
         await u
         await tick()
         expect(slice.data).toEqual([1])
-        expect(slice.loadError.raw).toBe(null)
-    })
-
-    test('update reject after destroy: document zombie loadError write', async () => {
-        const pending: Deferred<number[]>[] = []
-        const slice = new AsyncRxSlice<number>([1], () => {
-            const d = deferred<number[]>()
-            pending.push(d)
-            return d.promise
-        }, x => x)
-        const u = slice.update(1, 1)
-        slice.destroy()
-        pending[0].reject(new Error('net'))
-        await u
-        await tick()
         expect(slice.active).toBe(false)
-        expect(slice.loadError.raw).toBeInstanceOf(Error)
-        expect((slice.loadError.raw as Error).message).toBe('net')
+        expect(slice.loadError.raw).toBe(null)
+        expect(slice.isLoading.raw).toBe(false)
     })
 })

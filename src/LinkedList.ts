@@ -77,10 +77,14 @@ export class LinkedList<T extends object> implements Iterable<ListNode<T>>{
         }
 
 
-        // 清理 itemToNode 中被移除的映射，避免 getNodeByItem 返回已脱链的节点
+        // 清理 itemToNode 中被移除的映射，避免 getNodeByItem 返回已脱链的节点。
+        // 仅当 WeakMap 指向本节点时才删：同一 item 身份出现多次时，constructor
+        // 只登记最后一个节点；删掉非登记节点不应抹掉幸存者的查找入口。
         let current: ListNode<T>|undefined = startNode
         while (current) {
-            this.itemToNode.delete(current.item)
+            if (this.itemToNode.get(current.item) === current) {
+                this.itemToNode.delete(current.item)
+            }
             if (current === endNode) break
             current = current.next
         }
