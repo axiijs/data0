@@ -3,6 +3,7 @@ import {atom} from '../src/atom.js'
 import {computed, Computed, destroyComputed} from '../src/computed.js'
 import {batch, notifier} from '../src/notify.js'
 import {ReactiveEffect} from '../src/reactiveEffect.js'
+import {RxList} from '../src/RxList.js'
 
 /**
  * L2 防线自检:验证 dev-mode 全局不变量断言在违约时真的会开火。
@@ -54,6 +55,47 @@ describe('dev-mode 不变量断言', () => {
             expect(notifier.isDigesting).toBe(false)
         } finally {
             destroyComputed(double)
+        }
+    })
+})
+
+describe('RxList 行级记账不变量的开火自检', () => {
+    // 这些断言由全套测试被动执行（零误报），这里主动违约验证它们真的会开火：
+    // 变异掉断言条件/守卫（mutation 审计的幸存类之一）会让本组测试当场失败。
+    test('atomIndexes 值漂移在下一次结构变更时被检出', () => {
+        const source = new RxList([1, 2, 3])
+        const mapped = source.map((x, idx) => x + idx.raw)
+        try {
+            // 破坏 index atom 的值（模拟记账错位）
+            source.atomIndexes![1]!(5)
+            expect(() => source.push(4)).toThrow('atomIndex value drift at 1')
+        } finally {
+            mapped.destroy()
+            source.destroy()
+        }
+    })
+
+    test('atomIndexes 长于 data 在下一次结构变更时被检出', () => {
+        const source = new RxList([1, 2])
+        const mapped = source.map((x, idx) => x + idx.raw)
+        try {
+            source.atomIndexes!.push(atom(2), atom(3))
+            expect(() => source.push(9)).toThrow('atomIndexes longer than data')
+        } finally {
+            mapped.destroy()
+            source.destroy()
+        }
+    })
+
+    test('map 行级 effect frame 与数据错位在 patch 边界被检出', () => {
+        const source = new RxList([1, 2])
+        const mapped = source.map(x => x * 2)
+        try {
+            mapped.effectFramesArray.push([])   // 人为错位
+            expect(() => source.push(3)).toThrow('map effectFramesArray misaligned with data')
+        } finally {
+            mapped.destroy()
+            source.destroy()
         }
     })
 })

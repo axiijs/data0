@@ -1,11 +1,5 @@
 export const extend = Object.assign
 
-const hasOwnProperty = Object.prototype.hasOwnProperty
-export const hasOwn = (
-    val: object,
-    key: string | symbol
-) => hasOwnProperty.call(val, key)
-
 export const isArray = Array.isArray
 // FIXME 支持自定义的 Map 和 Set
 export const isMap = (val: unknown): val is Map<any, any> =>
@@ -13,29 +7,9 @@ export const isMap = (val: unknown): val is Map<any, any> =>
 export const isSet = (val: unknown): val is Set<any> =>
     toTypeString(val) === '[object Set]'
 
-export const isDate = (val: unknown): val is Date =>
-    toTypeString(val) === '[object Date]'
-export const isRegExp = (val: unknown): val is RegExp =>
-    toTypeString(val) === '[object RegExp]'
-export const isFunction = (val: unknown): val is Function =>
-    typeof val === 'function'
-export const isString = (val: unknown): val is string => typeof val === 'string'
-export const isSymbol = (val: unknown): val is symbol => typeof val === 'symbol'
-export const isObject = (val: unknown): val is Record<any, any> =>
-    val !== null && typeof val === 'object'
-
-export const isPromise = <T = any>(val: unknown): val is Promise<T> => {
-    return isObject(val) && isFunction(val.then) && isFunction(val.catch)
-}
-
 export const objectToString = Object.prototype.toString
 export const toTypeString = (value: unknown): string =>
     objectToString.call(value)
-
-export const toRawType = (value: unknown): string => {
-    // extract "RawType" from strings like "[object RawType]"
-    return toTypeString(value).slice(8, -1)
-}
 
 // CAUTION 这个判断不能识别是不是自己创建的对象
 // export const isPlainObject = (val: unknown): val is object => toTypeString(val) === '[object Object]'
@@ -56,20 +30,6 @@ export function isStringOrNumber(target: any) {
 export function isReactivableType( data: any ) {
     return isPlainObject(data) || isArray(data)  || isMap(data) || isSet(data)
 }
-
-export const getStackTrace = function() {
-    const obj = {};
-    //@ts-ignore
-    Error.captureStackTrace(obj, getStackTrace);
-    //@ts-ignore
-    return obj.stack.split('\n').slice(1, Infinity).map(line => {
-        const nameAndLoc =  line.replace(/^\s+at\s/, '').split(' ')
-        if (nameAndLoc.length === 1) nameAndLoc.unshift('anonymous')
-        nameAndLoc[1] = nameAndLoc[1].slice(1, nameAndLoc[1].length -1)
-        return nameAndLoc
-    });
-};
-
 
 export function assert(condition: boolean, message: string ) {
     if (!condition) {
@@ -92,9 +52,7 @@ export function isGenerator(fn: Function) {
     return fn.constructor.name === 'GeneratorFunction'
 }
 
-export function uuid() {
-    return Math.random().toString(36).substring(2)
-} // CAUTION 为了一般场景中的新能，不深度 replace!
+// CAUTION 为了一般场景中的新能，不深度 replace!
 //  用户可以通过 computed 的再封装实现对某个 computed 结果的深度监听。
 export function replace(source: any, nextSourceValue: any) {
     const rawSource = source
