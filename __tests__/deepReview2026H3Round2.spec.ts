@@ -3,9 +3,11 @@ import {RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
 import {createSelection} from '../src/RxList.js'
-import {computed, destroyComputed, Computed} from '../src/computed.js'
+import {computed, destroyComputed, getComputedInternal, Computed} from '../src/computed.js'
 import {atom} from '../src/atom.js'
-import {notifier} from '../src/notify.js'
+import {batch, notifier} from '../src/notify.js'
+
+const tick = () => new Promise<void>(r => setTimeout(r, 0))
 
 /**
  * 2026-H3 第二轮深度 review(方法 18:协议命名空间碰撞审计 + GC 可达性/记账残留审计)
@@ -56,17 +58,42 @@ describe('缺陷类 8:协议命名空间碰撞(用户 key 撞 "method"/"explicit
             const list = s.toList()
             const uni = s.union(other)
             const diff = s.difference(other)
+            const inter = s.intersection(other)
+            const sym = s.symmetricDifference(other)
             try {
                 s.add(evil)
                 expect(list.data).toEqual(['a', evil])
                 expect([...uni.data].sort()).toEqual(['a', 'b', evil].sort())
                 expect([...diff.data].sort()).toEqual(['a', evil].sort())
+                expect([...inter.data]).toEqual([])
+                expect([...sym.data].sort()).toEqual(['a', 'b', evil].sort())
+                other.add(evil)
+                expect([...inter.data]).toEqual([evil])
                 s.delete(evil)
                 expect(list.data).toEqual(['a'])
                 expect([...diff.data]).toEqual(['a'])
+                expect([...inter.data]).toEqual([])
+                expect([...sym.data].sort()).toEqual(['a', 'b', evil].sort())
             } finally {
-                list.destroy(); uni.destroy(); diff.destroy()
+                list.destroy(); uni.destroy(); diff.destroy(); inter.destroy(); sym.destroy()
                 s.destroy(); other.destroy()
+            }
+        }
+    })
+
+    test('toMap:元组 key 为协议字符串(内部 RxMap.set/delete 路径)', () => {
+        for (const evil of PROTOCOL_STRINGS) {
+            const l = new RxList<[string, number]>([['a', 1]])
+            const asMap = l.toMap()
+            const keys = asMap.keys()
+            try {
+                l.push([evil, 2])
+                expect([...asMap.data.entries()]).toEqual([['a', 1], [evil, 2]])
+                expect(keys.data).toEqual(['a', evil])
+                l.splice(1, 1)
+                expect(keys.data).toEqual(['a'])
+            } finally {
+                asMap.destroy(); l.destroy()
             }
         }
     })
@@ -235,6 +262,65 @@ describe('缺陷类 10:RxMap.set 判等采用 Object.is', () => {
  * 修复:dep 记录宿主(host/hostKey),退订到空时从 depsMap 摘除;
  * restoreEffectDeps(错误恢复)负责把被摘除的 dep 重新挂回/合并。
  */
+/**
+ * 缺陷类 12:reduce/reduceToAtom 的"纯尾插"增量判定按**重放时终态**长度回推
+ * (argv[0] === source.data.length - 插入数),多 info 重放下把"越界 clamp 到尾部"
+ * 的 splice 误判为尾插——喂给 reduceFn 的 index 与全量重算分叉(操作时位置 ×
+ * 重放终态的缺陷类,与 findIndex/groupBy/slice 同源)。修复:判定与应用都经
+ * digestReplay 内核取逐条操作时长度;顺带让 batch 内连续 push 保持增量
+ * (旧判定下多 info 必然回退)。
+ */
+describe('缺陷类 12:reduce 多 info 尾插判定按操作时长度', () => {
+    test('batch 内越界 clamp 尾插:index 与全量一致', () => {
+        const source = new RxList<string>(['x', 'y'])
+        const collected = source.reduce<RxList<string>>((last, item, index) => {
+            last.push(`${item}@${index}`)
+        })
+        const joined = source.reduceToAtom((acc: string, item, index) => `${acc},${item}@${index}`, '')
+        try {
+            // 两条 info 的 argv[0] 都恰等于 终态长(4) - 插入数(1) = 3:旧判定误入增量,
+            // 但 info1 操作时长度是 2(splice(3) 被 clamp 到 2),index 应为 2 而不是 3。
+            batch(() => {
+                source.splice(3, 0, 'a')
+                source.splice(3, 0, 'b')
+            })
+            expect(collected.data).toEqual(source.data.map((item, i) => `${item}@${i}`))
+            expect(joined.raw).toBe(source.data.reduce((acc, item, i) => `${acc},${item}@${i}`, ''))
+        } finally {
+            collected.destroy()
+            destroyComputed(joined)
+            source.destroy()
+        }
+    })
+
+    test('batch 内连续 push 保持增量(经操作时长度逐条对齐)', () => {
+        const source = new RxList<number>([1, 2])
+        const collected = source.reduce<RxList<number>>((last, item, index) => {
+            last.push(item * 100 + index)
+        })
+        let fullRecomputes = 0
+        ;(collected as unknown as Computed).on('fullRecompute', () => fullRecomputes++)
+        try {
+            batch(() => {
+                source.push(3)
+                source.push(4)
+            })
+            expect(collected.data).toEqual(source.data.map((x, i) => x * 100 + i))
+            expect(fullRecomputes).toBe(0)
+            // 混合操作(非尾插)仍回退全量,结果一致
+            batch(() => {
+                source.push(5)
+                source.unshift(0)
+            })
+            expect(collected.data).toEqual(source.data.map((x, i) => x * 100 + i))
+            expect(fullRecomputes).toBeGreaterThan(0)
+        } finally {
+            collected.destroy()
+            source.destroy()
+        }
+    })
+})
+
 describe('缺陷类 11:depsMap 空 Dep 条目随订阅退订循环无界残留', () => {
     function depsMapSize(target: object): number {
         const m = (notifier as any).targetMap.get(target)
@@ -315,5 +401,47 @@ describe('缺陷类 11:depsMap 空 Dep 条目随订阅退订循环无界残留',
             destroyComputed(c)
             list.destroy()
         }
+    })
+})
+
+/**
+ * 缺陷类 13(方法 18 的 GC 审计衍生):挂起的 async/generator getter 在 destroy
+ * 之后完成时,completeTracking(isLast) 无条件重放 asyncTracks,把已销毁 effect
+ * 重新订阅回各 dep——dep 对僵尸保持强引用(泄漏),每次源触发都白走一遍调度。
+ * 修复:active === false 时丢弃重放(与"destroy 取消在途 async patch"同一语义)。
+ */
+describe('缺陷类 13:destroy 后完成的 async getter 不再重放订阅', () => {
+    test('generator getter 挂起期间 destroy,完成后 deps 保持空', async () => {
+        const a = atom(1)
+        let release!: () => void
+        const gate = new Promise<void>(r => { release = r })
+        const c = computed(function* () {
+            const v = a()          // 挂起前读:track 排队进 asyncTracks
+            yield gate
+            return v * 2
+        } as any)
+        await tick()               // 首轮 getter 启动并挂起
+        const internal = getComputedInternal(c)!
+        destroyComputed(c)
+        expect(internal.deps.length).toBe(0)
+        release()
+        await tick(); await tick() // getter 完成,asyncTracks 重放点
+        expect(internal.deps.length).toBe(0)
+        const dep = notifier.getPrimitiveAtomDep(a) as any
+        const subscribers = dep ? (dep.overflow ? dep.overflow.size : (dep.single !== undefined ? 1 : 0)) : 0
+        expect(subscribers).toBe(0)
+        a(5)                       // 触发无僵尸接收方,不抛错
+        await tick()
+    })
+
+    test('存活的 async getter 的 asyncTracks 重放不受影响(阴性对照)', async () => {
+        const a = atom(1)
+        const c = computed(async () => a() * 2)
+        await tick()
+        expect(c.raw).toBe(2)
+        a(3)
+        await tick()
+        expect(c.raw).toBe(6)      // 重订阅存活,写入仍驱动重算
+        destroyComputed(c)
     })
 })

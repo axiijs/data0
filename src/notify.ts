@@ -72,9 +72,14 @@ export const ITERATE_KEY_KEY_ONLY = Symbol('Map key iterate' )
 //  （公开调用形状 manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD) 不变）。
 export const METHOD_TRACK_KEY = Symbol('method track key')
 export const EXPLICIT_KEY_CHANGE_TRACK_KEY = Symbol('explicit key change track key')
+// CAUTION 先比 type 再比 key：track 是最热路径之一，绝大多数调用 type 是
+//  'get'/'atom'/'iterate'，一次 interned 字符串比较（指针比较）即可短路。
 function normalizeTrackKey(type: TrackOpTypes, key: unknown): unknown {
-  if (key === TriggerOpTypes.METHOD && type === TrackOpTypes.METHOD) return METHOD_TRACK_KEY
-  if (key === TriggerOpTypes.EXPLICIT_KEY_CHANGE && type === TrackOpTypes.EXPLICIT_KEY_CHANGE) return EXPLICIT_KEY_CHANGE_TRACK_KEY
+  if (type === TrackOpTypes.METHOD) {
+    if (key === TriggerOpTypes.METHOD) return METHOD_TRACK_KEY
+  } else if (type === TrackOpTypes.EXPLICIT_KEY_CHANGE) {
+    if (key === TriggerOpTypes.EXPLICIT_KEY_CHANGE) return EXPLICIT_KEY_CHANGE_TRACK_KEY
+  }
   return key
 }
 /**
