@@ -222,3 +222,67 @@ describe('R3-C2 特征:class 实例 atom 的属性读写不对称', () => {
         stop()
     })
 })
+
+describe('R3-M notify.ts mutation 审计盲区补杀', () => {
+    test('shouldTrigger=false 对 primitive atom 写路径同样生效(triggerPrimitiveAtomValue 的暂停门)', async () => {
+        // 既有 shouldTrigger 覆盖只走 keyed trigger(notifier.trigger);primitive atom
+        // 的特化写路径(triggerPrimitiveAtomValue)有独立的暂停门,变异该门无测试检出。
+        const {Notifier} = await import('../src/notify.js')
+        const a = atom(1)
+        const seen: number[] = []
+        const stop = autorun(() => { seen.push(a()) }, true)
+        expect(seen).toEqual([1])
+        Notifier.instance.shouldTrigger = false
+        try {
+            a(2) // 值已写入,但订阅者不触发
+        } finally {
+            Notifier.instance.shouldTrigger = true
+        }
+        expect(a.raw).toBe(2)
+        expect(seen).toEqual([1])
+        a(3)
+        expect(seen).toEqual([1, 3])
+        stop()
+    })
+
+    test('batch 内 primitive atom 写路径的 session info 形状(scheduleAtomEffect)', async () => {
+        // scheduleAtomEffect 是 batch 内 atom 写的特化排队路径:info 必须逐次
+        // 累积且形状为 {type:'atom', key:'value', newValue, oldValue}。变异
+        // _sessionInfos 初值(塞垃圾元素)或 needsTriggerInfo 门无测试检出——
+        // 既有 batch × atom 覆盖都用不消费 info 的 effect。
+        const {batch} = await import('../src/notify.js')
+        const a = atom(1)
+        const batches: TriggerInfo[][] = []
+        const capture = new Computed(function (this: Computed) {
+            this.manualTrack(a, TrackOpTypes.ATOM, 'value')
+        }, function (_d: any, ts: TriggerInfo[]) {
+            batches.push([...ts])
+        })
+        capture.run([], true)
+        batch(() => { a(2); a(3) })
+        expect(batches.length).toBe(1)
+        expect(batches[0].map(i => ({type: i.type, key: i.key, newValue: i.newValue, oldValue: i.oldValue}))).toEqual([
+            {type: TriggerOpTypes.ATOM, key: 'value', newValue: 2, oldValue: 1},
+            {type: TriggerOpTypes.ATOM, key: 'value', newValue: 3, oldValue: 2},
+        ])
+        capture.destroy()
+    })
+
+    test('同一 effect 同时订阅 key dep 与 ITERATE dep:DELETE 触发经去重路径恰跑一次', () => {
+        // trigger 的多 dep 去重路径(dedupedEffects)在 deps 数组含空槽
+        // (ITERATE_KEY_KEY_ONLY 无人订阅 → depsMap.get 为 undefined)时依赖
+        // `if (!dep) continue` 跳空。既有测试从未同时铺满 key+ITERATE 两个 dep,
+        // 变异该守卫/去重结构无检出。
+        const m = new RxMap<string, number>([['a', 1], ['b', 2]])
+        let runs = 0
+        const stop = autorun(() => {
+            runs++
+            m.get('a')       // key dep
+            m.forEach(() => {}) // ITERATE dep
+        }, true)
+        expect(runs).toBe(1)
+        m.delete('a')        // DELETE:key dep + ITERATE + ITERATE_KEY_KEY_ONLY(空)
+        expect(runs).toBe(2) // 去重:恰好一次,不因双 dep 跑两次
+        stop(); m.destroy()
+    })
+})
