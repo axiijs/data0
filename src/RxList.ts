@@ -1742,6 +1742,17 @@ export class RxList<T> extends Computed {
                     } else if (method === 'reorder') {
                         return false
                     } else if (typeof key === 'number' && Number.isInteger(key) && key >= 0) {
+                        // CAUTION 段长守卫：越界 set（契约内透传）会让源段长度跳变
+                        //  （len 3 → set(10) → len 11），EKC 的 key 落在旧段之外时按
+                        //  段内偏移直写会覆盖到后续源的段（B 段元素整体错位，结构性
+                        //  错乱而不只是洞物化差异）。回退全量重算与终态源对齐。
+                        //  旧段长 = 本列表长 − 其他源现长（单 info 守卫已保证其他源
+                        //  在本次 digest 未变）。
+                        let othersLength = 0
+                        for (let i = 0; i < sources.length; i++) {
+                            if (i !== sourceIndex) othersLength += sources[i].data.length
+                        }
+                        if (key >= this.data.length - othersLength) return false
                         this.set(offset + key, newValue as T)
                     } else {
                         return false
@@ -2165,14 +2176,20 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             // 指示器（选中集是稀疏的，两向 toggle 的旧算法在"选中 index 落在删除
             // 区间/多选相邻"等组合下会关错行）。等长替换时后续行不动，新行已按
             // index 初始化，无需修正。
+            // CAUTION 洞位行安全（?.）：越界 set（契约内透传）会让行数组出洞，校正
+            //  循环撞洞位直接 TypeError 且抛给 list.splice 调用方，违反"OOB set ×
+            //  派生算子不崩溃且可恢复"等价类（sparseSetOperatorsSweep 只测了纯尾插,
+            //  尾插不进本循环）。洞位行无 indicator 可校正，跳过与 map/filter 的
+            //  行级 ?. 守卫一致。
             if (deleteCount !== insertCount) {
                 const selectedIndexes = getSelectedIndexes()
                 for (let i = startIndex + insertCount; i < list.data.length; i++) {
-                    list.data[i][1](selectedIndexes.has(i))
+                    list.data[i]?.[1](selectedIndexes.has(i))
                 }
             }
         } else if (triggerInfo.method === 'reorder') {
             // 行随源重排，但选中的 index 不动：重排后受影响区间逐行按新 index 校正
+            // （洞位行 ?. 跳过，同上 splice 校正循环的说明）
             const reorderInfo = triggerInfo.reorderInfo as ReorderPatchInfo | undefined
             list.reorder(triggerInfo.argv![0] as Order[], reorderInfo)
             const selectedIndexes = getSelectedIndexes()
@@ -2180,7 +2197,7 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             const start = affected ? Math.max(affected[0], 0) : 0
             const end = affected ? Math.min(affected[1] + 1, list.data.length) : list.data.length
             for (let i = start; i < end; i++) {
-                list.data[i][1](selectedIndexes.has(i))
+                list.data[i]?.[1](selectedIndexes.has(i))
             }
         } else {
             // explicit key change（set）：index 不变，行内容替换，选中状态由 index 决定

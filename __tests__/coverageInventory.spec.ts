@@ -59,7 +59,7 @@ export const INVENTORY: Record<string, Row> = {
     'RxList.filter':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
     'RxList.toSorted':       row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
     'RxList.slice':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
-    'RxList.concat':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
+    'RxList.concat':         row(BROAD, DUP, H2, `${SWEEP}+deepReview2026H3Round3.spec.ts(段长跳变回退)`, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
     'RxList.groupBy':        row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
     'RxList.toSet':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
     'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
@@ -73,7 +73,7 @@ export const INVENTORY: Record<string, Row> = {
     'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', SWEEP, BATCH, DESTROY, 'NA:值无关(只依赖结构长度)'),
     'RxList.createSelection':         row('createSelection.spec.ts(示例级)', H2, 'collectionLedgerBurndown.spec.ts(undefined item)', SWEEP, MODEL, DESTROY, 'collectionLedgerBurndown.spec.ts(NaN item 含孪生行)'),
     'RxList.createSelections':        row('createSelection.spec.ts(示例级)', H2, 'collectionLedgerBurndown2.spec.ts(undefined item)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown.spec.ts(batch splice+选中集)', 'collectionLedgerBurndown.spec.ts(含 autoReset 清理)', 'collectionLedgerBurndown2.spec.ts(NaN 孪生行)'),
-    'RxList.createIndexKeySelection': row('createSelection.spec.ts(示例级)', 'NA:按 index 键(与元素值无关)', 'collectionLedgerBurndown.spec.ts(undefined 行内容)', SWEEP, 'collectionLedgerBurndown.spec.ts(batch 不等长 splice)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN/-0 行内容)'),
+    'RxList.createIndexKeySelection': row('createSelection.spec.ts(示例级)', 'NA:按 index 键(与元素值无关)', 'collectionLedgerBurndown.spec.ts(undefined 行内容)', `${SWEEP}+deepReview2026H3Round3.spec.ts(校正循环洞位)`, 'collectionLedgerBurndown.spec.ts(batch 不等长 splice)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN/-0 行内容)'),
 
     // ---- RxMap 派生 ----
     'RxMap.keys':    row(BROAD, 'NA:Map key 构造性唯一', 'collectionLedgerBurndown.spec.ts(undefined value)', 'NA:非数组结构', MODEL, DESTROY, 'reproducedIssuesFixes.spec.ts(F10 delete(NaN),示例级)'),

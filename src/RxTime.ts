@@ -124,8 +124,12 @@ export class RxTime {
                  this.timeoutId = null
              }
              // 下次变化的时候重新计算
+             // CAUTION isFinite 守卫：系数相消（t1.gt(t2) 这类 RxTime 差,coefficient
+             //  为 0）时 -constant/0 是 ±Infinity——表达式值与时间无关,不存在"下次
+             //  变化时刻"。不加守卫会 setTimeout(Infinity)：Node 打
+             //  TimeoutOverflowWarning 并 clamp 成 1ms 的虚假唤醒,浏览器 clamp 成 0。
              const nextChangeTimestamp = - constant / coefficient
-             if (nextChangeTimestamp > currentTimestamp)  {
+             if (Number.isFinite(nextChangeTimestamp) && nextChangeTimestamp > currentTimestamp)  {
                  // CAUTION 这里的 +2 非常重要，因为系数常数可能有浮点，或者 Date.now() 算出来的时候可能病名有达到真正的变化时间。
                  //  所以这里使用 +2 来保证在是真正已经产生变化了。
                  const timeoutTime = nextChangeTimestamp - currentTimestamp + 2

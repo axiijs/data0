@@ -54,6 +54,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 - atom 写入后**同步**执行订阅者,顺序为订阅顺序;computed 默认立即重算(`immediate`),async getter 默认经 microtask 调度。
 - **对象 atom 的浅属性写入会触发**:`obj.x = 1` 经 proxy set 陷阱通知订阅者;`obj.raw.nested.n = 1` 或取出嵌套对象后再改**不会**触发,需 `obj({...})` 整替换(无深 Proxy)。
+- **atom 的对象特性由创建时初始值的形态决定,不随后续写入迁移**:以原始值/`null`/`undefined` 起手的 atom 是无 Proxy 的轻量形态,之后写入对象(`a(user)`)后整值读写与依赖追踪一切正常,但**属性级读写不可用**——`a.x` 读不到值对象的属性、`a.x = 1` 既不写入值对象也不触发(落在 atom 函数对象自身上)。需要属性级用法时以对象初值创建 atom;以 `null` 起手的"暂无数据"atom 请坚持整值替换。class 实例 atom 的属性**写**会写穿实例并触发,属性**读**不转发(属性读仅对 plain object 承诺)。特征测试见 `__tests__/deepReview2026H3Round3.spec.ts`。
 - **菱形依赖存在 glitch**(AGENTS.md A1):`a→c` 且 `a→b→c` 时,`c` 可能先以"新 a + 旧 b"重算一次,下游可观察到中间值并产生重复重算;**终值保证收敛正确**。对中间态敏感的副作用应自行防抖或读 `.raw` 终值。
 - **同步重算环会抛错**:在同步 computed 重算过程中又触发它自身的依赖变更,会抛出 `detect recompute triggerred in sync recompute`,请将变更移到调度回调中。
 
@@ -113,7 +114,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 | `RxList.length`、`RxMap.keys/values/entries/size`、`RxSet.size` | 增量(`clear`/`replace` 部分重算) | 增量 | 无关 |
 | `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量(`replace` 的 `newItems` 按 Set 语义去重) | — | — |
 
-**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、或增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)时回退。回退是正确性措施,结果不变,只损失该次增量性。
+**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度),越界 `set` 使源段长度跳变时单变更也回退(防跨段错位);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、或增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)时回退。回退是正确性措施,结果不变,只损失该次增量性。
 
 矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie,`__tests__/deepReview2026H2Findings.spec.ts` 覆盖 selection 家族的重复 item 域与 toSorted 的 undefined 元素值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
 
