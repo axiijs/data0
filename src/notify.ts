@@ -1,4 +1,4 @@
-import {CompactDep, createCompactDep, createDep, Dep, newTracked, wasTracked} from "./dep";
+import {CompactDep, createCompactDep, createDep, Dep, newTracked, reattachDepToHost, wasTracked} from "./dep";
 import {TrackOpTypes, TriggerOpTypes} from "./operations";
 import {Computed} from "./computed";
 import {assert, extend} from "./util";
@@ -61,6 +61,27 @@ export type DebuggerEvent = {
 export const ITERATE_KEY = Symbol( 'iterate' )
 // Object/Array 执行 ownKeys 或者 Map 执行 keys 的时候用到。
 export const ITERATE_KEY_KEY_ONLY = Symbol('Map key iterate' )
+// CAUTION 协议订阅（METHOD/EXPLICIT_KEY_CHANGE）的 depsMap 记账 key。
+//  曾直接用字符串枚举值（'method'/'explicit_key_change'）作 key，与用户数据 key
+//  共享同一命名空间：RxMap 的 key / RxSet 的成员 / groupBy 的组键恰为这两个字符串时
+//  （按 HTTP method 分组是完全现实的输入），SET/ADD/DELETE 的 key dep 与内部
+//  METHOD 订阅者是同一个 dep——派生结构的 applyPatch 收到非协议形状的 info：
+//  RxMap.keys 的 assert(unreachable) 直接抛给 map.set 调用方，RxSet.toList 等
+//  对 methodResult 解构 TypeError 且派生静默分叉。track/trigger 双侧统一经
+//  normalizeTrackKey 映射为内部 Symbol，用户 key 与协议 key 从构造上隔离
+//  （公开调用形状 manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD) 不变）。
+export const METHOD_TRACK_KEY = Symbol('method track key')
+export const EXPLICIT_KEY_CHANGE_TRACK_KEY = Symbol('explicit key change track key')
+// CAUTION 先比 type 再比 key：track 是最热路径之一，绝大多数调用 type 是
+//  'get'/'atom'/'iterate'，一次 interned 字符串比较（指针比较）即可短路。
+function normalizeTrackKey(type: TrackOpTypes, key: unknown): unknown {
+  if (type === TrackOpTypes.METHOD) {
+    if (key === TriggerOpTypes.METHOD) return METHOD_TRACK_KEY
+  } else if (type === TrackOpTypes.EXPLICIT_KEY_CHANGE) {
+    if (key === TriggerOpTypes.EXPLICIT_KEY_CHANGE) return EXPLICIT_KEY_CHANGE_TRACK_KEY
+  }
+  return key
+}
 /**
  * The bitwise track markers support at most 30 levels of recursion.
  * This value is chosen to enable modern JS engines to use a SMI on all platforms.
@@ -241,6 +262,9 @@ export class Notifier {
 
     // FIXME 对 async 的 reactive，要暂存，complete 的时候才确认。因为它是可以被打断重算的。
 
+    // 协议 key（METHOD/EXPLICIT_KEY_CHANGE）与用户数据 key 的命名空间隔离
+    key = normalizeTrackKey(type, key)
+
     let depsMap = this.targetMap.get(target)
     if (!depsMap) {
       this.targetMap.set(target, (depsMap = new Map()))
@@ -248,6 +272,10 @@ export class Notifier {
     let dep = depsMap.get(key)
     if (!dep) {
       depsMap.set(key, (dep = createDep()))
+      // 宿主记账：退订到空时把本 dep 从 depsMap 摘除（见 dep.ts pruneEmptyDepFromHost），
+      // 否则"订阅不同 key → 退订"的循环会在长活 target 上留下无界的空 Dep 条目。
+      dep.host = depsMap
+      dep.hostKey = key
     }
 
     const eventInfo = __DEV__
@@ -297,6 +325,11 @@ export class Notifier {
             dep.add(activeEffect!)
             trackRetainedDepEffectAdded(dep)
             activeEffect!.addDep(dep)
+            // async 收尾先 cleanup 再重放 asyncTracks：cleanup 可能把瞬时清空的
+            // dep 从宿主摘除（pruneEmptyDepFromHost），这里挂回，否则重订阅落在
+            // 孤儿 dep 上，后续 trigger 永远找不到本 effect。
+            const effective = reattachDepToHost(dep, activeEffect!)
+            if (effective !== dep) activeEffect!.addDep(effective)
           }
         })
       }
@@ -336,7 +369,10 @@ export class Notifier {
 
     } else {
       // schedule runs for SET | ADD | DELETE
-      if (key !== void 0) {
+      // CAUTION 'key' in inputInfo 兜住"key 恰为 undefined"的带内值：RxMap 支持
+      //  undefined 作为合法 key，get(undefined) 的订阅者曾因 `key !== void 0`
+      //  把"未提供 key"与"key 为 undefined"混为一谈而永久漏触发（静默陈旧）。
+      if (key !== void 0 || 'key' in inputInfo) {
         deps.push(depsMap.get(key))
       }
 
@@ -355,10 +391,10 @@ export class Notifier {
           deps.push(depsMap.get(ITERATE_KEY))
           break
         case TriggerOpTypes.METHOD:
-          deps.push(depsMap.get(TriggerOpTypes.METHOD))
+          deps.push(depsMap.get(METHOD_TRACK_KEY))
           break
         case TriggerOpTypes.EXPLICIT_KEY_CHANGE:
-          deps.push(depsMap.get(TriggerOpTypes.EXPLICIT_KEY_CHANGE))
+          deps.push(depsMap.get(EXPLICIT_KEY_CHANGE_TRACK_KEY))
           break
       }
     }

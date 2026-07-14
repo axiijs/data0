@@ -1,4 +1,4 @@
-import {Dep, finalizeDepMarkers, initDepMarkers} from "./dep.js";
+import {Dep, finalizeDepMarkers, initDepMarkers, pruneEmptyDepFromHost} from "./dep.js";
 import {maxMarkerBits, Notifier, notifier} from "./notify.js";
 import type {InputTriggerInfo, TriggerInfo} from "./notify.js";
 import type {TriggerOpTypes} from "./operations.js";
@@ -304,7 +304,14 @@ export class ReactiveEffect extends ManualCleanup {
             if (isLast) {
                 this.cleanup()
                 if (this._asyncTracks) {
-                    this._asyncTracks.forEach(track => track())
+                    // CAUTION destroy 后不得重放:挂起的 async/generator getter 完成时
+                    //  才走到这里,若期间 effect 已销毁(cleanup 已在 destroy 中执行过),
+                    //  重放会把已销毁 effect 重新订阅回各 dep——dep 对僵尸保持强引用
+                    //  (真实泄漏),且每次源触发都白走一遍调度路径。与"destroy 取消
+                    //  在途 async patch 的后续应用"(README §5)同一语义。
+                    if (this.active) {
+                        this._asyncTracks.forEach(track => track())
+                    }
                     this._asyncTracks.length = 0
                 }
             }
@@ -405,9 +412,19 @@ export class ReactiveEffect extends ManualCleanup {
     cleanup() {
         const {deps} = this
         if (deps.length) {
+            // CAUTION 只在销毁路径（active 已置 false）摘除空 dep：活跃 effect 的
+            //  cleanup 是"重算前复位"（prepareTracking 的 full-cleanup、patch 的手动
+            //  重注册），紧接着就会 re-track 同一批 key——此时摘除会把 dep 的复用
+            //  变成每轮重算的 delete+重分配（findIndex patch 实测 -13% 吞吐）。
+            //  无界增长的记账残留只来自"创建→销毁"的 churn（destroy 必经此处且
+            //  active 为 false），在这里摘除即可封死该缺陷类。
+            const prune = !this.active
             for (let i = 0; i < deps.length; i++) {
                 const dep = deps[i]
-                if (dep.delete(this)) trackRetainedDepEffectRemoved(dep)
+                if (dep.delete(this)) {
+                    trackRetainedDepEffectRemoved(dep)
+                    if (prune) pruneEmptyDepFromHost(dep)
+                }
             }
             deps.length = 0
         }

@@ -163,8 +163,22 @@ export class RxList<T> extends Computed {
     pruneIndexKeyDeps(): boolean {
         const indexDeps = this._indexKeyDeps
         if (!indexDeps || indexDeps.size === 0) return false
+        // CAUTION 与 notifier 的记账残留摘除（pruneEmptyDepFromHost）联动：
+        //  index dep 退订清空后可能已被从 depsMap 摘除，甚至同 index 被重新订阅
+        //  重建成了新 dep。缓存必须以 depsMap 的现行 dep 为准重同步——只按持有的
+        //  旧 dep 判空会误删（旧 dep 空、新 dep 有订阅者），splice 的受影响区间
+        //  从此漏触发该 index。重同步放在结构变更入口（这些 entry 本来就要遍历），
+        //  at() 的读热路径保持零额外开销。
+        const depsMap = notifier.targetMap.get(this)
         for (const [index, dep] of indexDeps) {
-            if (isDepEmpty(dep)) indexDeps.delete(index)
+            const current = depsMap?.get(index)
+            if (current === undefined) {
+                indexDeps.delete(index)
+            } else if (current !== dep) {
+                indexDeps.set(index, current)
+            } else if (isDepEmpty(dep)) {
+                indexDeps.delete(index)
+            }
         }
         return indexDeps.size > 0
     }
@@ -615,6 +629,9 @@ export class RxList<T> extends Computed {
             return this.data[this.data.length + index]
         }
         const dep = notifier.track(this, TrackOpTypes.GET, index)
+        // 缓存可能因记账摘除而过期（dep 被 pruneEmptyDepFromHost 移除后同 index
+        // 重新订阅会建新 dep），由 pruneIndexKeyDeps 在结构变更入口统一重同步，
+        // 这里保持读热路径零额外开销。
         if (dep && !this.indexKeyDeps.has(index)) {
             this.indexKeyDeps.set(index, dep)
         }
@@ -982,6 +999,18 @@ export class RxList<T> extends Computed {
             },
         )
     }
+    // CAUTION reduce/reduceToAtom 的"纯尾插"增量判定必须以**该条 info 操作时**的
+    //  源长度归一化 start（缺陷类：操作时位置 × 重放时终态）：多 info 重放时逐条
+    //  拿终态长度回推会把"越界 clamp 到尾部"的 splice 误判为尾插（argv[0] 恰等于
+    //  终态长 - 插入数），增量喂给 reduceFn 的 index 与全量重算分叉。单 info 时
+    //  终态回推成立；多 info 经 digestReplay 内核取逐条操作时长度，判定不误入
+    //  且真尾插序列（batch 内连续 push）保持增量。
+    private static isPureTailAppend(info: TriggerInfo, lengthBefore: number): boolean {
+        if (info.method !== 'splice') return false
+        const deletedCount = (info.methodResult as unknown[] | undefined)?.length ?? 0
+        if (deletedCount !== 0) return false
+        return normalizeSpliceStart(info.argv![0], lengthBefore) === lengthBefore
+    }
     reduce<U extends Computed = RxList<T>>(reduceFn: (last:U, item: T, index: number) => any, ResultComputed: new (...args:any[])=>U = RxList as any): U {
         const source = this
         return new ResultComputed(
@@ -1006,20 +1035,23 @@ export class RxList<T> extends Computed {
                 return result
             },
             function applyMapArrayPatch(this: U, _data:any, triggerInfos: TriggerInfo[]) {
-                // 只有纯粹的新增在末尾新增，是可以使用增量计算的
-                const shouldRecompute = triggerInfos.some((triggerInfo) => {
-                    const { method , argv   } = triggerInfo
-                    return !(method === 'splice' && argv![0] === source.data.length - argv!.slice(2).length && argv![1] === 0)
-                })
+                // 只有纯粹的尾部新增可以增量（判定与应用都按操作时长度，见 isPureTailAppend）
+                const multi = triggerInfos.length > 1 ? reconstructDigestStates(source.data, triggerInfos) : null
+                if (triggerInfos.length > 1 && !multi) return false
+                const lengthBeforeAt = (infoIndex: number, info: TriggerInfo) => multi
+                    ? multi.lengthBefore(infoIndex)
+                    : source.data.length - (info.argv!.length - 2) + ((info.methodResult as unknown[] | undefined)?.length ?? 0)
+                for (let i = 0; i < triggerInfos.length; i++) {
+                    const info = triggerInfos[i]
+                    if (info.method !== 'splice' || !RxList.isPureTailAppend(info, lengthBeforeAt(i, info))) return false
+                }
 
-                if(shouldRecompute) return false
-
-                triggerInfos.forEach((triggerInfo) => {
-                    const { argv   } = triggerInfo
+                for (let infoIndex = 0; infoIndex < triggerInfos.length; infoIndex++) {
+                    const triggerInfo = triggerInfos[infoIndex]
+                    const { argv } = triggerInfo
                     // CAUTION 这里重新从已经改变的  source 去读，才能重新被 reactive proxy 处理，和全量计算时收到的参数一样
                     const newItemsInArgs = argv!.slice(2)
-                    // patch 执行时 source 已包含新增项，先还原 splice 前长度。
-                    const originLength = source.data.length - newItemsInArgs.length
+                    const originLength = lengthBeforeAt(infoIndex, triggerInfo)
                     for(let i = 0; i < newItemsInArgs.length; i++) {
                         const getFrame = ReactiveEffect.collectEffect!()
                         try {
@@ -1028,7 +1060,7 @@ export class RxList<T> extends Computed {
                             this.effectFramesArray![i + originLength] = getFrame() as ReactiveEffect[]
                         }
                     }
-                })
+                }
             }
         )
     }
@@ -1041,23 +1073,27 @@ export class RxList<T> extends Computed {
                 return source.data.reduce(reduceFn, initialValue)
             },
             function applyMapArrayPatch(this: Computed, data:any, triggerInfos: TriggerInfo[]) {
-                // 只有纯粹的新增在末尾新增，是可以使用增量计算的
-                const shouldRecompute = triggerInfos.some((triggerInfo) => {
-                    const { method , argv   } = triggerInfo
-                    return !(method === 'splice' && argv![0] === source.data.length - argv!.slice(2).length && argv![1] === 0)
-                })
+                // 只有纯粹的尾部新增可以增量（判定与应用都按操作时长度，见 isPureTailAppend）
+                const multi = triggerInfos.length > 1 ? reconstructDigestStates(source.data, triggerInfos) : null
+                if (triggerInfos.length > 1 && !multi) return false
+                const lengthBeforeAt = (infoIndex: number, info: TriggerInfo) => multi
+                    ? multi.lengthBefore(infoIndex)
+                    : source.data.length - (info.argv!.length - 2) + ((info.methodResult as unknown[] | undefined)?.length ?? 0)
+                for (let i = 0; i < triggerInfos.length; i++) {
+                    const info = triggerInfos[i]
+                    if (info.method !== 'splice' || !RxList.isPureTailAppend(info, lengthBeforeAt(i, info))) return false
+                }
 
-                if(shouldRecompute) return false
-
-                triggerInfos.forEach((triggerInfo) => {
+                for (let infoIndex = 0; infoIndex < triggerInfos.length; infoIndex++) {
+                    const triggerInfo = triggerInfos[infoIndex]
                     const { argv } = triggerInfo
                     // CAUTION 这里重新从已经改变的  source 去读，才能重新被 reactive proxy 处理，和全量计算时收到的参数一样
                     const newItemsInArgs = argv!.slice(2)
-                    const originLength = source.data.length - newItemsInArgs.length
+                    const originLength = lengthBeforeAt(infoIndex, triggerInfo)
                     for(let i = 0; i < newItemsInArgs.length; i++) {
                         data(reduceFn(data.raw, newItemsInArgs[i], i + originLength))
                     }
-                })
+                }
             }
         )
     }
