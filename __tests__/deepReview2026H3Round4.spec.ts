@@ -151,7 +151,7 @@ describe('R4-1 map(mapFn 读 index()) × reorder：非 batch 触发序', () => {
 describe('R4-2 indexBy/toMap patch 插入侧 × null/undefined 行', () => {
     test('indexBy(属性形式)：push(null/undefined) 不抛错且 ≡ 全量（跳过）', () => {
         const source = new RxList<{id: number} | null | undefined>([{id: 1}, null])
-        const byId = source.indexBy('id' as never)
+        const byId = source.indexBy('id')
         try {
             expect([...byId.data.keys()]).toEqual([1])
             expect(() => source.push(null)).not.toThrow()
@@ -184,7 +184,7 @@ describe('R4-2 indexBy/toMap patch 插入侧 × null/undefined 行', () => {
 
     test('indexBy：set 替换 null 行 / 用 null 替换实体行（EKC 双侧守卫）', () => {
         const source = new RxList<{id: number} | null>([{id: 1}, null])
-        const byId = source.indexBy('id' as never)
+        const byId = source.indexBy('id')
         try {
             // null 旧行 → 实体新行：无旧 entry 可删，添加新 entry
             expect(() => source.set(1, {id: 9})).not.toThrow()
@@ -221,7 +221,7 @@ describe('R4-2 indexBy/toMap patch 插入侧 × null/undefined 行', () => {
 
     test('恢复性：抛错修复后派生结构与全量重算保持一致（含 batch 多 info）', () => {
         const source = new RxList<{id: number} | null>([{id: 1}])
-        const byId = source.indexBy('id' as never)
+        const byId = source.indexBy('id')
         try {
             batch(() => {
                 source.push(null)

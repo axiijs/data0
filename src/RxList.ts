@@ -1567,7 +1567,10 @@ export class RxList<T> extends Computed {
         )
     }
 
-    indexBy(inputIndexKey: keyof T|((item: T) => any)) {
+    // CAUTION keyof NonNullable<T> 而不是 keyof T：computation/patch 都显式支持
+    //  null/undefined 行（跳过），keyof (X | null) 是 never 会把属性形式对可空
+    //  行列表整个封死；对非空 T 两者相同（纯放宽，无下游破坏）。
+    indexBy(inputIndexKey: keyof NonNullable<T>|((item: T) => any)) {
         const source = this
         // CAUTION 稀疏行安全(2026-H2 缺陷类:OOB set × 属性形式 indexBy):越界 set
         //  产生的洞位读出 undefined——属性读 `(undefined)[key]` 直接 TypeError 且派生
@@ -1618,12 +1621,12 @@ export class RxList<T> extends Computed {
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry;
                         // null 旧行与全量语义一致地视为"无 entry")
                         if (oldValue != null) {
-                            const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
+                            const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as NonNullable<T>)[inputIndexKey]
                             this.delete(indexKey)
                         }
                         // set(i, null/undefined)：全量语义跳过该行，无新 entry
                         if (newValue != null) {
-                            const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as T)[inputIndexKey]
+                            const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as NonNullable<T>)[inputIndexKey]
                             this.set(newKey, newValue as T)
                         }
                     }
