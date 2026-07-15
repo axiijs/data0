@@ -1937,7 +1937,10 @@ export class RxList<T> extends Computed {
                         if ((ucHead || ucTail) && !(spliceStart > idxs[1] || spliceEffectEnd < idxs[0])) {
                             // 1.如果 splice 影响的是中间，先把中间处理了，并且仍然在有效范围内。才有处理的必要
                             if (ucHead && ucTail) {
-                                this.splice(ucHead[1]-ucHead[0], ucTailOldIndex! - (ucHead[1]-ucHead[0]), ...stateNow.slice(ucHead[1], ucTail[0]))
+                                // CAUTION spliceArray 而不是 spread：中间段可与源 splice 的
+                                //  插入量同量级（十万行级），spread 实参直接 RangeError
+                                //  （spliceMany 存在的同一动机；2026-H3 round4 动态复现）。
+                                this.spliceArray(ucHead[1]-ucHead[0], ucTailOldIndex! - (ucHead[1]-ucHead[0]), stateNow.slice(ucHead[1], ucTail[0]))
                             } else if (ucHead) {
                                 this.splice(ucHead[1]-ucHead[0], Infinity)
                             } else {

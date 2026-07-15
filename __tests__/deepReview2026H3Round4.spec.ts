@@ -25,6 +25,12 @@ import {mulberry32} from './fuzzKit.js'
  * set(i, undefined) 当场 TypeError 抛给变更调用方。与"修复必须覆盖同一语义
  * 的所有入口"（AGENTS §3.1 第 3 问）同构：守卫语义 = "行值域 × entry 存在性"，
  * 入口 = {全量, patch 删除, patch 插入(splice), patch 替换(EKC 双侧)}。
+ *
+ * 缺陷类 R4-3（RangeError 抛给变更调用方）：slice patch 的 ucHead+ucTail
+ * 中间段替换用 spread 传参（`this.splice(..., ...stateNow.slice(...))`），
+ * 中间段与源 splice 插入量同量级——大批量插入（spliceMany 的存在动机，
+ * 十万行 replaceData 场景）直接 Maximum call stack size exceeded。
+ * 等价类 = "patch 端 spread 不定长数组进函数调用"，修复为 spliceArray。
  */
 
 describe('R4-1 map(mapFn 读 index()) × reorder：非 batch 触发序', () => {
@@ -228,6 +234,25 @@ describe('R4-2 indexBy/toMap patch 插入侧 × null/undefined 行', () => {
             expect(new Map(byId.data)).toEqual(model)
         } finally {
             byId.destroy()
+            source.destroy()
+        }
+    })
+})
+
+describe('R4-3 slice patch 中间段大批量替换不受 spread 实参上限约束', () => {
+    test('70k 窗口 × 150k 中段插入不 RangeError 且 ≡ 全量语义', () => {
+        const N = 70000
+        const source = new RxList<number>(Array.from({length: N}, (_, i) => i))
+        const sliced = source.slice(0, N + 100000)
+        try {
+            const big = Array.from({length: 150000}, (_, i) => 1000000 + i)
+            // 中段替换（头尾都留存），命中 ucHead+ucTail 的中间段路径
+            expect(() => source.spliceArray(10, 5, big)).not.toThrow()
+            expect(sliced.data.length).toBe(source.data.slice(0, N + 100000).length)
+            expect(sliced.data[10]).toBe(1000000)
+            expect(sliced.data[9]).toBe(9)
+        } finally {
+            sliced.destroy()
             source.destroy()
         }
     })
