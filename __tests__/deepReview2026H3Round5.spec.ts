@@ -380,14 +380,27 @@ describe('R5-D2 字符串规范下标归一化:set("2")/at("2") ≡ set(2)/at(2)
     test('非规范字符串("02"/"2.5"/"-0")保持属性赋值语义,不归一化', () => {
         const list = new RxList<number>([1, 2, 3])
         const mapped = list.map(x => x * 10)
+        // 协议 key 身份钉扎:非规范字符串不得被归一化成 number(D2 契约边界,
+        // 杀"去掉 isInteger/范围检查只留 String(n)===key"的守卫子句变异)
+        const seenKeys: unknown[] = []
+        const probe = new RxList<number>(
+            function computation(this: RxList<number>) {
+                this.manualTrack(list, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
+                return []
+            },
+            function applyPatch(_d: unknown, infos: any[]) {
+                for (const info of infos) seenKeys.push(info.key)
+            }
+        )
         list.set("02" as any, 99)
         list.set("2.5" as any, 99)
         list.set("-0" as any, 99)
+        expect(seenKeys).toEqual(["02", "2.5", "-0"])
         // 三个都是属性赋值:行元素与 length 不变(属性留在数组对象上,与平台一致)
         expect([...list.data]).toEqual([1, 2, 3])
         expect(list.data.length).toBe(3)
         expect([...mapped.data]).toEqual([10, 20, 30])
-        mapped.destroy(); list.destroy()
+        probe.destroy(); mapped.destroy(); list.destroy()
     })
 })
 
@@ -411,7 +424,7 @@ describe('R5-D3 回调纯度契约:dev 探测警告(groupBy/indexBy getKey、toS
         }
     })
 
-    test('不稳定 getKey(每次新对象) → dev 警告', () => {
+    test('不稳定 getKey(每次新对象) → dev 警告;NaN 组键稳定,零误报', () => {
         if (!__DEV__) return
         const spy = vi.spyOn(console, 'warn').mockImplementation(() => {})
         try {
@@ -419,6 +432,13 @@ describe('R5-D3 回调纯度契约:dev 探测警告(groupBy/indexBy getKey、toS
             const groups = list.groupBy(i => ({key: i.k})) // 每次新引用
             expect(spy.mock.calls.some(c => String(c[0]).includes('unstable key'))).toBe(true)
             groups.destroy(); list.destroy()
+
+            // NaN 是合法组键(SameValueZero 判等):稳定性比对不得把 NaN≠NaN 误报为不稳定
+            spy.mockClear()
+            const nanList = new RxList<number>([NaN, 1])
+            const nanGroups = nanList.groupBy(x => x) // getKey 恒等,首元素键为 NaN
+            expect(spy.mock.calls.some(c => String(c[0]).includes('unstable key'))).toBe(false)
+            nanGroups.destroy(); nanList.destroy()
         } finally {
             spy.mockRestore()
         }
