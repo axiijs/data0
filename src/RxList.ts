@@ -92,6 +92,9 @@ function assertAtomIndexesAligned(list: RxList<any>) {
     }
 }
 
+// 合法数组下标域是 [0, 2^32-2]:length 最大 2^32-1,下标必须小于 length。
+const MAX_ARRAY_INDEX_EXCLUSIVE = 2 ** 32 - 1
+
 /**
  * EKC(set)的 key 是否是稠密下标。负/小数/非数字 key 的 set 契约上等同数组
  * 属性赋值:不触及任何行元素,全量 computation(只遍历 [0, length))也看不见它。
@@ -99,9 +102,14 @@ function assertAtomIndexesAligned(list: RxList<any>) {
  * 会把"属性赋值"物化成真实行(filter 插幽灵行、groupBy/indexBy/toMap/toSet 加
  * 幽灵成员;2026-H3 round3 形态操作 fuzz 命中)。协议侧 key 仍原样透传
  * (README「RxList 参数契约」),内部消费者独立归一化——与 splice argv 同规则。
+ * CAUTION 数值上界与负/小数同属幽灵 EKC 等价类(2026-H3 round5 动态复现):
+ *  key ≥ 2^32-1 的正整数同样不是数组下标(data[2^32-1]=v 是属性赋值,不改
+ *  length、全量不可见),漏判会物化幽灵行/成员,且 groupBy 的前缀计数循环按
+ *  key 迭代 ~2^32 次(单次 set 卡整分钟)、ensureAtomIndex 撑长 atomIndexes
+ *  直接 RangeError 抛给 set() 调用方(data 已写、info 未发,状态撕裂)。
  */
 function isDenseIndexKey(key: unknown): key is number {
-    return typeof key === 'number' && Number.isInteger(key) && key >= 0
+    return typeof key === 'number' && Number.isInteger(key) && key >= 0 && key < MAX_ARRAY_INDEX_EXCLUSIVE
 }
 
 // toSorted 批量回退阈值：bulk > 64 且（bulk×4 > 派生长度 或 bulk > 4096）时
@@ -415,7 +423,11 @@ export class RxList<T> extends Computed {
         const oldValue = this.data[index]
         this.data[index] = value
 
-        if (this.atomIndexes && Number.isInteger(index) && index >= 0) {
+        // isDenseIndexKey(含数值上界)而不是裸 Number.isInteger && >= 0:
+        // key ≥ 2^32-1 时 data[key] 是属性赋值(length 不变),但 ensureAtomIndex
+        // 把 atomIndexes.length 撑到 key+1 > 2^32-1 会当场 RangeError——data 已写、
+        // trigger 还没发,调用方收到异常且派生结构永久漏掉本次变更(状态撕裂)。
+        if (this.atomIndexes && isDenseIndexKey(index)) {
             this.ensureAtomIndex(index)
         }
 
@@ -1518,7 +1530,10 @@ export class RxList<T> extends Computed {
                         this.set(groupKey, new RxList([]))
                     }
                     let groupIndex = 0
-                    for (let i = 0; i < sourceIndex; i++) {
+                    // clamp 与 removeAtSourcePosition 对称(兄弟实现点一致性):
+                    // 前缀计数不得越过操作时源长度。
+                    const bound = Math.min(sourceIndex, stateNow.length)
+                    for (let i = 0; i < bound; i++) {
                         if (sameKey(getKey(stateNow[i]), groupKey)) groupIndex++
                     }
                     this.data.get(groupKey)!.splice(groupIndex, 0, item)
@@ -1886,6 +1901,12 @@ export class RxList<T> extends Computed {
 
     public concat(...others: RxList<T>[]): RxList<T> {
         const sources = [this, ...others]
+        // CAUTION 结构级自别名(2026-H3 round5 动态复现):同一源出现在多个操作数
+        //  位置(a.concat(a) 跑马灯复制是现实用法)时,一次变更只到达一条 info,
+        //  而 sources.indexOf 恒定位到首个段——其余段静默漏 patch,增量与全量
+        //  重算分叉([1,2,3,1,2] vs [1,2,3,1,2,3])。位置增量无法对多段同时表达
+        //  (逐段应用会互相移动 offset),构造性回退全量重算(README 脚注)。
+        const hasDuplicateSources = new Set(sources).size !== sources.length
         return new RxList<T>(
             function computation(this: RxList<T>) {
                 // Track each source for incremental updates
@@ -1907,6 +1928,8 @@ export class RxList<T> extends Computed {
                 // 多源 batch 的 offset 取决于每条 patch 的中间长度；无法从最终
                 // source 快照无歧义还原时直接全量重算。
                 if (triggerInfos.length !== 1) return false
+                // 同一源占多个段:单条 info 无法按 indexOf 定位唯一段(见构造处说明)
+                if (hasDuplicateSources) return false
                 // Figure out which source changed, then incrementally update
                 for (const info of triggerInfos) {
                     const sourceIndex = sources.indexOf(info.source as RxList<T>)
@@ -1931,7 +1954,7 @@ export class RxList<T> extends Computed {
                         this.spliceArray(offset + spliceStart, deletedItems.length, newItems)
                     } else if (method === 'reorder') {
                         return false
-                    } else if (typeof key === 'number' && Number.isInteger(key) && key >= 0) {
+                    } else if (isDenseIndexKey(key)) {
                         // CAUTION 段长守卫：越界 set（契约内透传）会让源段长度跳变
                         //  （len 3 → set(10) → len 11），EKC 的 key 落在旧段之外时按
                         //  段内偏移直写会覆盖到后续源的段（B 段元素整体错位，结构性
