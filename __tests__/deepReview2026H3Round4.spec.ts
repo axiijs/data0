@@ -239,6 +239,32 @@ describe('R4-2 indexBy/toMap patch 插入侧 × null/undefined 行', () => {
     })
 })
 
+describe('R4 顺带补杀：indexBy/toMap × 非稠密 key set 的幽灵 EKC 守卫（mutation 幸存盲区）', () => {
+    test('indexBy：set(-1, x) 不产生幽灵 entry（≡ 全量只扫 [0, length)）', () => {
+        const source = new RxList<{id: number}>([{id: 1}])
+        const byId = source.indexBy('id')
+        try {
+            source.set(-1 as never, {id: 9})
+            expect([...byId.data.keys()]).toEqual([1])
+        } finally {
+            byId.destroy()
+            source.destroy()
+        }
+    })
+
+    test('toMap：set(-1, entry) 不产生幽灵 entry', () => {
+        const source = new RxList<[string, number]>([['a', 1]])
+        const asMap = source.toMap()
+        try {
+            source.set(-1 as never, ['ghost', 9])
+            expect([...asMap.data.keys()]).toEqual(['a'])
+        } finally {
+            asMap.destroy()
+            source.destroy()
+        }
+    })
+})
+
 describe('R4-3 slice patch 中间段大批量替换不受 spread 实参上限约束', () => {
     test('70k 窗口 × 150k 中段插入不 RangeError 且 ≡ 全量语义', () => {
         const N = 70000
