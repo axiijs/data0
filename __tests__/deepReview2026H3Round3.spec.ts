@@ -36,7 +36,7 @@
  */
 import {describe, expect, test, vi, afterEach} from 'vitest'
 import {atom} from '../src/atom.js'
-import {RxList, createIndexKeySelection} from '../src/RxList.js'
+import {RxList, createIndexKeySelection, createSelection} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
 import {RxTime} from '../src/RxTime.js'
@@ -220,6 +220,99 @@ describe('R3-C2 特征:class 实例 atom 的属性读写不对称', () => {
         expect(a.x).toBeUndefined()  // 读不转发(仅 plain object 承诺属性读)
         expect(a().x).toBe(2)        // 整值读路径正常
         stop()
+    })
+})
+
+describe('R3-5 幽灵 EKC:非稠密 key(负/小数)的 set 是属性赋值,派生结构不得物化', () => {
+    test('filter × set(-1):不得插入幽灵行(sparseOpsFuzz seed=11 命中的最小复现)', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const even = list.filter(x => typeof x === 'number' && x % 2 === 0)
+        expect([...even.data]).toEqual([2])
+        list.set(-1, 100) // 数组属性赋值,元素不变;修复前 100(偶数)被物化成真实行插到最前
+        expect([...even.data]).toEqual([2])
+        expect(list.data.length).toBe(3)
+        even.destroy(); list.destroy()
+    })
+    test('slice × set(1.5):区间内小数 key 不得替换真实行', () => {
+        const list = new RxList<number>([10, 20, 30, 40])
+        const sliced = list.slice(0, 3)
+        expect([...sliced.data]).toEqual([10, 20, 30])
+        list.set(1.5 as any, 99) // 修复前:1.5 落在区间内,经 splice 归一化替换掉行 1
+        expect([...sliced.data]).toEqual([10, 20, 30])
+        sliced.destroy(); list.destroy()
+    })
+    test('groupBy/toSet/map/selection × 负 key set:成员与行均不变', () => {
+        const list = new RxList<number>([1, 2])
+        const grouped = list.groupBy(x => x % 2)
+        const asSet = list.toSet()
+        const mapped = list.map(x => x * 2)
+        const sel = new RxSet<number>([1])
+        const selection = createSelection(list, sel)
+        list.set(-2, 77)
+        expect([...asSet.data].sort()).toEqual([1, 2])
+        expect([...grouped.data.keys()].sort()).toEqual([0, 1])
+        expect(densifyRows(mapped.data)).toEqual([2, 4])
+        expect(selection.data.map(r => r[0])).toEqual([1, 2])
+        selection.destroy(); mapped.destroy(); asSet.destroy(); grouped.destroy(); list.destroy(); sel.destroy()
+    })
+})
+
+function densifyRows<T>(a: readonly T[]) { return Array.from(a) }
+
+describe('R3-6 filter × mapList 全量重算必须整体重建 filtered', () => {
+    test('filterFn 抛错一次(错误恢复走全量)后,filtered ≡ 终态全量过滤', () => {
+        const list = new RxList<number>([1, 2, 3, 4])
+        let bomb = false
+        const even = list.filter(x => {
+            if (bomb) throw new Error('boom')
+            return typeof x === 'number' && x % 2 === 0
+        })
+        expect([...even.data]).toEqual([2, 4])
+        bomb = true
+        expect(() => list.push(6)).toThrow('boom') // patch 抛错上抛给 mutator(错误恢复语义)
+        bomb = false
+        list.push(8) // mapList phase 已回退 FULL → 全量重建
+        // 修复前:filtered 停留在 [2,4](6/8 丢失;或按旧行为翻倍计数)
+        expect([...even.data]).toEqual(list.data.filter(x => x % 2 === 0))
+        even.destroy(); list.destroy()
+    })
+})
+
+describe('R3-7 groupBy × reorder × 稀疏洞:组内容按全下标扫描(与全量物化洞一致)', () => {
+    test('已物化的 undefined 组经 reorder 不得被 filter 跳洞清空', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const grouped = list.groupBy(x => (x === undefined ? 'hole' : x % 2))
+        list.set(5, 99)          // 洞在 3、4(增量路径看不见洞——洞不产生事件)
+        grouped.recompute(true)  // 全量物化:hole 组 = [undefined, undefined]
+        expect(densifyRows(grouped.data.get('hole')!.data)).toEqual([undefined, undefined])
+        list.swap(0, 5)          // 修复前:reorder 分支的 Array#filter 跳洞 → hole 组被清空
+        // 参考:全量 computation 语义(按 [0,length) 读取,洞位读出 undefined)
+        const model = new Map<any, any[]>()
+        for (let i = 0; i < list.data.length; i++) {
+            const k = list.data[i] === undefined ? 'hole' : (list.data[i] as number) % 2
+            if (!model.has(k)) model.set(k, [])
+            model.get(k)!.push(list.data[i])
+        }
+        for (const [k, expected] of model) {
+            expect(densifyRows(grouped.data.get(k)!.data), `group[${String(k)}]`).toEqual(densifyRows(expected))
+        }
+        grouped.destroy(); list.destroy()
+    })
+})
+
+describe('R3-8 toSorted × reorder:tie 稳定序跟随源序,必须回退全量(矩阵格子实为「重算」)', () => {
+    test('reorder 后 tie 组顺序与全量稳定排序一致(回退发生)', () => {
+        const source = new RxList<number>([0, -0, 1])
+        const sorted = source.toSorted((a, b) => (a as number) - (b as number))
+        let fulls = 0
+        sorted.on('fullRecompute', () => fulls++)
+        expect(Object.is(sorted.data[0], 0)).toBe(true)
+        expect(Object.is(sorted.data[1], -0)).toBe(true)
+        source.swap(0, 1) // 源序 [-0, 0, 1]:tie 组的稳定序必须翻转
+        expect(fulls).toBe(1) // 修复守卫的等价类:reorder 不得被"非稠密 key 忽略"分支吞掉
+        expect(Object.is(sorted.data[0], -0)).toBe(true)
+        expect(Object.is(sorted.data[1], 0)).toBe(true)
+        sorted.destroy(); source.destroy()
     })
 })
 

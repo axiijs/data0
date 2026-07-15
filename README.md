@@ -73,7 +73,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 ### 4. RxList 参数契约
 
 - `splice(start, deleteCount, ...items)` 的参数按 `Array.prototype.splice` 规范归一化(ToIntegerOrInfinity:NaN→0、小数截断、负数从尾部回退、越界 clamp、`-0`→`+0`)。
-- **`toSorted(compare)` 的 comparator 必须对元素值域构成一致全序**(与 `Array#sort` 的 consistent-comparator 要求相同)。`NaN` 元素 × 裸数值 comparator(`(a,b)=>a-b` 返回 NaN)违反一致性,属契约外;需要含 `NaN` 的列表请用 NaN 归一化的 comparator。元素身份(增量删除定位)按 `Object.is`(`NaN` 可定位,`0`/`-0` 可区分);等值 tie 组内存在可区分成员时增量删除自动回退全量重算。
+- **`toSorted(compare)` 的 comparator 必须对元素值域构成一致全序**(与 `Array#sort` 的 consistent-comparator 要求相同)。`NaN` 元素 × 裸数值 comparator(`(a,b)=>a-b` 返回 NaN)违反一致性,属契约外;需要含 `NaN` 的列表请用 NaN 归一化的 comparator。同理,列表可能**驻留** `undefined` 元素(含稀疏洞被 reorder 物化)时,comparator 必须与 `Array#sort` 的强制规则一致地把 `undefined` 排到末尾(引擎从不为 undefined 调用 comparator、一律排尾;把 undefined 排前的 comparator 与全量语义必然分叉,属契约外)——**变更本身**涉及 undefined 时仍自动回退全量,无须 comparator 处理。元素身份(增量删除定位)按 `Object.is`(`NaN` 可定位,`0`/`-0` 可区分);等值 tie 组内存在可区分成员时增量删除自动回退全量重算。
 - **`triggerInfo.argv` 透传用户原始参数**(不归一化)。这是 axii/axle 依赖的协议;消费 argv 的派生结构必须自行归一化(内部实现均已如此)。
 - **`EXPLICIT_KEY_CHANGE` 必须消费 `info.newValue`(以及需要时的 `methodResult` 旧值),不要回读 `source.data[key]`**。batch/延迟调度下一次 digest 可能同时含 EKC 与结构操作;重放时 `source.data` 已是终态,按终态下标读出会与操作时位置错位,导致宿主镜像与源分叉。data0 自身的 map/filter 等增量路径已按协议字段消费。
 - `set(index, value)` 的契约是**替换已存在的稠密行**。越界/负数/非整数 key 属于契约外用法:行为等同普通数组赋值(可能产生稀疏数组、`length` computed 不更新),key 原样透传给下游。若列表已有 `atomIndexes`(`map` 使用了 index 参数),越界 set 会为写入位分配 index atom,派生 `map(index)` 不再因此崩溃;稀疏洞位仍按数组语义保留。
@@ -102,7 +102,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 |---|---|---|---|
 | `RxList.map` | 增量 | 增量 | 增量 |
 | `RxList.filter` | 增量 | 增量 | 重建(按 indicator 顺序) |
-| `RxList.toSorted` | 增量(等值 tie/含 undefined→重算) | 增量(等值 tie/含 undefined→重算) | 无关 |
+| `RxList.toSorted` | 增量(等值 tie/含 undefined→重算) | 增量(等值 tie/含 undefined→重算) | 重算(tie 稳定序随源序) |
 | `RxList.slice` | 增量(负边界→重算) | 增量 | 重算 |
 | `RxList.concat` | 增量(批量多条→重算) | 增量 | 重算 |
 | `RxList.groupBy` | 增量 | 增量 | 组内重排 |
