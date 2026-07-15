@@ -2,13 +2,15 @@ import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wri
 import {tmpdir} from 'node:os'
 import {join, resolve} from 'node:path'
 import {spawnSync} from 'node:child_process'
-import {describe, expect, test} from 'vitest'
+import {describe, expect, test, vi} from 'vitest'
 import {AsyncRxSlice} from '../src/AsyncRxSlice.js'
 import {atom} from '../src/atom.js'
+import {autorun} from '../src/common.js'
 import {computed, destroyComputed} from '../src/computed.js'
 import {notifier} from '../src/notify.js'
 import {RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
+import {RxTime} from '../src/RxTime.js'
 
 /**
  * Executable evidence for confirmed issues.
@@ -330,6 +332,33 @@ describe('known AsyncRxSlice state issues', () => {
             expect(slice.loadError()).toBeNull()
         } finally {
             slice.destroy()
+        }
+    })
+})
+
+describe('known RxTime semantic issues', () => {
+    // 已知未修（2026-H3 round4 review 动态复现，待语义裁定）：eq 的唤醒 timeout
+    // 刻意排在越点后 +2ms（浮点防御），而谓词是点相等 v === 0——唤醒时刻已越过
+    // 零点，eq 永远观察不到 true。定时器的存在本身说明"越点应可观察"是实现
+    // 意图（否则无须排定唤醒）；gt/lt 不受影响（不等式越点后稳定成立）。
+    // 裁定方向：脉冲语义 / 容差窗口 / 移除 eq。修复时按 AGENTS 纪律把本测试
+    // 转为普通回归（test.fails 会在行为变化时主动报警）。
+    test.fails('RxTime.eq(future instant) becomes observable after the crossing', () => {
+        vi.useFakeTimers()
+        try {
+            vi.setSystemTime(1_000_000)
+            const t = new RxTime()
+            const isEq = t.eq(1_000_500)
+            let sawTrue = isEq.raw === true
+            const stop = autorun(() => {
+                if (isEq()) sawTrue = true
+            }, true)
+            vi.advanceTimersByTime(600)
+            stop()
+            t.destroy()
+            expect(sawTrue).toBe(true)
+        } finally {
+            vi.useRealTimers()
         }
     })
 })

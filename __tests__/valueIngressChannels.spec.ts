@@ -210,4 +210,18 @@ describe('null × 五通道（值域含 null 的算子）', () => {
             null,
         )
     })
+
+    test('createSelection（null item 行元组镜像 + 指示器可用）', () => {
+        const currentValues = new RxSet<V | number>([])
+        runChannels(
+            (s) => createSelection(s, currentValues),
+            (d, src, ctx) => {
+                expect(d.data.map(row => row[0]), ctx).toEqual(src)
+                expect(d.data.every(row => typeof row[1].raw === 'boolean'), `${ctx} indicator`).toBe(true)
+            },
+            (d) => d.destroy(),
+            null,
+        )
+        currentValues.destroy()
+    })
 })

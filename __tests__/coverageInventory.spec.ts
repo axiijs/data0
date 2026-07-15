@@ -114,7 +114,7 @@ const R4 = 'deepReview2026H3Round4.spec.ts'
 export const VALUE_INGRESS_INVENTORY: Record<string, IngressRow> = {
     'RxList.map':             ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
     'RxList.filter':          ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
-    'RxList.toSorted':        ingressRow(`${INGRESS}(undefined;null 参与 comparator 属契约外,README §4)`, INGRESS, `${INGRESS}(变更含 undefined 自动回退全量)`, INGRESS, INGRESS),
+    'RxList.toSorted':        ingressRow(`${INGRESS}(仅 undefined;null 参与 comparator 属契约外,README §4)`, `${INGRESS}(仅 undefined)`, `${INGRESS}(仅 undefined;变更含 undefined 自动回退全量)`, `${INGRESS}(仅 undefined)`, `${INGRESS}(仅 undefined)`),
     'RxList.groupBy':         ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
     'RxList.toSet':           ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
     'RxList.indexBy':         ingressRow(`${R4}(null 初始行)`, `${R4}(push null/undefined)`, `${R4}(set→null)`, `${R4}(null 行被替换)`, `${R4}(splice 删 null 行)`),
