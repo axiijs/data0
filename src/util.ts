@@ -110,15 +110,16 @@ export function nextTick(fn: () => any) {
 //  reorder 的 argv[0]、RxSet.replace 的内层数组)持独立副本——否则 batch /
 //  async applyPatch 跨 await / onChange handler / 自定义调度器四类延迟消费窗口
 //  里,调用方改写返回数组会静默毒化全部 patch 消费者与 digestReplay 重建。
-//  dev 下冻结副本:载荷是对全部订阅者的共享广播,订阅者改写毒化兄弟订阅者时
-//  当场 TypeError(生产不冻结,靠契约)。空数组共享冻结单例:纯尾插(push)
-//  的删除项恒空,最热变更路径零额外分配。
+//  CAUTION 只拷贝、不冻结:曾对副本(及 trigger 汇聚点的 argv)做 dev
+//  Object.freeze 让订阅者改写当场抛错,ABBA 实测 dev 下 push +20%/单删
+//  splice +30%/swap +52%(freeze 调用本身 + 冻结数组的元素种类转换拖慢后续
+//  消费),热路径不可接受。订阅者侧的只读性由契约(README)+ onChange 给
+//  handler 发防御副本(见 common.ts)承载。空数组共享冻结单例:纯尾插
+//  (push)的删除项恒空,最热变更路径零额外分配(冻结单例只读,不在热读路径)。
 const EMPTY_PROTOCOL_PAYLOAD = Object.freeze([]) as unknown as unknown[]
 export function toProtocolPayload<T>(items: T[]): T[] {
     if (items.length === 0) return EMPTY_PROTOCOL_PAYLOAD as T[]
-    const copy = items.slice()
-    if (__DEV__) Object.freeze(copy)
-    return copy
+    return items.slice()
 }
 
 // Array#splice 对 start/deleteCount 的 ToIntegerOrInfinity 语义：

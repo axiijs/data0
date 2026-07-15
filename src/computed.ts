@@ -688,19 +688,12 @@ export class Computed extends ReactiveEffect {
     get savedTriggerInfos(): Parameters<Notifier["trigger"]>[] {
         return this._savedTriggerInfos ?? (this._savedTriggerInfos = [])
     }
+    // CAUTION 协议载荷只读契约(README「参数契约」):argv/methodResult 是对全部
+    //  订阅者的共享广播。dev 的冻结执法放在载荷**产生点**(util.toProtocolPayload
+    //  的副本、RxMap 冷路径的 methodResult),而不是本 trigger 汇聚点——曾在此对
+    //  每次 trigger 的 argv 做 Object.freeze,ABBA 实测 dev 下 push +20%/swap +52%
+    //  (freeze 调用 + 冻结元素种类转换拖慢后续消费),热路径不可接受。
     trigger(...args: Parameters<Notifier["trigger"]>) {
-        if (__DEV__) {
-            // 协议载荷是对全部订阅者的共享广播(只读契约,README「参数契约」):
-            // dev 下冻结数组型 argv/methodResult,订阅者(onChange handler、自定义
-            // 调度器)改写载荷毒化兄弟订阅者时当场 TypeError 而不是静默分叉。
-            // 单点覆盖 RxList/RxMap/RxSet 的全部 trigger 入口;内部消费者只读
-            // (2026-H3 round5 审计),返回给调用方的数组是独立副本(toProtocolPayload)。
-            const inputInfo = args[2] as InputTriggerInfo | undefined
-            if (inputInfo) {
-                if (Array.isArray(inputInfo.argv)) Object.freeze(inputInfo.argv)
-                if (Array.isArray(inputInfo.methodResult)) Object.freeze(inputInfo.methodResult)
-            }
-        }
         this.savedTriggerInfos.push(args)
     }
     sendTriggerInfos() {

@@ -81,6 +81,20 @@ export function oncePromise(fn:() => any, scheduleRerun: DirtyCallback|true = ne
     })
 }
 
+// 一层深的数组拷贝:外层数组换新,数组型元素也换新(元素内的对象引用保留——
+// 值级共享是正常语义)。undefined/非数组字段原样透传。
+function copyNestedArray(value: unknown): unknown {
+    if (!Array.isArray(value)) return value
+    return value.map(item => (Array.isArray(item) ? item.slice() : item))
+}
+
+function copyTriggerInfoPayload(info: TriggerInfo): TriggerInfo {
+    const copy: TriggerInfo = {...info}
+    if (Array.isArray(copy.argv)) copy.argv = copyNestedArray(copy.argv) as any[]
+    if (Array.isArray(copy.methodResult)) copy.methodResult = copyNestedArray(copy.methodResult)
+    return copy
+}
+
 /**
  * @category Miscellaneous
  */
@@ -98,7 +112,13 @@ export function onChange(source:Atom|RxList<any>|RxSet<any>|RxMap<any, any>, han
         }
         
     }, function applyPatch(this:Computed, data:any, triggerInfos:TriggerInfo[]) {
-        handler([...triggerInfos])
+        // 防御副本(载荷所有权契约,README「参数契约」):info 的 argv/methodResult
+        // 是对全部订阅者共享的广播,handler 是任意用户代码——给它独立副本
+        // (外层数组 + 一层嵌套:RxSet.replace 的 [newItems,deletedItems]、
+        // RxMap 的 entry 对、reorder 的 Order 对),改写不再毒化兄弟订阅者。
+        // onChange 是观察 API 而非热路径,O(载荷) 拷贝可接受;曾用 dev 冻结
+        // 执法,但冻结落在 trigger 热路径上(ABBA: push +20%/swap +52%),弃用。
+        handler(triggerInfos.map(copyTriggerInfoPayload))
     })
 
     instance.run([], true)
