@@ -105,6 +105,22 @@ export function nextTick(fn: () => any) {
     Promise.resolve().then(fn)
 }
 
+// CAUTION 协议载荷所有权(2026-H3 round5 裁定,README「参数契约」):变更方法的
+//  返回数组归调用方所有(原生 Array#splice 预期),协议载荷(info.methodResult、
+//  reorder 的 argv[0]、RxSet.replace 的内层数组)持独立副本——否则 batch /
+//  async applyPatch 跨 await / onChange handler / 自定义调度器四类延迟消费窗口
+//  里,调用方改写返回数组会静默毒化全部 patch 消费者与 digestReplay 重建。
+//  dev 下冻结副本:载荷是对全部订阅者的共享广播,订阅者改写毒化兄弟订阅者时
+//  当场 TypeError(生产不冻结,靠契约)。空数组共享冻结单例:纯尾插(push)
+//  的删除项恒空,最热变更路径零额外分配。
+const EMPTY_PROTOCOL_PAYLOAD = Object.freeze([]) as unknown as unknown[]
+export function toProtocolPayload<T>(items: T[]): T[] {
+    if (items.length === 0) return EMPTY_PROTOCOL_PAYLOAD as T[]
+    const copy = items.slice()
+    if (__DEV__) Object.freeze(copy)
+    return copy
+}
+
 // Array#splice 对 start/deleteCount 的 ToIntegerOrInfinity 语义：
 // NaN/undefined → 0，小数截断，-0 → +0，±Infinity 保留（由后续 clamp 处理）。
 export function toIntegerOrInfinity(value: unknown): number {

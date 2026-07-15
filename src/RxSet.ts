@@ -3,7 +3,7 @@ import {Atom} from "./atom.js";
 import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
-import {warn} from "./util.js";
+import {toProtocolPayload, warn} from "./util.js";
 import {RxList} from "./RxList";
 /**
  * @category Basic
@@ -64,7 +64,9 @@ export class RxSet<T> extends Computed {
             }
         })
 
-        this.trigger(this, TriggerOpTypes.METHOD, { method: 'replace', argv: [newData], methodResult: [newItems, deletedItems]})
+        // 载荷持内层数组的独立副本(所有权契约,见 util.toProtocolPayload):
+        // 返回的 [newItems, deletedItems] 归调用方,延迟消费窗口里改写不毒化 patch 消费者。
+        this.trigger(this, TriggerOpTypes.METHOD, { method: 'replace', argv: [newData], methodResult: [toProtocolPayload(newItems), toProtocolPayload(deletedItems)]})
         this.sendTriggerInfos()
         return [newItems, deletedItems]
     }

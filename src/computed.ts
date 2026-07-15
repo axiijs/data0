@@ -689,6 +689,18 @@ export class Computed extends ReactiveEffect {
         return this._savedTriggerInfos ?? (this._savedTriggerInfos = [])
     }
     trigger(...args: Parameters<Notifier["trigger"]>) {
+        if (__DEV__) {
+            // 协议载荷是对全部订阅者的共享广播(只读契约,README「参数契约」):
+            // dev 下冻结数组型 argv/methodResult,订阅者(onChange handler、自定义
+            // 调度器)改写载荷毒化兄弟订阅者时当场 TypeError 而不是静默分叉。
+            // 单点覆盖 RxList/RxMap/RxSet 的全部 trigger 入口;内部消费者只读
+            // (2026-H3 round5 审计),返回给调用方的数组是独立副本(toProtocolPayload)。
+            const inputInfo = args[2] as InputTriggerInfo | undefined
+            if (inputInfo) {
+                if (Array.isArray(inputInfo.argv)) Object.freeze(inputInfo.argv)
+                if (Array.isArray(inputInfo.methodResult)) Object.freeze(inputInfo.methodResult)
+            }
+        }
         this.savedTriggerInfos.push(args)
     }
     sendTriggerInfos() {

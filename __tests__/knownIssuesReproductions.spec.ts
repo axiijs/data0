@@ -337,17 +337,13 @@ describe('known AsyncRxSlice state issues', () => {
 })
 
 describe('known trigger-payload ownership issues', () => {
-    // 已知未修(2026-H3 round5 动态复现,待所有权语义裁定):splice/clear/pop 等的
-    // 返回数组与 info.methodResult 是同一引用(RxSet.replace 的 [newItems,deletedItems]
-    // 同形)。非 batch 下 patch 在方法返回前同步消费完,别名不可见;batch(以及
-    // async applyPatch 跨 await 持有 info、onChange handler 直接拿到 info 对象、
-    // 自定义调度器的 infos 参数)把消费推迟,调用方在窗口期改写该数组——原生
-    // Array#splice 给调用方的预期是独占所有权——会静默毒化全部 patch 消费者,
-    // digestReplay 的逆向重建也随之污染。
-    // 裁定方向:延迟消费场景防御拷贝(仅 session/async 模式,O(删除数)) vs
-    // README 把"返回数组在 digest 前只读"钉成 A3 的输出侧对偶契约 + 特征钉扎。
-    // 修复/裁定时按 AGENTS 纪律把本测试转为普通回归或特征测试。
-    test.fails('splice return array can be mutated inside batch without corrupting deferred patches', () => {
+    // 2026-H3 round5 动态复现,裁定已执行(防御拷贝):splice/clear 等的返回数组
+    // 曾与 info.methodResult 同引用,batch/async applyPatch/onChange/自定义调度器
+    // 四类延迟消费窗口里调用方按原生 splice 预期改写返回数组会静默毒化全部
+    // patch 消费者与 digestReplay 重建。现协议载荷持独立副本(util.toProtocolPayload,
+    // dev 下冻结广播载荷),返回数组归调用方所有。等价类横扫见
+    // deepReview2026H3Round5.spec.ts 的 R5-D1 组。
+    test('splice return array can be mutated inside batch without corrupting deferred patches', () => {
         const list = new RxList<number>([1, 2, 3, 4])
         const groups = list.groupBy(item => item % 2)
         try {

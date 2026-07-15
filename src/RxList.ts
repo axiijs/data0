@@ -13,7 +13,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, warn} from "./util.js";
+import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, toProtocolPayload, warn} from "./util.js";
 import {reconstructDigestStates} from "./digestReplay.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
@@ -112,11 +112,62 @@ function isDenseIndexKey(key: unknown): key is number {
     return typeof key === 'number' && Number.isInteger(key) && key >= 0 && key < MAX_ARRAY_INDEX_EXCLUSIVE
 }
 
+/**
+ * 字符串规范下标归一化(2026-H3 round5 裁定,README「参数契约」)。
+ * 平台规范:字符串 P 是数组下标 ⟺ ToString(ToUint32(P)) === P 且 ToUint32(P) ≠ 2^32-1
+ * ——`data["2"] = v` **真实写入第 2 行**(dataset/JSON/URL 参数都是字符串入口,
+ * TS 类型挡不住 JS 调用方)。守卫域若比平台窄,set("2") 会真改源而全部派生
+ * 静默失联、at(2) 订阅者(depsMap key 2)永久漏触发(2026-H3 round5 动态复现)。
+ * set/at 入口把规范下标字符串归一化为 number(与 splice 参数的
+ * ToIntegerOrInfinity 归一化同一原则:内部一律使用平台语义的规范形态);
+ * 非规范字符串("02"/"2.5"/"-0"/"1e3")平台本就视为属性,原样透传不动。
+ */
+function normalizeIndexKey(key: unknown): unknown {
+    if (typeof key === 'string') {
+        const n = Number(key)
+        if (Number.isInteger(n) && n >= 0 && n < MAX_ARRAY_INDEX_EXCLUSIVE && String(n) === key) {
+            if (__DEV__) {
+                warn(`RxList received string index key "${key}"; normalized to ${n} (canonical array index per spec). Pass numbers to avoid this.`)
+            }
+            return n
+        }
+    }
+    return key
+}
+
 // toSorted 批量回退阈值：bulk > 64 且（bulk×4 > 派生长度 或 bulk > 4096）时
 // 回退全量重算。标定与理由见 toSorted applyPatch 内注释（2026-H3 round4）。
 const TOSORTED_BULK_MIN = 64
 const TOSORTED_BULK_RATIO = 4
 const TOSORTED_BULK_CAP = 4096
+
+// SameValueZero(NaN 等于自身):与 Map 组键语义一致,用于 dev 稳定性比对
+function sameValueZero(a: unknown, b: unknown): boolean {
+    return a === b || (a !== a && b !== b)
+}
+
+// CAUTION 回调纯度契约的 dev 探测(2026-H3 round5 裁定,README「参数契约」):
+//  groupBy/indexBy 的 getKey 与 toSorted 的 comparator 在 pauseTracking 下执行,
+//  读响应式数据不建立任何依赖——变化不会触发重算(静默陈旧),且 patch 时
+//  getKey 与建组时返回不一致会破坏前缀计数(增量结构损坏)。契约:这些回调
+//  必须纯且确定。dev 下用 detached probe 隔离地跑一次回调:probe 捕获到
+//  响应式读取即警告;订阅随 probe 销毁即弃,不残留。reduce/reduceToAtom 的
+//  reduceFn 不探测(重复调用会向累加器重复写入;probe 会劫持其子 effect 的
+//  父子归属),纯度要求由 README 契约承载。
+function devDetectReactiveReads(label: string, run: () => unknown): unknown {
+    const probe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe())
+    try {
+        const result = probe.probe(run)
+        if (probe.hasCaptures()) {
+            warn(`${label} read reactive data during computation. Such reads are NOT tracked: `
+                + `changes will NOT retrigger this derivation (silent staleness). `
+                + `Derive a plain field first (e.g. list.map(...)) or use find/findIndex/map/filter which support reactive callbacks.`)
+        }
+        return result
+    } finally {
+        probe.destroy()
+    }
+}
 
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
@@ -264,7 +315,8 @@ export class RxList<T> extends Computed {
         try {
             const deletedItems = this.data.slice()
             this.data.length = 0
-            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: deletedItems })
+            // 载荷持独立副本(所有权契约,见 toProtocolPayload):返回数组归调用方
+            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: toProtocolPayload(deletedItems) })
             this.sendTriggerInfos()
             return deletedItems
         } finally {
@@ -347,7 +399,8 @@ export class RxList<T> extends Computed {
 
         if (canUseMetadataFastPath && (isPureAppend || isPureClear)) {
             const result = spliceMany(this.data, normalizedStart, deleteItemsCount, items)
-            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
+            // 载荷持独立副本(所有权契约,见 toProtocolPayload);纯尾插时 result 恒空,零拷贝
+            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: toProtocolPayload(result) })
             this.sendTriggerInfos()
             return result
         }
@@ -382,7 +435,8 @@ export class RxList<T> extends Computed {
         // CAUTION 无论有没有 indexKeyDeps 都要触发 Iterator_Key，
         //  特别这里注意，我们利用传了 key 就会把对应 key 的 dep 拿出来的特性来 trigger ITERATE_KEY.
         //  CAUTION 一定先 trigger method，这样可能后面某些被删除的 atomIndexes 变化就不需要了。
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
+        //  载荷持独立副本(所有权契约,见 toProtocolPayload):返回数组归调用方。
+        this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: toProtocolPayload(result) })
         if (affected) {
             for (const [index, oldValue] of affected) {
                 this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: this.data[index], oldValue })
@@ -420,6 +474,9 @@ export class RxList<T> extends Computed {
             warn('mutating a destroyed RxList is a no-op')
             return undefined as T
         }
+        // 规范下标字符串("2")归一化为 number:平台把它当真实行写入,守卫/订阅
+        // 记账必须与平台一致,否则源已变而派生与 at() 订阅者静默失联(见 normalizeIndexKey)
+        index = normalizeIndexKey(index) as number
         const oldValue = this.data[index]
         this.data[index] = value
 
@@ -471,7 +528,9 @@ export class RxList<T> extends Computed {
             }
         })
 
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
+        // argv[0] 持 newOrder 的浅副本(所有权契约,见 toProtocolPayload):调用方
+        // 传入的 order 数组仍归调用方,延迟消费窗口里改写它不再毒化 patch 消费者。
+        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [toProtocolPayload(newOrder)], reorderInfo })
         // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见：否则非 batch 下
         //  原子写同步执行 map 的行级 Computed，其 hasPendingStructuralInfos 守卫看不到
         //  pending 结构 info，按终态位置直写派生列表，随后 reorder patch 又搬移一次
@@ -589,6 +648,8 @@ export class RxList<T> extends Computed {
             return 0
         })
 
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads)
+        let devComparatorChecked = false
         return new RxList<T>(
             function computation(this: RxList<T>) {
                 // Full recompute: track source changes
@@ -596,6 +657,11 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
                 // Make a clone of source.data and sort it
                 const cloned = source.data.slice()
+                if (__DEV__ && !devComparatorChecked && cloned.length >= 2
+                    && cloned[0] !== undefined && cloned[1] !== undefined) {
+                    devComparatorChecked = true
+                    devDetectReactiveReads('RxList.toSorted comparator', () => compare!(cloned[0], cloned[1]))
+                }
                 cloned.sort(compare!)
                 return cloned
             },
@@ -696,6 +762,9 @@ export class RxList<T> extends Computed {
     }
     // CAUTION 这里手动 track index dep 的变化，是为了在 splice 的时候能手动去根据订阅的 index dep 触发，而不是直接触发所有的 index key。
     at(index: number): T|undefined{
+        // 规范下标字符串归一化(与 set 对称):at("2") 必须与 set(2) 的触发 key
+        // 落在同一个 dep 上,否则订阅永久漏触发(见 normalizeIndexKey)
+        index = normalizeIndexKey(index) as number
         // 与 Array.prototype.at 一致：支持负索引（从末尾回数）。
         // CAUTION 负索引的结果依赖 length，不能建 index dep（元素本身没变时对应
         //  index 不会触发 SET），track ITERATE_KEY——所有结构变更（splice/reorder/set）
@@ -1499,11 +1568,22 @@ export class RxList<T> extends Computed {
     }
     groupBy<K>(getKey: (item: T) => K) {
         const source = this
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads)
+        let devPurityChecked = false
         return new RxMap<K, RxList<T>>(
             function computation(this: RxMap<any, RxList<T>>) {
                 const groups = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
+                if (__DEV__ && !devPurityChecked && source.data.length > 0) {
+                    devPurityChecked = true
+                    const probeItem = source.data[0]
+                    const k1 = devDetectReactiveReads('RxList.groupBy getKey', () => getKey(probeItem))
+                    if (!sameValueZero(k1, getKey(probeItem))) {
+                        warn('RxList.groupBy getKey returned different keys for the same item (unstable key). '
+                            + 'Incremental group maintenance locates groups by key identity; unstable keys make it diverge from a full recompute.')
+                    }
+                }
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
                     const key = getKey(item)
@@ -1688,11 +1768,26 @@ export class RxList<T> extends Computed {
         //  链永久毒化,违反 sparseSetOperatorsSweep 的"不崩溃且可恢复"等价类。
         //  洞位行(undefined)一律跳过:全量侧按 hasOwnProperty 跳洞(与 map 一致),
         //  patch 侧删除/替换遇 undefined 旧值视为"无旧 entry"。
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads;
+        // 属性形式对 object-atom 行同样适用——proxy get 也会被 probe 捕获)
+        let devPurityChecked = false
         return new RxMap<any, T>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
+                if (__DEV__ && !devPurityChecked) {
+                    const probeItem = source.data.find(it => it != null)
+                    if (probeItem != null) {
+                        devPurityChecked = true
+                        const extract = (item: NonNullable<T>) => typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
+                        const k1 = devDetectReactiveReads('RxList.indexBy getKey', () => extract(probeItem))
+                        if (!sameValueZero(k1, extract(probeItem))) {
+                            warn('RxList.indexBy getKey returned different keys for the same item (unstable key). '
+                                + 'Incremental index maintenance locates entries by key identity; unstable keys make it diverge from a full recompute.')
+                        }
+                    }
+                }
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
                     // 洞位与显式 null/undefined 行统一忽略(无法取 key)
