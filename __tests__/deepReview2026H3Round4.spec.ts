@@ -1,7 +1,10 @@
 import {describe, expect, test} from 'vitest'
 import {RxList} from '../src/RxList.js'
 import {batch} from '../src/notify.js'
+import {Computed, getComputedInternal} from '../src/computed.js'
+import {onChange} from '../src/common.js'
 import {indexReadingMapFn, indexReadingModel, mulberry32} from './fuzzKit.js'
+import {expectGroupByEqualsModel} from './stateOracle.js'
 
 /**
  * 2026-H3 round4 深度 review 资产。
@@ -261,6 +264,216 @@ describe('R4 顺带补杀：indexBy/toMap × 非稠密 key set 的幽灵 EKC 守
         } finally {
             asMap.destroy()
             source.destroy()
+        }
+    })
+})
+
+/**
+ * R4 规模债务清偿（groupBy 单遍批量 + toSorted 阈值回退）。
+ *
+ * groupBy：逐项 insertInSourceOrder/removeAtSourcePosition 对每项各扫一遍前缀
+ * → O(k×n)；reorder 分支每组全扫 stateNow → O(组数×n)。修复为单遍分桶：
+ * 批量路径下每组恰 ≤1 次删除 splice + ≤1 次插入 splice（依据"同一变更块的
+ * 同 key 项在组内必然连续"），reorder 一次 O(n) 分桶。单项操作保留零分配
+ * 快路径（与旧实现逐字节等价）。
+ *
+ * toSorted：批量变更（bulk > 64 且 bulk×4 > m 或 bulk > 4096）回退全量重算
+ * （实测交叉点 m=1k/10k/100k 时 k*≈200/2400/5300；排序列表的批量增量没有
+ * 廉价下游形态可保，回退与 tie/undefined 家族同语义）。
+ */
+describe('R4 规模债务清偿：groupBy 批量单遍路径', () => {
+    test('批量插入/删除/替换 ≡ 全量模型（含新键组/清空组/重复 key）', () => {
+        const source = new RxList<number>([1, 2, 3, 4, 5, 6])
+        const getKey = (x: number) => x % 3
+        const grouped = source.groupBy(getKey)
+        try {
+            // 批量插入（含新组键 + 既有组，重复 key 交错）
+            source.spliceArray(2, 0, [7, 8, 9, 10, 11])
+            expectGroupByEqualsModel(grouped, source.data, getKey, 'bulk insert')
+            // 批量替换（删插同时，部分组清空）
+            source.spliceArray(0, 8, [30, 31])
+            expectGroupByEqualsModel(grouped, source.data, getKey, 'bulk replace')
+            // 批量删除（清空整组 → 键删除）
+            source.spliceArray(0, source.data.length - 1)
+            expectGroupByEqualsModel(grouped, source.data, getKey, 'bulk delete')
+            // replaceData 全量换血
+            source.replaceData([100, 101, 102, 103, 104, 105, 106])
+            expectGroupByEqualsModel(grouped, source.data, getKey, 'replaceData')
+        } finally {
+            for (const g of grouped.data.values()) g.destroy()
+            grouped.destroy(); source.destroy()
+        }
+    })
+
+    test('部分批量变更下幸存组保持引用稳定（增量路径的语义承诺）', () => {
+        const source = new RxList<number>([0, 1, 2, 3, 4, 5])
+        const grouped = source.groupBy(x => x % 2)
+        try {
+            const evenBefore = grouped.data.get(0)
+            const oddBefore = grouped.data.get(1)
+            source.spliceArray(1, 2, [10, 11, 12, 13])  // 批量替换,两组都幸存
+            expect(grouped.data.get(0)).toBe(evenBefore)
+            expect(grouped.data.get(1)).toBe(oddBefore)
+            expectGroupByEqualsModel(grouped, source.data, x => x % 2, 'identity kept')
+        } finally {
+            for (const g of grouped.data.values()) g.destroy()
+            grouped.destroy(); source.destroy()
+        }
+    })
+
+    test('触发形状：一次批量 splice 每组收到 ≤2 条 splice info（曾为逐项 k 条）', () => {
+        const source = new RxList<number>([0, 1, 2, 3, 4, 5, 6, 7])
+        const grouped = source.groupBy(x => x % 2)
+        try {
+            const evenGroup = grouped.data.get(0)!
+            const infos: any[] = []
+            const stop = onChange(evenGroup, (batchInfos: any[]) => infos.push(...batchInfos))
+            // 批量替换:偶数组同时有删有插
+            source.spliceArray(0, 6, [20, 22, 24, 21, 23])
+            stop()
+            const spliceInfos = infos.filter(i => i.method === 'splice')
+            expect(spliceInfos.length).toBeLessThanOrEqual(2)
+            expect(spliceInfos.length).toBeGreaterThanOrEqual(1)
+            expectGroupByEqualsModel(grouped, source.data, x => x % 2, 'shape')
+        } finally {
+            for (const g of grouped.data.values()) g.destroy()
+            grouped.destroy(); source.destroy()
+        }
+    })
+
+    test('reorder × 多组（单遍分桶路径）≡ 全量模型且引用稳定', () => {
+        const source = new RxList<number>(Array.from({length: 300}, (_, i) => i))
+        const getKey = (x: number) => x % 100  // 100 个组
+        const grouped = source.groupBy(getKey)
+        try {
+            const refBefore = grouped.data.get(7)
+            source.sortSelf((a, b) => b - a)
+            expectGroupByEqualsModel(grouped, source.data, getKey, 'reorder many groups')
+            expect(grouped.data.get(7)).toBe(refBefore)
+        } finally {
+            for (const g of grouped.data.values()) g.destroy()
+            grouped.destroy(); source.destroy()
+        }
+    })
+
+    // 差分 fuzz：批量操作域（大 k splice/replaceData/reorder 混排,含 NaN key 与
+    // 单项快路径/批量路径交替）,每步与朴素模型全可观察比对
+    for (const seed of [71, 72, 73]) {
+        test(`批量差分 fuzz seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            let counter = 0
+            const getKey = (x: number) => (Number.isNaN(x) ? NaN : x % 5)
+            const source = new RxList<number>(Array.from({length: 30}, () => counter++))
+            const grouped = source.groupBy(getKey)
+            const history: string[] = []
+            try {
+                for (let step = 0; step < 80; step++) {
+                    const r = rand()
+                    const len = source.data.length
+                    if (r < 0.3) {
+                        // 批量插入(有时含 NaN)
+                        const k = 2 + Math.floor(rand() * 20)
+                        const items = Array.from({length: k}, () => (rand() < 0.1 ? NaN : counter++))
+                        const start = Math.floor(rand() * (len + 1))
+                        source.spliceArray(start, 0, items)
+                        history.push(`bulkIns(${start},${k})`)
+                    } else if (r < 0.5 && len > 2) {
+                        const start = Math.floor(rand() * len)
+                        const dc = 2 + Math.floor(rand() * Math.min(len - start, 15))
+                        const ins = Array.from({length: Math.floor(rand() * 6)}, () => counter++)
+                        source.spliceArray(start, dc, ins)
+                        history.push(`bulkRepl(${start},${dc},${ins.length})`)
+                    } else if (r < 0.62 && len > 0) {
+                        source.splice(Math.floor(rand() * len), 1)
+                        history.push('single-del')
+                    } else if (r < 0.74) {
+                        source.push(counter++)
+                        history.push('push')
+                    } else if (r < 0.86 && len >= 2) {
+                        source.sortSelf((a, b) => (a ?? 0) - (b ?? 0))
+                        history.push('sortSelf')
+                    } else if (len > 0) {
+                        source.set(Math.floor(rand() * len), counter++)
+                        history.push('set')
+                    }
+                    expectGroupByEqualsModel(grouped, source.data, getKey,
+                        `seed=${seed} step=${step} recent=${history.slice(-4).join(',')}`)
+                }
+            } finally {
+                for (const g of grouped.data.values()) g.destroy()
+                grouped.destroy(); source.destroy()
+            }
+        })
+    }
+})
+
+describe('R4 规模债务清偿：toSorted 批量阈值回退', () => {
+    function witness(target: any): () => number {
+        const internal: Computed = target instanceof Computed ? target : getComputedInternal(target)!
+        let count = 0
+        internal.on('fullRecompute', () => count++)
+        return () => count
+    }
+
+    test('阈值边界：小批量保持增量,大批量回退且结果 ≡ 全量 sort', () => {
+        let n = 0
+        const mk = (count: number) => Array.from({length: count}, () => (n += 2))
+        const source = new RxList<number>(mk(1000))
+        const sorted = source.toSorted((a, b) => a - b)
+        const fulls = witness(sorted)
+        try {
+            // bulk=65 > 64 但 65×4=260 ≤ 1000 且 ≤4096 → 增量
+            source.spliceArray(500, 0, mk(65))
+            expect(fulls()).toBe(0)
+            expect(sorted.data).toEqual(source.data.slice().sort((a, b) => a - b))
+            // bulk=300:300×4=1200 > 1065 → 回退全量
+            source.spliceArray(0, 0, mk(300))
+            expect(fulls()).toBe(1)
+            expect(sorted.data).toEqual(source.data.slice().sort((a, b) => a - b))
+            // 批量删除同样计入 bulk
+            source.spliceArray(0, 600)
+            expect(fulls()).toBe(2)
+            expect(sorted.data).toEqual(source.data.slice().sort((a, b) => a - b))
+            // 单项操作仍增量
+            source.push(n += 2)
+            source.splice(0, 1)
+            expect(fulls()).toBe(2)
+            expect(sorted.data).toEqual(source.data.slice().sort((a, b) => a - b))
+        } finally {
+            sorted.destroy(); source.destroy()
+        }
+    })
+
+    test('绝对上限门：长列表上超 4096 的批量也回退（k×m 悬崖的另一半）', () => {
+        let n = 0
+        const mk = (count: number) => Array.from({length: count}, () => (n += 2))
+        const source = new RxList<number>(mk(30000))
+        const sorted = source.toSorted((a, b) => a - b)
+        const fulls = witness(sorted)
+        try {
+            // bulk=5000:5000×4=20000 ≤ 30000 但 > 4096 → 回退
+            source.spliceArray(100, 0, mk(5000))
+            expect(fulls()).toBe(1)
+            expect(sorted.data.length).toBe(source.data.length)
+            expect(sorted.data[0]).toBe(2)
+        } finally {
+            sorted.destroy(); source.destroy()
+        }
+    })
+
+    test('batch 多 info 内批量 + 单项混排 ≡ 全量 sort', () => {
+        let n = 0
+        const mk = (count: number) => Array.from({length: count}, () => (n += 2))
+        const source = new RxList<number>(mk(200))
+        const sorted = source.toSorted((a, b) => a - b)
+        try {
+            batch(() => {
+                source.spliceArray(50, 0, mk(120))  // bulk 回退
+                source.push(n += 2)                  // 单项
+            })
+            expect(sorted.data).toEqual(source.data.slice().sort((a, b) => a - b))
+        } finally {
+            sorted.destroy(); source.destroy()
         }
     })
 })

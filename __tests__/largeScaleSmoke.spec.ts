@@ -14,10 +14,11 @@ import {batch} from '../src/notify.js'
  * 一致。目标是抓 spread/实参上限、栈深、平方级放大等规模缺陷类，
  * 不是性能基准（计时归 bench）。
  *
- * 已知规模债务（登记，未立案）：groupBy 与 toSorted 的增量**批量插入**是
- * O(插入数 × 源长)（逐项前缀计数 / 逐项有序插入），10^5 级批量插入会走分钟级
- * ——本层对二者只做大规模构建 + 小步增量；若未来支持大批量增量（或加阈值
- * 回退全量），在此处补全量级并更新 README 矩阵脚注。
+ * 规模债务清偿记录（2026-H3 round4）：groupBy 与 toSorted 的批量增量曾是
+ * O(插入数 × 源长)（逐项前缀计数 / 逐项有序插入），10^5 级批量走分钟级，
+ * 本层首版被迫绕开。现 groupBy 走单遍分桶批量路径（O(n+k)，每组 ≤2 次
+ * splice）、toSorted 批量超阈值回退全量（README 脚注），10^5 批量格子已
+ * 点亮（实测 replaceData(100k)：groupBy 6.6s→11ms，toSorted 2.0s→14ms）。
  */
 
 const N = 100_000
@@ -98,7 +99,7 @@ describe('10^5 量级冒烟（正确性，非性能）', () => {
         }
     })
 
-    test('groupBy/toSorted × N 构建 + 小步增量（大批量增量为已登记规模债务）', () => {
+    test('groupBy/toSorted × N 构建 + 小步增量', () => {
         const source = new RxList<number>(range(N))
         const grouped = source.groupBy(x => x % 7)
         const sorted = source.toSorted((a, b) => b - a)
@@ -115,6 +116,51 @@ describe('10^5 量级冒烟（正确性，非性能）', () => {
         } finally {
             for (const g of grouped.data.values()) g.destroy()
             grouped.destroy(); sorted.destroy(); source.destroy()
+        }
+    })
+
+    test('groupBy × N 批量：replaceData/大段替换（单遍批量路径）+ 幸存组引用稳定', () => {
+        const source = new RxList<number>(range(N))
+        const grouped = source.groupBy(x => x % 7)
+        try {
+            const groupRef = grouped.data.get(3)
+            // 大段替换（两相都是批量路径；所有组都幸存 → 引用必须稳定）
+            source.spliceArray(1000, 50_000, range(80_000, 1_000_000))
+            expect(grouped.data.get(3)).toBe(groupRef)
+            let total = 0
+            for (const g of grouped.data.values()) {
+                total += g.data.length
+                // 组内序抽查：与模型首元素一致
+                expect(g.data.length).toBeGreaterThan(0)
+            }
+            expect(total).toBe(source.data.length)
+            // 全量换血（组会经历清空→重建）
+            source.replaceData(range(N, 5_000_000))
+            total = 0
+            for (const [k, g] of grouped.data) {
+                total += g.data.length
+                expect(g.data[0] % 7).toBe(k)
+            }
+            expect(total).toBe(N)
+            // reorder × 大 N（单遍分桶路径）
+            source.sortSelf((a, b) => b - a)
+            expect(grouped.data.get(grouped.data.keys().next().value!)!.data.length).toBeGreaterThan(0)
+        } finally {
+            for (const g of grouped.data.values()) g.destroy()
+            grouped.destroy(); source.destroy()
+        }
+    })
+
+    test('toSorted × N 批量：replaceData 经阈值回退，结果 ≡ 全量 sort', () => {
+        const source = new RxList<number>(range(N).map(i => (i * 7919) % (N * 10)))
+        const sorted = source.toSorted((a, b) => a - b)
+        try {
+            const next = range(N, 3).map(i => (i * 6271) % (N * 10))
+            source.replaceData(next)
+            const model = next.slice().sort((a, b) => a - b)
+            expectSameArray(sorted.data, model, 'toSorted after bulk replaceData')
+        } finally {
+            sorted.destroy(); source.destroy()
         }
     })
 

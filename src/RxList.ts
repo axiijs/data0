@@ -104,6 +104,12 @@ function isDenseIndexKey(key: unknown): key is number {
     return typeof key === 'number' && Number.isInteger(key) && key >= 0
 }
 
+// toSorted 批量回退阈值：bulk > 64 且（bulk×4 > 派生长度 或 bulk > 4096）时
+// 回退全量重算。标定与理由见 toSorted applyPatch 内注释（2026-H3 round4）。
+const TOSORTED_BULK_MIN = 64
+const TOSORTED_BULK_RATIO = 4
+const TOSORTED_BULK_CAP = 4096
+
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
 export type ReorderPatchInfo = {
@@ -633,6 +639,20 @@ export class RxList<T> extends Computed {
                     if (method === 'splice') {
                         const deletedItems = (methodResult as T[]) || []
                         const newItems = argv!.slice(2) as T[]
+                        // CAUTION 批量阈值回退（2026-H3 round4 规模债务清偿）：逐项增量是
+                        //  O(k×(m+k))——每项二分 O(log m) + splice 的 O(m) 搬移 + 一次派发，
+                        //  批量 replaceData（十万行）走分钟级。排序列表的批量变更没有"廉价
+                        //  的增量下游形态"可保：即使归并成 O(m+k)，表达为 patch 最坏仍是 k
+                        //  段插入；整体重建 = 一次 wholesale splice = 与全量重算可观察等价。
+                        //  交叉点实测（/tmp 标定脚本，无订阅者的下界；有订阅者时逐项派发
+                        //  使 k* 更低）：m=1k/10k/100k 时 k*≈200/2400/5300——非线性，
+                        //  单一比例不拟合。双门 bulk > 64 且（bulk×4 > m 或 bulk > 4096）：
+                        //  三个量级的边界各落在 ~250/~2500/~4100，阈值带内最坏多付 ≤1.3×
+                        //  （毫秒级、有界），悬崖（k≈m 时增量比全量慢两个数量级）消除。
+                        //  回退语义与 tie/undefined 家族一致（README 脚注已同步）。
+                        const bulk = deletedItems.length + newItems.length
+                        if (bulk > TOSORTED_BULK_MIN
+                            && (bulk * TOSORTED_BULK_RATIO > this.data.length || bulk > TOSORTED_BULK_CAP)) return false
                         // includes 是 SameValueZero：undefined（含稀疏洞读出的 undefined）可命中
                         if (deletedItems.includes(undefined as T) || newItems.includes(undefined as T)) return false
                         // 1) remove items（tie 歧义与定位失败都回退全量,见 removeOrBail）
@@ -1539,27 +1559,96 @@ export class RxList<T> extends Computed {
                             ? multi.lengthBefore(infoIndex)
                             : source.data.length - newItemsInArgs.length + deleteItems.length
                         const startIndex = normalizeSpliceStart(argv![0], lengthBeforeSplice)
-                        deleteItems.forEach((item) => {
-                            // 所有删除项都从 startIndex 起：前缀 [0, startIndex) 未被本次触及
-                            removeAtSourcePosition(item, startIndex)
-                        })
-                        newItemsInArgs.forEach((item, index) => {
-                            insertInSourceOrder(item, startIndex + index)
-                        })
+                        if (deleteItems.length <= 1 && newItemsInArgs.length <= 1) {
+                            // 单项快路径：push/pop/单元素 splice 是最热形态，逐项前缀
+                            // 扫描零分配（批量路径的 Map 记账对 k=1 是纯开销）。
+                            deleteItems.forEach((item) => {
+                                // 所有删除项都从 startIndex 起：前缀 [0, startIndex) 未被本次触及
+                                removeAtSourcePosition(item, startIndex)
+                            })
+                            newItemsInArgs.forEach((item, index) => {
+                                insertInSourceOrder(item, startIndex + index)
+                            })
+                        } else {
+                            // CAUTION 批量单遍路径（2026-H3 round4 规模债务清偿）：逐项调用
+                            //  insertInSourceOrder/removeAtSourcePosition 会对每个项各扫一遍
+                            //  前缀——k 项 × O(startIndex) 前缀 = O(k×n) getKey 调用（10^5 级
+                            //  replaceData 走分钟级）。批量化的结构事实：**同一次 splice 的
+                            //  同 key 项在组内必然连续**——变更块在源中连续占据
+                            //  [startIndex, startIndex+k)，既存同 key 项要么整体在块前、要么
+                            //  整体在块后。因此每组恰需一次删除 spliceArray + 一次插入
+                            //  spliceArray，位置都是"前缀 [0, startIndex) 的同 key 计数"，
+                            //  前缀只需扫一遍。总复杂度 O(startIndex + k)；下游每组从 k 条
+                            //  info 收敛到 ≤2 条（触发形状钉扎见 deepReview2026H3Round4）。
+                            //  Map 的键语义是 SameValueZero，与 sameKey/全量 computation 的
+                            //  Map 分组一致（NaN 可作组键，0/-0 同组）。
+                            const prefixCounts = new Map<any, number>()
+                            const bound = Math.min(startIndex, stateNow.length)
+                            for (let i = 0; i < bound; i++) {
+                                const k = getKey(stateNow[i])
+                                prefixCounts.set(k, (prefixCounts.get(k) ?? 0) + 1)
+                            }
+                            if (deleteItems.length) {
+                                const deletesByKey = new Map<any, number>()
+                                for (const item of deleteItems) {
+                                    const k = getKey(item)
+                                    deletesByKey.set(k, (deletesByKey.get(k) ?? 0) + 1)
+                                }
+                                for (const [k, count] of deletesByKey) {
+                                    const group = this.data.get(k)
+                                    if (!group) continue
+                                    const pos = prefixCounts.get(k) ?? 0
+                                    // clamp 防御（与逐项版的 pos < length 守卫同源）
+                                    const deletable = Math.min(count, Math.max(group.data.length - pos, 0))
+                                    if (deletable > 0) group.splice(pos, deletable)
+                                    // 空组必须删键（语义同 removeAtSourcePosition）
+                                    if (group.data.length === 0) {
+                                        this.delete(k)
+                                        group.destroy()
+                                    }
+                                }
+                            }
+                            if (newItemsInArgs.length) {
+                                // 分桶保持源内顺序；组的创建顺序 = key 在插入块中的首现顺序
+                                // （Map 迭代序），与逐项版一致
+                                const insertsByKey = new Map<any, T[]>()
+                                for (const item of newItemsInArgs) {
+                                    const k = getKey(item)
+                                    let bucket = insertsByKey.get(k)
+                                    if (!bucket) insertsByKey.set(k, (bucket = []))
+                                    bucket.push(item)
+                                }
+                                for (const [k, items] of insertsByKey) {
+                                    let group = this.data.get(k)
+                                    if (!group) {
+                                        group = new RxList<T>([])
+                                        this.set(k, group)
+                                    }
+                                    group.spliceArray(prefixCounts.get(k) ?? 0, 0, items)
+                                }
+                            }
+                        }
 
                     } else if (method === 'reorder') {
                         // membership 不变，只按该 info 操作时的 source 顺序重排现有 group，
                         // 保持 group RxList 引用稳定。
+                        // CAUTION 单遍分桶（2026-H3 round4 规模债务清偿）：旧实现每组全扫
+                        //  stateNow，组多时（极端：每项一组）reorder 是 O(组数×n) = O(n²)。
+                        //  一次 O(n) 扫描按 key 分桶后每组一次 spliceArray；只重排 this.data
+                        //  里已存在的组（组集在 reorder 下不变，与旧行为一致）。
                         // CAUTION 全下标扫描而不是 Array#filter：全量 computation 按
                         //  [0, length) 读取（洞位读出 undefined 参与分组），filter 会跳洞
                         //  ——稀疏源上 reorder 会把"undefined 组"清空而键残留，与全量
                         //  重算分叉（洞的物化语义必须两侧一致，同 map/indexBy 先例）。
+                        const nextByKey = new Map<any, T[]>()
+                        for (let i = 0; i < stateNow.length; i++) {
+                            const k = getKey(stateNow[i])
+                            let bucket = nextByKey.get(k)
+                            if (!bucket) nextByKey.set(k, (bucket = []))
+                            bucket.push(stateNow[i])
+                        }
                         this.data.forEach((group, groupKey) => {
-                            const nextItems: T[] = []
-                            for (let i = 0; i < stateNow.length; i++) {
-                                if (sameKey(getKey(stateNow[i]), groupKey)) nextItems.push(stateNow[i])
-                            }
-                            group.spliceArray(0, group.data.length, nextItems)
+                            group.spliceArray(0, group.data.length, nextByKey.get(groupKey) ?? [])
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key 的 set 是数组属性赋值,不触及任何元素:忽略 ≡ 全量重算
