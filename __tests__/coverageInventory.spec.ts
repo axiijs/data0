@@ -95,10 +95,38 @@ export const INVENTORY: Record<string, Row> = {
     'RxSet.isDisjointFrom':      row('rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'collectionLedgerBurndown2.spec.ts', 'NA:非数组结构', 'collectionLedgerBurndown2.spec.ts(batch 谓词)', DESTROY, 'collectionLedgerBurndown2.spec.ts'),
 }
 
+// ---- 值域 × 进入通道账本(2026-H3 round4,R4-2 教训) ----
+// 主矩阵的格子粒度是"算子 × 值域";R4-2 证明值域覆盖必须叉乘**进入通道**:
+// indexBy × undefined 格子亮着(初始数据/删除侧有资产),值从 argv 插入与
+// EKC newValue 通道进入的路径零覆盖,patch 插入侧的属性读当场 TypeError。
+// 本表对"patch 端按值消费元素"的算子逐通道过账 null/undefined 敌意值域;
+// 通道恒走全量重算(无 patch 侧守卫可失衡)的格子标 NA 并给构造性理由。
+const INGRESS_CHANNELS = ['initialData', 'argvInsert', 'ekcNewValue', 'ekcOldValue', 'methodResultDelete'] as const
+type IngressChannel = typeof INGRESS_CHANNELS[number]
+type IngressRow = Record<IngressChannel, Cell>
+
+const ingressRow = (initialData: Cell, argvInsert: Cell, ekcNewValue: Cell, ekcOldValue: Cell, methodResultDelete: Cell): IngressRow =>
+    ({initialData, argvInsert, ekcNewValue, ekcOldValue, methodResultDelete})
+
+const INGRESS = 'valueIngressChannels.spec.ts'
+const R4 = 'deepReview2026H3Round4.spec.ts'
+
+export const VALUE_INGRESS_INVENTORY: Record<string, IngressRow> = {
+    'RxList.map':             ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
+    'RxList.filter':          ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
+    'RxList.toSorted':        ingressRow(`${INGRESS}(undefined;null 参与 comparator 属契约外,README §4)`, INGRESS, `${INGRESS}(变更含 undefined 自动回退全量)`, INGRESS, INGRESS),
+    'RxList.groupBy':         ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
+    'RxList.toSet':           ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
+    'RxList.indexBy':         ingressRow(`${R4}(null 初始行)`, `${R4}(push null/undefined)`, `${R4}(set→null)`, `${R4}(null 行被替换)`, `${R4}(splice 删 null 行)`),
+    'RxList.toMap':           ingressRow(`${R4}(undefined 初始行)`, `${R4}(push undefined)`, `${R4}(set→undefined)`, `${R4}(undefined 行被替换)`, `${R4}(splice 删 undefined 行)`),
+    'RxList.reduce':          ingressRow('collectionLedgerBurndown2.spec.ts(undefined 透传)', 'collectionLedgerBurndown2.spec.ts(尾插 undefined 增量)', 'NA:set→全量重算(README 矩阵,值不经 patch 插入路径)', 'NA:set→全量重算(同左)', 'NA:非尾插删除→全量重算(README 矩阵)'),
+    'RxList.createSelection': ingressRow(INGRESS, INGRESS, INGRESS, INGRESS, INGRESS),
+}
+
 // 原型上的非派生成员分类(新增公开方法必须归入某一类,否则测试失败)。
 // 数据本体在 surfaceClassification.ts(与 entryPointSemanticsInventory 共享,
 // 一处修改两本账本同时生效)。
-import {READS, MUTATIONS, INTERNAL} from './surfaceClassification.js'
+import {READS, MUTATIONS, INTERNAL, DOWNSTREAM_FEEDBACK} from './surfaceClassification.js'
 
 const CLASSES: Record<string, any> = {RxList: RxList.prototype, RxMap: RxMap.prototype, RxSet: RxSet.prototype}
 
@@ -166,8 +194,50 @@ describe('覆盖清单 conformance', () => {
                 if (cells[dim] === 'UNCOVERED') uncovered.push(`${operator} × ${dim}`)
             }
         }
+        for (const [operator, cells] of Object.entries(VALUE_INGRESS_INVENTORY)) {
+            for (const ch of INGRESS_CHANNELS) {
+                if (cells[ch] === 'UNCOVERED') uncovered.push(`${operator} × ingress:${ch}`)
+            }
+        }
         // 不 fail:盲格是显式登记的债务。这里输出总账,涨落都可见于 diff。
         console.info(`[coverageInventory] 当前显式盲格 ${uncovered.length} 个:\n  ${uncovered.join('\n  ')}`)
         expect(uncovered.length).toBeGreaterThanOrEqual(0)
+    })
+
+    test('进入通道账本:引用的资产文件全部真实存在', () => {
+        const missing: string[] = []
+        for (const [operator, cells] of Object.entries(VALUE_INGRESS_INVENTORY)) {
+            for (const ch of INGRESS_CHANNELS) {
+                const cell = cells[ch]
+                if (cell === 'UNCOVERED' || cell.startsWith('NA:')) continue
+                const fileMatch = cell.match(/([A-Za-z0-9]+\.spec\.ts)/)
+                if (!fileMatch) {
+                    missing.push(`${operator} × ${ch}: 格式无法解析 "${cell}"`)
+                    continue
+                }
+                if (!existsSync(join(__dirname, fileMatch[1]))) {
+                    missing.push(`${operator} × ${ch}: 资产不存在 "${fileMatch[1]}"`)
+                }
+            }
+        }
+        expect(missing, missing.join('\n')).toEqual([])
+    })
+
+    test('进入通道账本:键必须是主矩阵登记过的算子', () => {
+        for (const key of Object.keys(VALUE_INGRESS_INVENTORY)) {
+            expect(INVENTORY[key], `${key} 不在主矩阵中`).toBeTruthy()
+        }
+    })
+
+    test('下游反馈标记:主矩阵每个算子必须显式标注(none 面按更高权重立项)', () => {
+        const unmarked = Object.keys(INVENTORY).filter(op => !(op in DOWNSTREAM_FEEDBACK))
+        expect(
+            unmarked,
+            `以下算子缺下游反馈标记(axii/axle 使用情况,grep 依据见 surfaceClassification.ts):\n${unmarked.join('\n')}`
+        ).toEqual([])
+        const stale = Object.keys(DOWNSTREAM_FEEDBACK).filter(op => !(op in INVENTORY))
+        expect(stale, `以下标记指向不存在的算子:\n${stale.join('\n')}`).toEqual([])
+        const none = Object.values(DOWNSTREAM_FEEDBACK).filter(v => v === 'none').length
+        console.info(`[coverageInventory] 下游零反馈面 ${none}/${Object.keys(DOWNSTREAM_FEEDBACK).length} 个(review 立项加权依据)`)
     })
 })

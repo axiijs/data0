@@ -289,6 +289,31 @@ export class RxList<T> extends Computed {
             this.resetAutoTrack()
         }
     }
+    /**
+     * @internal
+     * CAUTION 构造性不变量（2026-H3 round4，R4-1 等价类）：结构变更的 info 派发
+     *  必须先于"订阅者可见的原子写"（index atom 值写入等 meta 维护）对外可见。
+     *  否则非 batch 下原子写会同步执行行级订阅者（map 的 rowComputed），此刻它们
+     *  看不到任何 pending 结构 info（hasPendingStructuralInfos 守卫失效），按终态
+     *  位置直写派生列表，随后派生列表的结构 patch 再搬移一次——双重搬移，silent
+     *  乱序。本原语把顺序固化为：同一 effect session 内先 sendTriggerInfos、再执行
+     *  原子写；digest 时结构 patch 先应用、行级重算后运行。
+     *  所有"派发结构 info + 随后写 meta 原子"的变更方法必须走本原语，禁止各自
+     *  手写 createEffectSession/sendTriggerInfos 顺序——doSplice 曾正确、reorder
+     *  曾遗漏，同一不变量的兄弟实现点不一致即缺陷（AGENTS「不变量升格」规则的
+     *  第一个登记项，静态执法见 __tests__/sourceInvariants.spec.ts）。
+     */
+    protected dispatchStructuralThen(atomWrites?: () => void) {
+        notifier.createEffectSession()
+        try {
+            this.sendTriggerInfos()
+            atomWrites?.()
+        } finally {
+            // CAUTION 放在 finally：session 一旦创建必须消化，否则 notifier 永久
+            //  停留在 session 模式，之后所有 trigger 都被吞进队列。
+            notifier.digestEffectSession()
+        }
+    }
     private doSplice(start: number, deleteCount: number, items: T[]) {
         const originLength = this.data.length
         // CAUTION 内部计算一律用归一化后的 start/deleteCount（Array#splice 的
@@ -350,29 +375,20 @@ export class RxList<T> extends Computed {
             }
         }
 
-        // CATION 特别注意这里 atomIndexes 的变化也要先 catch 住
-        notifier.createEffectSession()
-        try {
-            this.sendTriggerInfos()
-
-            if (this.atomIndexes) {
-                // CAUTION 稀疏对齐：越界 set（契约内透传）会让 data 变长而 atomIndexes
-                //  没跟上。此时必须先把 atomIndexes 撑到 splice 前的 data 长度（产生洞,
-                //  零分配），否则 native splice 会把 start 钳到旧长度，新 index atom
-                //  全部插错位置（值与位置漂移）。洞位置不分配 atom（与初始构建时
-                //  Array#map 跳过稀疏洞的行为一致），由下方 ?. 跳过。
-                if (this.atomIndexes.length < originLength) this.atomIndexes.length = originLength
-                spliceMany(this.atomIndexes, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
-                for (let i = normalizedStart; i <changedIndexEnd; i++) {
-                    // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
-                    this.atomIndexes[i]?.(i)
-                }
+        // 结构 info 先派发、atomIndexes 维护随后（顺序契约见 dispatchStructuralThen）
+        this.dispatchStructuralThen(this.atomIndexes === undefined ? undefined : () => {
+            // CAUTION 稀疏对齐：越界 set（契约内透传）会让 data 变长而 atomIndexes
+            //  没跟上。此时必须先把 atomIndexes 撑到 splice 前的 data 长度（产生洞,
+            //  零分配），否则 native splice 会把 start 钳到旧长度，新 index atom
+            //  全部插错位置（值与位置漂移）。洞位置不分配 atom（与初始构建时
+            //  Array#map 跳过稀疏洞的行为一致），由下方 ?. 跳过。
+            if (this.atomIndexes!.length < originLength) this.atomIndexes!.length = originLength
+            spliceMany(this.atomIndexes!, normalizedStart, deleteItemsCount, items.map((_, index) => atom(index + normalizedStart)))
+            for (let i = normalizedStart; i <changedIndexEnd; i++) {
+                // 注意这里的 ?. ，因为 splice 之后可能长度不够了。
+                this.atomIndexes![i]?.(i)
             }
-        } finally {
-            // CAUTION 放在 finally：session 一旦创建必须消化，否则 notifier 永久停留在
-            //  session 模式，之后所有 trigger 都被吞进队列。
-            notifier.digestEffectSession()
-        }
+        })
 
         if (__DEV__) assertAtomIndexesAligned(this)
         return result
@@ -438,25 +454,16 @@ export class RxList<T> extends Computed {
         })
 
         this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
-        // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见（与 doSplice 的
-        //  session 顺序一致）：index atom 的订阅者（map 的行级 Computed）在非 batch 下
-        //  会被原子写同步执行——此刻 reorder 的 METHOD info 尚未派发，行级 getter 的
-        //  hasPendingStructuralInfos 守卫看不到任何 pending 结构 info，于是按"终态位置"
-        //  直写派生列表；随后派生列表的 reorder patch 又按 order 搬移一次，行序被双重
-        //  搬移（silent 乱序，2026-H3 round4 动态复现）。这里先把 METHOD 入队、再在同一
-        //  session 内写 index atom：digest 时结构 patch 先应用、行级重算后运行（此时
-        //  终态位置已经就绪），与 batch 路径的可观察语义一致。
-        notifier.createEffectSession()
-        try {
-            this.sendTriggerInfos()
-            if (oldIndexAtoms) {
-                newIndexes.forEach((newIndex, i) => {
-                    oldIndexAtoms[i]?.(newIndex)
-                })
-            }
-        } finally {
-            notifier.digestEffectSession()
-        }
+        // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见：否则非 batch 下
+        //  原子写同步执行 map 的行级 Computed，其 hasPendingStructuralInfos 守卫看不到
+        //  pending 结构 info，按终态位置直写派生列表，随后 reorder patch 又搬移一次
+        //  ——双重搬移，silent 乱序（2026-H3 round4 动态复现）。顺序由
+        //  dispatchStructuralThen 原语固化（与 doSplice 同一出口）。
+        this.dispatchStructuralThen(oldIndexAtoms === null ? undefined : () => {
+            newIndexes.forEach((newIndex, i) => {
+                oldIndexAtoms[i]?.(newIndex)
+            })
+        })
         if (__DEV__) assertAtomIndexesAligned(this)
     }
     reposition(start:number, newStart:number, limit:number = 1 ) {

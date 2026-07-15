@@ -1,7 +1,7 @@
 import {describe, expect, test} from 'vitest'
 import {RxList} from '../src/RxList.js'
 import {batch} from '../src/notify.js'
-import {mulberry32} from './fuzzKit.js'
+import {indexReadingMapFn, indexReadingModel, mulberry32} from './fuzzKit.js'
 
 /**
  * 2026-H3 round4 深度 review 资产。
@@ -102,14 +102,14 @@ describe('R4-1 map(mapFn 读 index()) × reorder：非 batch 触发序', () => {
     })
 
     // 等价类横扫：读 index 的 map × 全操作域差分（固定 seed）。
-    // 既有 broadOperatorsFuzz 的 map(item, index) 列只存 atom 不读值，
-    // 本列覆盖"行升级为带 index 依赖的 rowComputed"的形态。
+    // 行形态生成器已入 fuzzKit（indexReadingMapFn），broadOperatorsFuzz 的
+    // map 列同步继承；本列额外覆盖 swap 与 batch 混排。
     for (const seed of [61, 62, 63]) {
         test(`差分 fuzz（读 index 行）seed=${seed}`, () => {
             const rand = mulberry32(seed)
             let counter = 0
             const source = new RxList<number>([counter++, counter++, counter++])
-            const mapped = source.map((item, index) => `${item}#${index()}`)
+            const mapped = source.map(indexReadingMapFn)
             try {
                 for (let step = 0; step < 120; step++) {
                     const r = rand()
@@ -138,7 +138,7 @@ describe('R4-1 map(mapFn 读 index()) × reorder：非 batch 触发序', () => {
                         })
                     }
                     expect(mapped.data, `seed=${seed} step=${step} src=${JSON.stringify(source.data)}`)
-                        .toEqual(source.data.map((x, i) => `${x}#${i}`))
+                        .toEqual(indexReadingModel(source.data))
                 }
             } finally {
                 mapped.destroy()
