@@ -738,3 +738,74 @@ describe('findIndex 增量 cache 删除后的行为等价回归', () => {
         expect(Object.is(normalizeSpliceStart(-0.5, 5), 0)).toBe(true)
     })
 })
+
+// ---------------------------------------------------------------------------
+// 5. map 行级 hasPendingStructuralInfos 守卫（2026-H3 round4 mutation 幸存
+//    分类第 e 类"套件无法构造触发态"的补杀）
+//    源码形状：`if (!hasPendingStructuralInfos) { 直写终态位置 } else { frame 定位 }`。
+//    守卫的 load-bearing 场景：batch 内**先写行内依赖、再做结构操作**——
+//    行级 rowComputed 排在派生列表 patch 之前运行，此刻 mapped 还是结构变更前
+//    的形态。把条件变异成**恒 true**（强制直写分支）会按终态位置写进 pre-patch
+//    的 mapped：写错行/写进将被删除的位置，随后 patch 搬移后新值静默丢失、
+//    旧值残留——本组第一个测试杀灭该变体（已动态翻转自证）。
+//    （条件变异成恒 false = 恒走 frame 定位：非 pending 状态下行的当前位置
+//    恰等于终态位置，结果等价、只多一次 O(n) frame 扫描，属安全方向接受项。）
+// ---------------------------------------------------------------------------
+describe('map 行级重算 × 结构操作在同一 batch 的先后两序', () => {
+    // CAUTION 行引用独立持有（不复用传给构造器的数组）：构造采纳外部数组
+    //  是零拷贝所有权移交（A3），splice 会就地改写它。
+    const mkRow = (label: string) => ({label: atom(label)})
+
+    test('batch 内先写行依赖、再 splice：行新值不得丢失（frame 定位分支 load-bearing）', () => {
+        const [a, b, c] = [mkRow('a'), mkRow('b'), mkRow('c')]
+        const source = new RxList([a, b, c])
+        const mapped = source.map(row => row.label())
+        try {
+            expect(mapped.data).toEqual(['a', 'b', 'c'])
+            batch(() => {
+                b.label('B!')           // 行依赖先入队
+                source.splice(0, 1)     // 结构操作后入队：digest 时行级重算先运行
+            })
+            expect(source.data.length).toBe(2)
+            expect(mapped.data).toEqual(source.data.map(row => row.label.raw))
+            expect(mapped.data).toEqual(['B!', 'c'])
+        } finally {
+            mapped.destroy()
+            source.destroy()
+        }
+    })
+
+    test('batch 内先 splice、再写行依赖：direct 分支路径同样收敛', () => {
+        const [a, b, c] = [mkRow('a'), mkRow('b'), mkRow('c')]
+        const source = new RxList([a, b, c])
+        const mapped = source.map(row => row.label())
+        try {
+            batch(() => {
+                source.splice(0, 1)
+                c.label('C!')
+            })
+            expect(mapped.data).toEqual(source.data.map(row => row.label.raw))
+            expect(mapped.data).toEqual(['b', 'C!'])
+        } finally {
+            mapped.destroy()
+            source.destroy()
+        }
+    })
+
+    test('batch 内写行依赖后该行被删除：新值既不落错行也不复活', () => {
+        const [a, b, c] = [mkRow('a'), mkRow('b'), mkRow('c')]
+        const source = new RxList([a, b, c])
+        const mapped = source.map(row => row.label())
+        try {
+            batch(() => {
+                b.label('B!')
+                source.splice(1, 1)     // 删除被写的行
+            })
+            expect(mapped.data).toEqual(source.data.map(row => row.label.raw))
+            expect(mapped.data).toEqual(['a', 'c'])
+        } finally {
+            mapped.destroy()
+            source.destroy()
+        }
+    })
+})

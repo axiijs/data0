@@ -148,6 +148,36 @@ export function performRandomListOp(
     return `unshift(${v})`
 }
 
+// ---- 行形态维度(map 行的 mapFn 运行时行为;2026-H3 round4) ----
+// R4-1 教训:"传了 index 参数"≠"读了 index 值"。map 的行按 mapFn **执行期**是否
+// 读取响应式数据分成三种形态,走完全不同的实现路径:
+//   storesValue   —— 只存值/存 atom 引用:行级探测捕获零依赖,行不升级(纯数据路径);
+//   readsIndex    —— 执行期读 index():行升级为带 index atom 依赖的 rowComputed,
+//                    "结构搬移 × 行级重算"的触发序交错路径只在此形态可达;
+//   readsItemAtom —— 执行期读 item 内部 atom:行升级为带 item 依赖的 rowComputed,
+//                    hasPendingStructuralInfos 守卫的 frame 定位分支只在
+//                    此形态 × batch(行依赖先于结构 info 入队)可达。
+// 所有 map 形态类 fuzz/killer 从这里取 mapFn 与对照模型,禁止在单个文件里私藏形态。
+import type {Atom} from '../src/atom.js'
+import {atom as createAtom} from '../src/atom.js'
+
+/** readsIndex 形态:mapFn 执行期读 index()(行升级为带 index 依赖的 rowComputed) */
+export const indexReadingMapFn = (item: number, index: Atom<number>) => `${item}#${index()}`
+/** readsIndex 形态的全量对照模型 */
+export const indexReadingModel = (src: number[]) => src.map((x, i) => `${x}#${i}`)
+
+/** storesValue 形态:只存 atom 引用不读值(行不升级;既有 fuzz 的默认形态,显式命名) */
+export const valueStoringMapFn = (item: number, index: Atom<number>) => ({item, index})
+
+/** readsItemAtom 形态:行内含 atom 的元素工厂 + 执行期读 atom 的 mapFn */
+export type AtomRow = {id: number, label: Atom<string>}
+export function atomRowFactory(): (label: string) => AtomRow {
+    let id = 0
+    return (label: string) => ({id: id++, label: createAtom(label)})
+}
+export const itemAtomReadingMapFn = (row: AtomRow) => `${row.id}:${row.label()}`
+export const itemAtomReadingModel = (src: AtomRow[]) => src.map(row => `${row.id}:${row.label.raw}`)
+
 // ---- 触发精确度计数器(观察面:谁被重算了几次) ----
 // 2026-H3 round3 教训:全部差分 fuzz 只对比终值,"结果正确但多做了工作"类缺陷
 // (值未变的幽灵触发、无关源的误触发)对值 oracle 天然不可见。本计数器把

@@ -102,7 +102,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 |---|---|---|---|
 | `RxList.map` | 增量 | 增量 | 增量 |
 | `RxList.filter` | 增量 | 增量 | 重建(按 indicator 顺序) |
-| `RxList.toSorted` | 增量(等值 tie/含 undefined→重算) | 增量(等值 tie/含 undefined→重算) | 重算(tie 稳定序随源序) |
+| `RxList.toSorted` | 增量(等值 tie/含 undefined/批量超阈值→重算) | 增量(等值 tie/含 undefined→重算) | 重算(tie 稳定序随源序) |
 | `RxList.slice` | 增量(负边界→重算) | 增量 | 重算 |
 | `RxList.concat` | 增量(批量多条→重算) | 增量 | 重算 |
 | `RxList.groupBy` | 增量 | 增量 | 组内重排 |
@@ -114,7 +114,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 | `RxList.length`、`RxMap.keys/values/entries/size`、`RxSet.size` | 增量(`clear`/`replace` 部分重算) | 增量 | 无关 |
 | `RxSet.difference/intersection/symmetricDifference/union/toList` | add/delete/replace 均增量(`replace` 的 `newItems` 按 Set 语义去重) | — | — |
 
-**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度),越界 `set` 使源段长度跳变时单变更也回退(防跨段错位);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、或增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)时回退。回退是正确性措施,结果不变,只损失该次增量性。
+**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度),越界 `set` 使源段长度跳变时单变更也回退(防跨段错位);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)、或**单次批量变更超过阈值**(插入数+删除数 > 64 且「> 派生长度/4 或 > 4096」——排序列表的批量逐项增量是 O(k×m),超过实测交叉点后全量重算更快且下游代价相同)时回退。回退是正确性措施,结果不变,只损失该次增量性。`groupBy` 的批量 splice 走单遍分桶增量(每组至多一次删除 + 一次插入 splice,幸存组引用稳定),不回退。
 
 矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie,`__tests__/deepReview2026H2Findings.spec.ts` 覆盖 selection 家族的重复 item 域与 toSorted 的 undefined 元素值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
 

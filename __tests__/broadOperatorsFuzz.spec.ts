@@ -1,9 +1,19 @@
 import {describe, expect, test} from 'vitest'
 import {atom} from '../src/atom.js'
+import {batch} from '../src/notify.js'
 import {RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
-import {adversarialSpliceStart, mulberry32, uniqueInts} from './fuzzKit.js'
+import {
+    adversarialSpliceStart,
+    atomRowFactory,
+    indexReadingMapFn,
+    indexReadingModel,
+    itemAtomReadingMapFn,
+    itemAtomReadingModel,
+    mulberry32,
+    uniqueInts,
+} from './fuzzKit.js'
 import {expectGroupByEqualsModel} from './stateOracle.js'
 
 type Op =
@@ -110,12 +120,16 @@ describe('broad fuzz: unique values, all operators', () => {
 })
 
 describe('broad fuzz: map(item, index) atomIndexes consistency', () => {
+    // 行形态维度(fuzzKit):storesValue 与 readsIndex 两列并行差分。
+    // R4-1 教训:旧版只有 storesValue 列(存 atom 不读值),行从不升级为带 index
+    // 依赖的 rowComputed,reorder 的"结构搬移 × 行级重算"触发序路径从未被进入。
     for (const seed of [21, 22, 23]) {
         test(`seed=${seed}`, () => {
             const rand = mulberry32(seed)
             let counter = 0
             const source = new RxList<number>([counter++, counter++, counter++])
             const mapped = source.map((item, index) => ({item, index}))
+            const mappedReadsIndex = source.map(indexReadingMapFn)
             try {
                 for (let step = 0; step < 100; step++) {
                     const r = rand()
@@ -136,6 +150,52 @@ describe('broad fuzz: map(item, index) atomIndexes consistency', () => {
                     mapped.data.forEach((entry, i) => {
                         expect(entry.index.raw, `seed=${seed} step=${step} row=${i}`).toBe(i)
                     })
+                    expect(mappedReadsIndex.data, `readsIndex seed=${seed} step=${step}`)
+                        .toEqual(indexReadingModel(source.data))
+                }
+            } finally {
+                mapped.destroy(); mappedReadsIndex.destroy(); source.destroy()
+            }
+        })
+    }
+
+    // readsItemAtom 形态:行升级为带 item 依赖的 rowComputed;结构操作与
+    // 行内 atom 写混排(含 batch 内"先写行依赖再结构操作"的 frame 定位分支)。
+    for (const seed of [26, 27]) {
+        test(`readsItemAtom seed=${seed}`, () => {
+            const rand = mulberry32(seed)
+            const mkRow = atomRowFactory()
+            let n = 0
+            const source = new RxList([mkRow('a' + n++), mkRow('a' + n++), mkRow('a' + n++)])
+            const mapped = source.map(itemAtomReadingMapFn)
+            try {
+                for (let step = 0; step < 100; step++) {
+                    const r = rand()
+                    const len = source.data.length
+                    if (r < 0.25 && len > 0) {
+                        source.data[Math.floor(rand() * len)].label('w' + n++)
+                    } else if (r < 0.45) {
+                        const start = Math.floor(rand() * (len + 1))
+                        const dc = Math.floor(rand() * 2)
+                        source.splice(start, dc, mkRow('s' + n++))
+                    } else if (r < 0.6 && len >= 2) {
+                        source.swap(0, len - 1)
+                    } else if (r < 0.75 && len > 0) {
+                        source.set(Math.floor(rand() * len), mkRow('t' + n++))
+                    } else if (r < 0.9 && len > 0) {
+                        // batch 内先写行依赖、再结构操作:frame 定位分支的常驻覆盖
+                        batch(() => {
+                            source.data[Math.floor(rand() * source.data.length)].label('b' + n++)
+                            if (rand() < 0.5 && source.data.length > 1) {
+                                source.splice(Math.floor(rand() * source.data.length), 1)
+                            } else {
+                                source.splice(Math.floor(rand() * (source.data.length + 1)), 0, mkRow('b' + n++))
+                            }
+                        })
+                    } else {
+                        source.push(mkRow('p' + n++))
+                    }
+                    expect(mapped.data, `seed=${seed} step=${step}`).toEqual(itemAtomReadingModel(source.data))
                 }
             } finally {
                 mapped.destroy(); source.destroy()
