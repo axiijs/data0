@@ -56,7 +56,7 @@ const WEIRD = 'weirdNumbersFuzz.spec.ts'
 
 export const INVENTORY: Record<string, Row> = {
     // ---- RxList 派生 ----
-    'RxList.map':            row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.map':            row(`${BROAD}+deepReview2026H3Round4.spec.ts(读 index 行 × reorder 触发序)`, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
     'RxList.filter':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
     'RxList.toSorted':       row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
     'RxList.slice':          row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
@@ -67,8 +67,8 @@ export const INVENTORY: Record<string, Row> = {
     'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
-    'RxList.indexBy':        row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined 行跳过)', `${SWEEP}+collectionLedgerBurndown2.spec.ts(属性形式修复回归)`, 'collectionLedgerBurndown.spec.ts(删+插同 key)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN key)'),
-    'RxList.toMap':          row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined value 元组)', 'collectionLedgerBurndown2.spec.ts(OOB set 修复回归)', 'collectionLedgerBurndown.spec.ts(删+插同 key)', 'collectionLedgerBurndown.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN key 元组)'),
+    'RxList.indexBy':        row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined 行跳过)+deepReview2026H3Round4.spec.ts(插入/EKC 双侧 null 行守卫)', `${SWEEP}+collectionLedgerBurndown2.spec.ts(属性形式修复回归)`, 'collectionLedgerBurndown.spec.ts(删+插同 key)+deepReview2026H3Round4.spec.ts(batch 含 null 行)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN key)'),
+    'RxList.toMap':          row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined value 元组)+deepReview2026H3Round4.spec.ts(插入/EKC 双侧 undefined 行守卫)', 'collectionLedgerBurndown2.spec.ts(OOB set 修复回归)', 'collectionLedgerBurndown.spec.ts(删+插同 key)', 'collectionLedgerBurndown.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN key 元组)'),
     'RxList.reduce':         row('reduceOperator.spec.ts(示例级差分)', 'reduceOperator.spec.ts(示例级差分)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown.spec.ts(batch 尾追加/混合)+deepReview2026H3Round2.spec.ts(越界 clamp 尾插按操作时长度)', 'reduceOperator.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN/-0 透传)'),
     'RxList.reduceToAtom':   row('rxList.spec.ts(示例级)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', `${SWEEP}+${SPARSE_FUZZ}`, 'collectionLedgerBurndown2.spec.ts(batch 混合回退)', DESTROY, 'collectionLedgerBurndown2.spec.ts'),
     'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, 'NA:值无关(只依赖结构长度)'),

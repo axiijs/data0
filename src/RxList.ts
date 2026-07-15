@@ -433,13 +433,30 @@ export class RxList<T> extends Computed {
                 this.trigger(this, TriggerOpTypes.SET, { key: newIndex, newValue: originItems[i], oldValue: originItemsInNewIndexes[i]})
             }
             if (oldIndexAtoms) {
-                oldIndexAtoms[i]?.(newIndex)
                 this.atomIndexes![newIndex] = oldIndexAtoms[i]!
             }
         })
 
         this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
-        this.sendTriggerInfos()
+        // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见（与 doSplice 的
+        //  session 顺序一致）：index atom 的订阅者（map 的行级 Computed）在非 batch 下
+        //  会被原子写同步执行——此刻 reorder 的 METHOD info 尚未派发，行级 getter 的
+        //  hasPendingStructuralInfos 守卫看不到任何 pending 结构 info，于是按"终态位置"
+        //  直写派生列表；随后派生列表的 reorder patch 又按 order 搬移一次，行序被双重
+        //  搬移（silent 乱序，2026-H3 round4 动态复现）。这里先把 METHOD 入队、再在同一
+        //  session 内写 index atom：digest 时结构 patch 先应用、行级重算后运行（此时
+        //  终态位置已经就绪），与 batch 路径的可观察语义一致。
+        notifier.createEffectSession()
+        try {
+            this.sendTriggerInfos()
+            if (oldIndexAtoms) {
+                newIndexes.forEach((newIndex, i) => {
+                    oldIndexAtoms[i]?.(newIndex)
+                })
+            }
+        } finally {
+            notifier.digestEffectSession()
+        }
         if (__DEV__) assertAtomIndexesAligned(this)
     }
     reposition(start:number, newStart:number, limit:number = 1 ) {
@@ -1586,6 +1603,10 @@ export class RxList<T> extends Computed {
                         })
                         const newItemsInArgs = argv!.slice(2)
                         newItemsInArgs.forEach((item) => {
+                            // CAUTION 与全量 computation 的 null/undefined 行跳过语义对称：
+                            //  插入侧漏守卫时 push(null) 的属性读直接 TypeError 抛给
+                            //  变更调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
+                            if (item == null) return
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
 
                             assert(!this.data.has(indexKey), 'indexBy key is already exist')
@@ -1594,13 +1615,17 @@ export class RxList<T> extends Computed {
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
                         if (!isDenseIndexKey(key)) return
-                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
-                        if (oldValue !== undefined) {
+                        // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry;
+                        // null 旧行与全量语义一致地视为"无 entry")
+                        if (oldValue != null) {
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
                             this.delete(indexKey)
                         }
-                        const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as T)[inputIndexKey]
-                        this.set(newKey, newValue as T)
+                        // set(i, null/undefined)：全量语义跳过该行，无新 entry
+                        if (newValue != null) {
+                            const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as T)[inputIndexKey]
+                            this.set(newKey, newValue as T)
+                        }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
                 })
@@ -1641,9 +1666,13 @@ export class RxList<T> extends Computed {
                             if (entry === undefined) return
                             this.delete(entry[0])
                         })
-                        const newItemsInArgs = argv!.slice(2) as [any, any][]
-                        newItemsInArgs.forEach(([indexKey, value]) => {
-                            this.set(indexKey, value)
+                        const newItemsInArgs = argv!.slice(2) as ([any, any] | undefined)[]
+                        newItemsInArgs.forEach((entry) => {
+                            // CAUTION 与全量 computation 的 undefined 行跳过语义对称：
+                            //  插入侧直接解构时 push(undefined) 当场 TypeError 抛给变更
+                            //  调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
+                            if (entry === undefined) return
+                            this.set(entry[0], entry[1])
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
@@ -1652,8 +1681,11 @@ export class RxList<T> extends Computed {
                         if (oldValue !== undefined) {
                             this.delete((oldValue as [any, any])[0])
                         }
-                        const [newKey, newItem] = newValue as [any, any]
-                        this.set(newKey, newItem)
+                        // set(i, undefined)：全量语义跳过该行，无新 entry
+                        if (newValue !== undefined) {
+                            const [newKey, newItem] = newValue as [any, any]
+                            this.set(newKey, newItem)
+                        }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
                 })
