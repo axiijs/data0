@@ -1,5 +1,5 @@
 import { Atom, isAtom } from "./atom.js";
-import {DirtyCallback, Computed, GetterContext} from "./computed.js";
+import {copyTriggerInfoPayload, DirtyCallback, Computed, GetterContext} from "./computed.js";
 import { TriggerInfo } from "./notify.js";
 import { TrackOpTypes, TriggerOpTypes } from "./operations.js";
 import { RxList } from "./RxList.js";
@@ -79,20 +79,6 @@ export function oncePromise(fn:() => any, scheduleRerun: DirtyCallback|true = ne
             return result
         }, scheduleRerun)
     })
-}
-
-// 一层深的数组拷贝:外层数组换新,数组型元素也换新(元素内的对象引用保留——
-// 值级共享是正常语义)。undefined/非数组字段原样透传。
-function copyNestedArray(value: unknown): unknown {
-    if (!Array.isArray(value)) return value
-    return value.map(item => (Array.isArray(item) ? item.slice() : item))
-}
-
-function copyTriggerInfoPayload(info: TriggerInfo): TriggerInfo {
-    const copy: TriggerInfo = {...info}
-    if (Array.isArray(copy.argv)) copy.argv = copyNestedArray(copy.argv) as any[]
-    if (Array.isArray(copy.methodResult)) copy.methodResult = copyNestedArray(copy.methodResult)
-    return copy
 }
 
 /**
