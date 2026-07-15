@@ -14,7 +14,7 @@ import {RxList} from '../src/RxList.js'
  * source.data 全量重算。这正是 A1/A2 划出的"仍属缺陷"边界（batch 结束后必须
  * 与全量重算一致）。
  */
-import {adversarialSpliceStart, mulberry32} from './fuzzKit.js'
+import {adversarialSpliceDeleteCount, adversarialSpliceStart, mulberry32} from './fuzzKit.js'
 import {expectGroupByEqualsModel} from './stateOracle.js'
 
 describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', () => {
@@ -43,9 +43,9 @@ describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', 
                 const r = rand()
                 const dataLen = source.data.length
                 if (r < 0.3) {
-                    // 对抗参数域(负数/越界/小数/NaN)统一由 fuzzKit 提供
+                    // 对抗参数域(start 与 deleteCount 两轴)统一由 fuzzKit 提供
                     const start = adversarialSpliceStart(rand, dataLen)
-                    const deleteCount = Math.floor(rand() * 3)
+                    const deleteCount = adversarialSpliceDeleteCount(rand, dataLen)
                     const items = Array.from({length: Math.floor(rand() * 3)}, () => counter++)
                     history.push(`splice(${start},${deleteCount},[${items}])`)
                     source.splice(start, deleteCount, ...items)

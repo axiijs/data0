@@ -22,6 +22,7 @@ import {RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
 import {batch} from '../src/notify.js'
 import {TrackOpTypes, TriggerOpTypes} from '../src/operations.js'
+import {autorun} from '../src/common.js'
 import {attachRecomputeCounter} from './fuzzKit.js'
 
 const NON_INDEX_KEY = 2 ** 32 + 5   // 非下标正整数(属性赋值)
@@ -183,5 +184,82 @@ describe('R5-2 EKC key 数值上界:≥ 2^32-1 的正整数是属性赋值,不�
         list.set(NON_INDEX_KEY, 5)
         expect(seen).toEqual([NON_INDEX_KEY])
         probe.destroy(); list.destroy()
+    })
+})
+
+// ---- 未探测清单清偿(round5 补充横扫):自引用回调 × 值域/键域特征 ----
+
+describe('R5-3 自引用回调:谓词/mapFn 经 at(0) 读列表自身(收敛钉扎)', () => {
+    // 攻击轴:row indicator/rowComputed 经 at(0) 订阅列表自身——set(0)/splice/swap
+    // 同时走「行级重算」与「结构 patch」两路,是 R4-1 触发序窗口的跨行依赖变体
+    // ("大于首元素/阈值行"是现实需求)。探针未发现反例;此前没有任何测试构造过
+    // 自引用谓词,本组把收敛特征钉为常驻回归。
+    const ref = (src: number[]) => src.filter(x => x > src[0])
+
+    test('filter(x => x > at(0)) × set(0)/头部 splice/swap/batch 全收敛', () => {
+        const list = new RxList<number>([5, 1, 10, 3])
+        const filtered = list.filter(x => x > (list.at(0) ?? -Infinity))
+        expect([...filtered.data]).toEqual(ref(list.data))
+
+        list.set(0, 2)                    // 阈值降低:行级重算 × EKC 同 digest
+        expect([...filtered.data]).toEqual(ref(list.data))
+        list.set(0, 100)                  // 阈值抬高:全部行反选
+        expect([...filtered.data]).toEqual(ref(list.data))
+        list.splice(0, 1)                 // 删除阈值元素本身(结构 + 阈值同时变)
+        expect([...filtered.data]).toEqual(ref(list.data))
+        list.unshift(7)                   // 头插新阈值
+        expect([...filtered.data]).toEqual(ref(list.data))
+        list.swap(0, 2)                   // reorder 路径 × 行级依赖
+        expect([...filtered.data]).toEqual(ref(list.data))
+        batch(() => {                      // batch 多 info × 自引用
+            list.set(0, 2)
+            list.splice(1, 1)
+        })
+        expect([...filtered.data]).toEqual(ref(list.data))
+        filtered.destroy(); list.destroy()
+    })
+
+    test('map(x => x * at(0)) × set(0)/shift 全收敛(行级 rowComputed 读自身)', () => {
+        const list = new RxList<number>([2, 3, 4])
+        const scaled = list.map(x => x * (list.at(0) ?? 1))
+        const refMap = (src: number[]) => src.map(x => x * src[0])
+        expect([...scaled.data]).toEqual(refMap(list.data))
+        list.set(0, 10)
+        expect([...scaled.data]).toEqual(refMap(list.data))
+        list.splice(0, 1)
+        expect([...scaled.data]).toEqual(refMap(list.data))
+        scaled.destroy(); list.destroy()
+    })
+})
+
+describe('R5-4 值域/键域特征钉扎(补充横扫)', () => {
+    test('对象引用作 groupBy 组键:引用身份下增量 ≡ 全量', () => {
+        const catA = {name: 'a'}, catB = {name: 'b'}
+        const mk = (id: number, cat: object) => ({id, cat})
+        const list = new RxList([mk(1, catA), mk(2, catB), mk(3, catA)])
+        const groups = list.groupBy(i => i.cat)
+        const snap = () => [...groups.data.entries()].map(([k, g]) => [(k as any).name, g.data.map((i: any) => i.id)])
+        expect(snap()).toEqual([['a', [1, 3]], ['b', [2]]])
+        list.push(mk(4, catB))
+        list.splice(0, 1)
+        list.set(0, mk(5, catA))
+        const inc = snap()
+        groups.recompute(true)
+        expect(inc).toEqual(snap())
+        groups.destroy(); list.destroy()
+    })
+
+    test('set(-0) ≡ set(0):at(0) 订阅触发、数据写入、派生全链一致', () => {
+        const list = new RxList<number>([1, 2, 3])
+        const mapped = list.map(x => x * 10)
+        let seen: number | undefined
+        const stop = autorun(() => { seen = list.at(0) }, true)
+        list.set(-0 as any, 9)
+        expect(seen).toBe(9)
+        expect(list.data).toEqual([9, 2, 3])
+        const inc = [...mapped.data]
+        mapped.recompute(true)
+        expect(inc).toEqual([...mapped.data])
+        stop(); mapped.destroy(); list.destroy()
     })
 })

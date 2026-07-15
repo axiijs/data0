@@ -53,7 +53,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 ### 2. 传播模型(急切推,同步)
 
 - atom 写入后**同步**执行订阅者,顺序为订阅顺序;computed 默认立即重算(`immediate`),async getter 默认经 microtask 调度。
-- **对象 atom 的浅属性写入会触发**:`obj.x = 1` 经 proxy set 陷阱通知订阅者;`obj.raw.nested.n = 1` 或取出嵌套对象后再改**不会**触发,需 `obj({...})` 整替换(无深 Proxy)。
+- **对象 atom 的浅属性写入会触发**:`obj.x = 1` 经 proxy set 陷阱通知订阅者;`obj.raw.nested.n = 1` 或取出嵌套对象后再改**不会**触发,需 `obj({...})` 整替换(无深 Proxy)。属性**读**转发仅覆盖 get:`in`/`Object.keys`/spread 不转发到值对象;值属性名与元 API 同名(`raw`/`call`)时读取被元 API 遮蔽(写入仍落值对象)。需要自省/同名属性请读 `.raw` 后操作原对象。
 - **atom 的对象特性由创建时初始值的形态决定,不随后续写入迁移**:以原始值/`null`/`undefined` 起手的 atom 是无 Proxy 的轻量形态,之后写入对象(`a(user)`)后整值读写与依赖追踪一切正常,但**属性级读写不可用**——`a.x` 读不到值对象的属性、`a.x = 1` 既不写入值对象也不触发(落在 atom 函数对象自身上)。需要属性级用法时以对象初值创建 atom;以 `null` 起手的"暂无数据"atom 请坚持整值替换。class 实例 atom 的属性**写**会写穿实例并触发,属性**读**不转发(属性读仅对 plain object 承诺)。特征测试见 `__tests__/deepReview2026H3Round3.spec.ts`。
 - **菱形依赖存在 glitch**(AGENTS.md A1):`a→c` 且 `a→b→c` 时,`c` 可能先以"新 a + 旧 b"重算一次,下游可观察到中间值并产生重复重算;**终值保证收敛正确**。对中间态敏感的副作用应自行防抖或读 `.raw` 终值。
 - **同步重算环会抛错**:在同步 computed 重算过程中又触发它自身的依赖变更,会抛出 `detect recompute triggerred in sync recompute`,请将变更移到调度回调中。
