@@ -92,6 +92,18 @@ function assertAtomIndexesAligned(list: RxList<any>) {
     }
 }
 
+/**
+ * EKC(set)的 key 是否是稠密下标。负/小数/非数字 key 的 set 契约上等同数组
+ * 属性赋值:不触及任何行元素,全量 computation(只遍历 [0, length))也看不见它。
+ * 派生结构的 patch 端凡按 key 物化行/成员的,都必须先过本谓词——否则幽灵 EKC
+ * 会把"属性赋值"物化成真实行(filter 插幽灵行、groupBy/indexBy/toMap/toSet 加
+ * 幽灵成员;2026-H3 round3 形态操作 fuzz 命中)。协议侧 key 仍原样透传
+ * (README「RxList 参数契约」),内部消费者独立归一化——与 splice argv 同规则。
+ */
+function isDenseIndexKey(key: unknown): key is number {
+    return typeof key === 'number' && Number.isInteger(key) && key >= 0
+}
+
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
 export type ReorderPatchInfo = {
@@ -592,7 +604,7 @@ export class RxList<T> extends Computed {
                 //  变更涉及 undefined 时一律回退全量重算（结果与 Array#sort 语义一致，
                 //  只损失该次增量性；同 tie 回退的处置）。
                 for (const info of triggerInfos) {
-                    const { method, argv, oldValue, newValue, methodResult } = info
+                    const { method, argv, key, type, oldValue, newValue, methodResult } = info
                     // method could be 'splice' (array insertion/removal) or an explicit key change
                     if (method === 'splice') {
                         const deletedItems = (methodResult as T[]) || []
@@ -607,7 +619,15 @@ export class RxList<T> extends Computed {
                         for (const item of newItems) {
                             if (!insertOrBail(item)) return false
                         }
+                    } else if (type !== TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        // reorder（method='reorder'）等非 EKC：成员不变但源序变——tie 组的
+                        // 稳定序依赖源序，必须回退全量重算。旧实现靠 else 分支的
+                        // oldValue===undefined 检查偶然兜住，这里显式化（不得被下方的
+                        // 非稠密 key 守卫吞掉——reorder 的 key 是 ITERATE_KEY Symbol）。
+                        return false
                     } else {
+                        // 非稠密 key 的 set 是数组属性赋值,不触及任何元素:忽略 ≡ 全量重算
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change: remove old, insert new
                         // 值为 undefined（含越界 set 的"无旧值"）→ 回退全量重算
                         if (oldValue === undefined || newValue === undefined) return false
@@ -922,6 +942,10 @@ export class RxList<T> extends Computed {
                         this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
                     } else {
                         // explicit key change
+                        // CAUTION 非稠密 key（负/小数）的 set 是数组属性赋值,不触及任何
+                        //  行元素——按 key 物化会造出幽灵行（本列表写属性、filter 经
+                        //  pending 插真实行）,忽略 ≡ 全量重算（2026-H3 round3 形态 fuzz 命中）。
+                        if (!isDenseIndexKey(key)) continue
                         // CAUTION 新行的 item 必须取 info.newValue（操作时的值），不能读
                         //  source.data[key]：key 是"操作时"的位置，而 source.data 是重放时
                         //  的终态——同一次 digest 里 set 之后还有结构操作（batch 中
@@ -1209,6 +1233,10 @@ export class RxList<T> extends Computed {
                                 startFindingIndex = startIndex
                             }
 
+                        } else if (!isDenseIndexKey(key)) {
+                            // 非稠密 key 的 set 是数组属性赋值,不触及任何元素:忽略。
+                            // 不跳过的话,负 key 与现有 match 的比较/matchOne(dataArr[-1])
+                            // 会把属性值当元素,可能把真实 match 覆写成 -1(幽灵 EKC 等价类)。
                         } else {
                             // explicit key change
                             if (this.data.raw === key) {
@@ -1290,6 +1318,15 @@ export class RxList<T> extends Computed {
             return -1
         }
 
+        // CAUTION mapList 全量重算(初次构建之外:patch 抛错后的错误恢复、行升级为
+        //  响应式后的多 info 回退)必须整体重建 filtered:
+        //  1. 抛错的 patch 轮可能留下未 flush 的 pending——新行的首跑上报会被引流进
+        //     这个死 pending(afterPatch 不会再来),filtered 永久缺行;
+        //  2. 全量重算的行 getter 首跑走"push 追加"路径,不清空旧内容会双倍计数。
+        //  错误恢复语义(README §5/方法 12 缺陷类 4)要求恢复后 ≡ 终态全量重算,
+        //  这里在 fullRecompute 见证事件里复位增量状态并清空 filtered,
+        //  行 getter 首跑按源序重新填充——与初次构建同一路径。
+        //  (2026-H3 round3 形态操作 fuzz 的错误注入探针动态命中。)
         mapList = this.map((item) => {
             return computed(({lastValue} ) => {
                 const matched = filterFn(item)
@@ -1371,6 +1408,12 @@ export class RxList<T> extends Computed {
                     rebuildAfterPatch = false
                 }
             }
+        })
+        mapList.on('fullRecompute', () => {
+            // 只在重建(非首次构建)时需要:首次构建 filtered 本来就是空的,复位幂等
+            pending = null
+            rebuildAfterPatch = false
+            if (filtered.data.length) filtered.splice(0, Infinity)
         })
         initialBuildDone = true
 
@@ -1483,11 +1526,21 @@ export class RxList<T> extends Computed {
                     } else if (method === 'reorder') {
                         // membership 不变，只按该 info 操作时的 source 顺序重排现有 group，
                         // 保持 group RxList 引用稳定。
+                        // CAUTION 全下标扫描而不是 Array#filter：全量 computation 按
+                        //  [0, length) 读取（洞位读出 undefined 参与分组），filter 会跳洞
+                        //  ——稀疏源上 reorder 会把"undefined 组"清空而键残留，与全量
+                        //  重算分叉（洞的物化语义必须两侧一致，同 map/indexBy 先例）。
                         this.data.forEach((group, groupKey) => {
-                            const nextItems = stateNow.filter(item => sameKey(getKey(item), groupKey))
+                            const nextItems: T[] = []
+                            for (let i = 0; i < stateNow.length; i++) {
+                                if (sameKey(getKey(stateNow[i]), groupKey)) nextItems.push(stateNow[i])
+                            }
                             group.spliceArray(0, group.data.length, nextItems)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        // 非稠密 key 的 set 是数组属性赋值,不触及任何元素:忽略 ≡ 全量重算
+                        // (幽灵 EKC 会把属性赋值物化成幽灵组成员,2026-H3 round3 形态 fuzz 等价类)
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change：set 不触及 [0, key) 前缀
                         removeAtSourcePosition(oldValue as T, key as number)
                         insertInSourceOrder(newValue as T, key as number)
@@ -1539,6 +1592,8 @@ export class RxList<T> extends Computed {
                             this.set(indexKey, item)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
+                        if (!isDenseIndexKey(key)) return
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
                         if (oldValue !== undefined) {
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(oldValue as T) : (oldValue as T)[inputIndexKey]
@@ -1591,6 +1646,8 @@ export class RxList<T> extends Computed {
                             this.set(indexKey, value)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
+                        if (!isDenseIndexKey(key)) return
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
                         if (oldValue !== undefined) {
                             this.delete((oldValue as [any, any])[0])
@@ -1626,6 +1683,8 @@ export class RxList<T> extends Computed {
                             this.add(item)
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
+                        // 非稠密 key:数组属性赋值,无成员变化(幽灵 EKC 等价类,忽略 ≡ 全量)
+                        if (!isDenseIndexKey(triggerInfo.key)) return
                         // explicit key change
                         if (!base.data.includes(oldValue as T)) this.delete(oldValue as T)
                         this.add(newValue as T)
@@ -1742,6 +1801,17 @@ export class RxList<T> extends Computed {
                     } else if (method === 'reorder') {
                         return false
                     } else if (typeof key === 'number' && Number.isInteger(key) && key >= 0) {
+                        // CAUTION 段长守卫：越界 set（契约内透传）会让源段长度跳变
+                        //  （len 3 → set(10) → len 11），EKC 的 key 落在旧段之外时按
+                        //  段内偏移直写会覆盖到后续源的段（B 段元素整体错位，结构性
+                        //  错乱而不只是洞物化差异）。回退全量重算与终态源对齐。
+                        //  旧段长 = 本列表长 − 其他源现长（单 info 守卫已保证其他源
+                        //  在本次 digest 未变）。
+                        let othersLength = 0
+                        for (let i = 0; i < sources.length; i++) {
+                            if (i !== sourceIndex) othersLength += sources[i].data.length
+                        }
+                        if (key >= this.data.length - othersLength) return false
                         this.set(offset + key, newValue as T)
                     } else {
                         return false
@@ -1863,6 +1933,10 @@ export class RxList<T> extends Computed {
 
                         lastIndexes = idxs
                     } else {
+                        // 非稠密 key(负/小数)是数组属性赋值:不触及区间内任何元素。
+                        // 小数 key 恰落在区间内时,不跳过会经 splice 归一化替换掉真实行
+                        // (幽灵替换,2026-H3 round3 形态 fuzz 等价类)。
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change or "set"
                         // remove oldValue if it was in our slice
                         const index = key as number
@@ -1884,6 +1958,7 @@ type SelectionInner = {
     updateIndicatorsFromCurrentValueChange:any,
     stopAutoResetValue:any,
     deleteIndicator:any,
+    resetIndicators:any,
     currentValues:any
 }
 export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<T|number>|Atom<T|null|number>, autoResetValue = false): SelectionInner {
@@ -2028,6 +2103,16 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
 
     stopAutoResetValue?.run()
 
+    // CAUTION 全量重建时必须清空记账(2026-H3 round3 GC 审计命中的记账无界类,
+    //  同 depsMap host 摘除/pruneIndexKeyDeps 的规则:谁建条目谁给回收路径):
+    //  computation 每次全量重算为每行 createNewIndicator,旧行的条目无人回收——
+    //  force recompute/错误恢复路径下 Map 值升级 Set 后无界累积,且 currentValues
+    //  每次变化都遍历写全部死 indicator(写放大)。行级增删的精确回收仍走
+    //  deleteIndicator;这里只服务"全部行重建"的语义。
+    function resetIndicators() {
+        itemToIndicators.clear()
+    }
+
     return {
         trackIndicators,
         trackCurrentValues,
@@ -2035,6 +2120,7 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         updateIndicatorsFromCurrentValueChange,
         stopAutoResetValue,
         deleteIndicator,
+        resetIndicators,
         currentValues
     }
 }
@@ -2066,6 +2152,9 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
+            // 非稠密 key:数组属性赋值,无行变化。物化会向行列表写属性并泄漏
+            // itemToIndicators 记账条目(幽灵 EKC 等价类,忽略 ≡ 全量重算)。
+            if (!isDenseIndexKey(key)) return
             const oldRow = list.set(key as number, [newValue as T, ...inners.map(inner => inner.createNewIndicator(newValue as T))] as [T, Atom<boolean>])
             // 被替换行的记账同步移除（旧实现从不清理：条目泄漏，重复 item 下
             //  还会让 currentValues 变化继续驱动已离场行的 indicator）
@@ -2079,6 +2168,8 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
     return new RxList(
         function computation(this:Computed ) {
             inners.forEach(inner => {
+                // 全量重建 = 所有旧行废弃:先清 indicator 记账再逐行重建(见 resetIndicators)
+                inner.resetIndicators()
                 inner.trackIndicators(this)
                 inner.trackCurrentValues(this)
             })
@@ -2165,14 +2256,20 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             // 指示器（选中集是稀疏的，两向 toggle 的旧算法在"选中 index 落在删除
             // 区间/多选相邻"等组合下会关错行）。等长替换时后续行不动，新行已按
             // index 初始化，无需修正。
+            // CAUTION 洞位行安全（?.）：越界 set（契约内透传）会让行数组出洞，校正
+            //  循环撞洞位直接 TypeError 且抛给 list.splice 调用方，违反"OOB set ×
+            //  派生算子不崩溃且可恢复"等价类（sparseSetOperatorsSweep 只测了纯尾插,
+            //  尾插不进本循环）。洞位行无 indicator 可校正，跳过与 map/filter 的
+            //  行级 ?. 守卫一致。
             if (deleteCount !== insertCount) {
                 const selectedIndexes = getSelectedIndexes()
                 for (let i = startIndex + insertCount; i < list.data.length; i++) {
-                    list.data[i][1](selectedIndexes.has(i))
+                    list.data[i]?.[1](selectedIndexes.has(i))
                 }
             }
         } else if (triggerInfo.method === 'reorder') {
             // 行随源重排，但选中的 index 不动：重排后受影响区间逐行按新 index 校正
+            // （洞位行 ?. 跳过，同上 splice 校正循环的说明）
             const reorderInfo = triggerInfo.reorderInfo as ReorderPatchInfo | undefined
             list.reorder(triggerInfo.argv![0] as Order[], reorderInfo)
             const selectedIndexes = getSelectedIndexes()
@@ -2180,11 +2277,13 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             const start = affected ? Math.max(affected[0], 0) : 0
             const end = affected ? Math.min(affected[1] + 1, list.data.length) : list.data.length
             for (let i = start; i < end; i++) {
-                list.data[i][1](selectedIndexes.has(i))
+                list.data[i]?.[1](selectedIndexes.has(i))
             }
         } else {
             // explicit key change（set）：index 不变，行内容替换，选中状态由 index 决定
             const { newValue, key } = triggerInfo
+            // 非稠密 key:数组属性赋值,无行变化(幽灵 EKC 等价类,忽略 ≡ 全量重算)
+            if (!isDenseIndexKey(key)) return
             list.set(key as number, [newValue as T, createNewIndicator(key as number)])
         }
     }

@@ -524,32 +524,19 @@ export class Notifier {
     const scopes = ReactiveEffect.activeScopes
     const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
 
-    // CompactDep 单订阅者快路径：零迭代器、零数组
-    if (dep instanceof CompactDep) {
-      const single = dep.single
-      if (single !== undefined) {
-        // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
-        //  重算过程中可能会再次出发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
-        if (single !== activeEffect) {
-          this.triggerEffect(single, source, type, inputInfo, debuggerEventExtraInfo)
-        }
-        return
-      }
-      if (dep.overflow === undefined) return
-      const effects = [...dep.overflow]
-      for (const effect of effects) {
-        if (effect !== activeEffect) {
-          this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
-        }
-      }
-      return
-    }
-
+    // CAUTION 这里不再为 CompactDep 设快路径（2026-H3 round3 mutation 审计确认为
+    //  不可达死分支）：CompactDep 只存在于 primitive atom 的函数对象上（不进
+    //  targetMap），其派发一律走 triggerPrimitiveAtomValue 的特化路径；本方法只
+    //  接到 track() 创建的 Set 型 dep。即使未来有 CompactDep 流入，下方 spread
+    //  快照对任何可迭代 dep 都正确（CompactDep 实现了 Symbol.iterator），只是
+    //  少一个单订阅者微优化。
     // CAUTION 快照稳定化：effect 执行过程中可能向 dep 增删订阅，
     //  不能直接在 live Set 上迭代（新增的订阅会被本轮误触发）。
-    const effects = [...(dep as unknown as Set<ReactiveEffect>)]
+    const effects = [...(dep as unknown as Iterable<ReactiveEffect>)]
     for (const effect of effects) {
       if (effect !== activeEffect) {
+        // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
+        //  重算过程中可能会再次触发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
         this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
       }
     }

@@ -19,7 +19,7 @@ if (typeof global.gc !== "function") {
 
 const distPath = process.argv[2] || "./dist/data0.js";
 const data0 = await import(pathToFileURL(path.resolve(distPath)).href);
-const { atom, computed, destroyComputed, RxList, RxMap, autorun, Notifier } = data0;
+const { atom, computed, destroyComputed, RxList, RxMap, RxSet, createSelection, autorun, Notifier } = data0;
 
 async function gcSettle() {
   for (let i = 0; i < 5; i++) {
@@ -122,6 +122,36 @@ function depsMapSize(target) {
   const size = depsMapSize(map);
   report("ledger bounded: RxMap.get() churn ×10000", size <= 8, `depsMap entries=${size}`);
   map.destroy();
+}
+
+// ---- 4. selection 的 itemToIndicators 记账有界（全量重算 churn）----
+// 缺陷类（2026-H3 round3 命中）：createSelectionInner 的 computation 每次全量
+// 重算为每行 createNewIndicator，旧行的 indicator 条目无人回收——force
+// recompute/错误恢复路径下 Map 值升级成 Set 后无界累积，且 currentValues 每次
+// 变化都要遍历写全部死 indicator（写放大）。断言：全量重算 ×N 后，旧 indicator
+// 必须可回收（记账在 computation 重建时清空）。
+function allocSelectionIndicator(selection) {
+  // 旧行元组里的 indicator（独立栈帧取引用，防栈扫描 pin 假阳性）
+  return new WeakRef(selection.data[0][1]);
+}
+{
+  const src = new RxList([1, 2, 3]);
+  const currentValues = new RxSet([1]);
+  const selection = createSelection(src, currentValues);
+  const oldIndicatorRef = allocSelectionIndicator(selection);
+  for (let i = 0; i < 50; i++) selection.recompute(true);
+  await gcSettle();
+  report(
+    "ledger bounded: selection itemToIndicators (force-recompute ×50, stale indicator collectable)",
+    oldIndicatorRef.deref() === undefined
+  );
+  // 行为面:重建后的记账仍正确驱动当前行
+  currentValues.add(2);
+  const row2 = selection.data.find((r) => r[0] === 2);
+  report("selection indicators still driven after rebuild churn", row2 && row2[1].raw === true);
+  selection.destroy();
+  src.destroy();
+  currentValues.destroy();
 }
 
 console.log(failures ? `\n${failures} failure(s)` : "\nall checks passed");

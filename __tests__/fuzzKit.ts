@@ -60,3 +60,118 @@ export function adversarialSpliceStart(rand: Rand, len: number): number {
     if (r < 0.35) return NaN
     return Math.floor(rand() * (len + 1))
 }
+
+// ---- 对抗参数域(set key 维度):越界(产生稀疏洞)/负/小数 ----
+// 2026-H3 round3 教训:稀疏(OOB set)此前以"一次性 sweep"进入体系而不是生成器,
+// 该维度因此从不与操作序列组合——"先 OOB set、再不等长 splice"这种两步组合
+// 任何随机搜索都生成不出来,createIndexKeySelection 的校正循环崩溃因此存活。
+// 规则:契约外形态操作也必须以生成器进入组合空间(oracle 由调用方按二级契约降级,
+// 见 sparseOpsFuzz 的"不崩溃 + 强制全量重算后收敛"两级断言)。
+export function adversarialSetIndex(rand: Rand, len: number): number {
+    const r = rand()
+    if (r < 0.5) return len + 1 + Math.floor(rand() * 3)   // 越界:产生洞
+    if (r < 0.6) return -1 - Math.floor(rand() * 2)          // 负:数组属性赋值
+    if (r < 0.7) return Math.floor(rand() * len) + 0.5       // 小数:属性赋值
+    return Math.floor(rand() * Math.max(len, 1))             // 区间内
+}
+
+// ---- 共享操作序列生成器(形态操作域) ----
+// 对一个 RxList 源执行一步随机操作(含契约内结构操作与契约外 OOB/负/小数 set),
+// 返回操作描述(用于失败信息回放)。所有形态类 fuzz 从这里取操作,
+// 保证"新形态操作加一次、全 fuzz 生效"。
+import type {RxList} from '../src/RxList.js'
+
+export function performRandomListOp(
+    rand: Rand,
+    list: RxList<number>,
+    nextValue: () => number,
+): string {
+    const len = list.data.length
+    const r = rand()
+    if (r < 0.22) {
+        const start = adversarialSpliceStart(rand, len)
+        const deleteCount = Math.floor(rand() * 3)
+        const items = Array.from({length: Math.floor(rand() * 3)}, () => nextValue())
+        list.splice(start, deleteCount, ...items)
+        return `splice(${start},${deleteCount},[${items}])`
+    }
+    if (r < 0.34) {
+        const v = nextValue()
+        list.push(v)
+        return `push(${v})`
+    }
+    if (r < 0.40 && len > 0) {
+        list.pop()
+        return `pop()`
+    }
+    if (r < 0.48 && len > 0) {
+        list.shift()
+        return `shift()`
+    }
+    if (r < 0.60 && len > 0) {
+        const index = Math.floor(rand() * len)
+        const v = nextValue()
+        list.set(index, v)
+        return `set(${index},${v})`
+    }
+    if (r < 0.75) {
+        // 形态迁移操作:越界/负/小数 set(契约外,透传;可能产生稀疏洞)
+        const index = adversarialSetIndex(rand, len)
+        const v = nextValue()
+        list.set(index, v)
+        return `set*(${index},${v})`
+    }
+    if (r < 0.83 && len >= 2) {
+        const i = Math.floor(rand() * len)
+        let j = Math.floor(rand() * len)
+        if (j === i) j = (j + 1) % len
+        list.swap(Math.min(i, j), Math.max(i, j))
+        return `swap(${Math.min(i, j)},${Math.max(i, j)})`
+    }
+    if (r < 0.90 && len >= 2) {
+        const start = Math.floor(rand() * len)
+        const newStart = Math.floor(rand() * len)
+        if (start !== newStart) {
+            list.reposition(start, newStart)
+            return `reposition(${start},${newStart})`
+        }
+        list.push(nextValue())
+        return `push(fallback)`
+    }
+    if (r < 0.95 && len >= 2) {
+        // 洞位安全的比较器:sortSelf 会把洞读成 undefined 传给 compare
+        list.sortSelf((a, b) => ((a ?? -Infinity) as number) - ((b ?? -Infinity) as number))
+        return `sortSelf()`
+    }
+    const v = nextValue()
+    list.unshift(v)
+    return `unshift(${v})`
+}
+
+// ---- 触发精确度计数器(观察面:谁被重算了几次) ----
+// 2026-H3 round3 教训:全部差分 fuzz 只对比终值,"结果正确但多做了工作"类缺陷
+// (值未变的幽灵触发、无关源的误触发)对值 oracle 天然不可见。本计数器把
+// 「每次 digest 每个派生至多 1 轮 patch + 至多 1 轮全量回退」与「无关源零触发」
+// 变成可断言列;形态/差分 fuzz 按需挂载。
+export type RecomputeCounter = {
+    rounds: () => number
+    fulls: () => number
+    reset: () => void
+    detach: () => void
+}
+
+// host 是任何 ReactiveEffect 派生(RxList/RxMap/RxSet 实例,或 computed 的 internal)
+export function attachRecomputeCounter(host: {on: Function, off: Function}): RecomputeCounter {
+    let rounds = 0
+    let fulls = 0
+    const onRecompute = () => { rounds++ }
+    const onFull = () => { fulls++ }
+    host.on('recompute', onRecompute)
+    host.on('fullRecompute', onFull)
+    return {
+        rounds: () => rounds,
+        fulls: () => fulls,
+        reset: () => { rounds = 0; fulls = 0 },
+        detach: () => { host.off('recompute', onRecompute); host.off('fullRecompute', onFull) },
+    }
+}

@@ -203,6 +203,29 @@ describe('atom basic', () => {
         stop()
     })
 
+    test('proxy atom keeps call and primitive conversion behavior (mutation no-cov killers)', () => {
+        // 2026-H3 round3 mutation 首审:proxy 形态的 call 转发与 Symbol.toPrimitive
+        // 此前只对 primitive 形态测过(no-cov 盲区)。对象值走 proxy 形态。
+        const objValue = atom<any>({n: 1})
+        expect(objValue.call(null)).toEqual({n: 1})
+        objValue.call(null, {n: 2})
+        expect(objValue.raw).toEqual({n: 2})
+        // 特征:对象值 proxy atom 的字符串转换走 get 陷阱转发到 value(无自有
+        // Symbol.toPrimitive)→ OrdinaryToPrimitive → value 原型 toString,
+        // receiver 是包着函数的 proxy → '[object Function]'。钉现状。
+        expect(`${objValue}`).toBe('[object Function]')
+
+        // interceptor 强制 proxy 形态承载数值:toPrimitive 的 number/default 分支
+        const numValue = atom(3, (updater, handler) => [updater, handler])
+        expect(+numValue).toBe(3)
+        expect(`${numValue}`).toBe('3')
+        expect((numValue as any) + 1).toBe(4)
+
+        // 具名 atom:setDebugName 路径
+        const named = atom({x: 1}, undefined, 'named-atom')
+        expect(named.x).toBe(1)
+    })
+
     test('atom with interceptor keeps proxy path', () => {
         const value = atom(1, (updater, handler) => {
             return [updater, {

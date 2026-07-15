@@ -61,9 +61,16 @@ export class RxMap<K, V> extends Computed{
 
         entries.forEach(([key, value]) => {
             const hasValue = this.data.has(key)
+            const oldValue = hasValue ? this.data.get(key) : undefined
             this.data.set(key, value)
             if (hasValue) {
-                this.trigger(this, TriggerOpTypes.SET, { key, newValue: value})
+                // CAUTION 与 set() 的判等门一致（Object.is，见 set 的说明）：replace
+                //  是"set 的批量形态"，值未变的 key 不触发 SET——否则 get(key) 的
+                //  订阅者在整表 replace 时被全量幽灵触发。SET info 同样带 oldValue,
+                //  与 set() 的协议形状一致。
+                if (!Object.is(value, oldValue)) {
+                    this.trigger(this, TriggerOpTypes.SET, { key, newValue: value, oldValue})
+                }
             } else {
                 this.trigger(this, TriggerOpTypes.ADD, { key, newValue: value})
             }

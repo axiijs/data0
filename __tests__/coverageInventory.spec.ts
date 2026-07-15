@@ -48,6 +48,7 @@ const BROAD = 'broadOperatorsFuzz.spec.ts'
 const DUP = 'duplicateValuesFuzz.spec.ts'
 const H2 = 'deepReview2026H2Findings.spec.ts'
 const SWEEP = 'sparseSetOperatorsSweep.spec.ts'
+const SPARSE_FUZZ = 'sparseOpsFuzz.spec.ts' // 形态操作组合 fuzz(sweep 的生成器化升级,2026-H3 round3)
 const BATCH = 'batchReplayFuzz.spec.ts'
 const DESTROY = 'destroySemantics.spec.ts'
 const MODEL = 'modelComparisonFuzz.spec.ts'
@@ -55,25 +56,25 @@ const WEIRD = 'weirdNumbersFuzz.spec.ts'
 
 export const INVENTORY: Record<string, Row> = {
     // ---- RxList 派生 ----
-    'RxList.map':            row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
-    'RxList.filter':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
-    'RxList.toSorted':       row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
-    'RxList.slice':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
-    'RxList.concat':         row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
-    'RxList.groupBy':        row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
-    'RxList.toSet':          row(BROAD, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
-    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, SWEEP, BATCH, DESTROY, WEIRD),
+    'RxList.map':            row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.filter':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.toSorted':       row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
+    'RxList.slice':          row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
+    'RxList.concat':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}(段长跳变回退回归另见 deepReview2026H3Round3.spec.ts)`, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
+    'RxList.groupBy':        row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.toSet':          row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
     'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
     'RxList.indexBy':        row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined 行跳过)', `${SWEEP}+collectionLedgerBurndown2.spec.ts(属性形式修复回归)`, 'collectionLedgerBurndown.spec.ts(删+插同 key)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN key)'),
     'RxList.toMap':          row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined value 元组)', 'collectionLedgerBurndown2.spec.ts(OOB set 修复回归)', 'collectionLedgerBurndown.spec.ts(删+插同 key)', 'collectionLedgerBurndown.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN key 元组)'),
     'RxList.reduce':         row('reduceOperator.spec.ts(示例级差分)', 'reduceOperator.spec.ts(示例级差分)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown.spec.ts(batch 尾追加/混合)+deepReview2026H3Round2.spec.ts(越界 clamp 尾插按操作时长度)', 'reduceOperator.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN/-0 透传)'),
-    'RxList.reduceToAtom':   row('rxList.spec.ts(示例级)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', SWEEP, 'collectionLedgerBurndown2.spec.ts(batch 混合回退)', DESTROY, 'collectionLedgerBurndown2.spec.ts'),
-    'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', SWEEP, BATCH, DESTROY, 'NA:值无关(只依赖结构长度)'),
-    'RxList.createSelection':         row('createSelection.spec.ts(示例级)', H2, 'collectionLedgerBurndown.spec.ts(undefined item)', SWEEP, MODEL, DESTROY, 'collectionLedgerBurndown.spec.ts(NaN item 含孪生行)'),
+    'RxList.reduceToAtom':   row('rxList.spec.ts(示例级)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', `${SWEEP}+${SPARSE_FUZZ}`, 'collectionLedgerBurndown2.spec.ts(batch 混合回退)', DESTROY, 'collectionLedgerBurndown2.spec.ts'),
+    'RxList.length':         row(BROAD, 'NA:值无关(只依赖结构长度)', 'NA:值无关(只依赖结构长度)', `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, 'NA:值无关(只依赖结构长度)'),
+    'RxList.createSelection':         row('createSelection.spec.ts(示例级)', H2, 'collectionLedgerBurndown.spec.ts(undefined item)', `${SWEEP}+${SPARSE_FUZZ}`, MODEL, DESTROY, 'collectionLedgerBurndown.spec.ts(NaN item 含孪生行)'),
     'RxList.createSelections':        row('createSelection.spec.ts(示例级)', H2, 'collectionLedgerBurndown2.spec.ts(undefined item)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown.spec.ts(batch splice+选中集)', 'collectionLedgerBurndown.spec.ts(含 autoReset 清理)', 'collectionLedgerBurndown2.spec.ts(NaN 孪生行)'),
-    'RxList.createIndexKeySelection': row('createSelection.spec.ts(示例级)', 'NA:按 index 键(与元素值无关)', 'collectionLedgerBurndown.spec.ts(undefined 行内容)', SWEEP, 'collectionLedgerBurndown.spec.ts(batch 不等长 splice)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN/-0 行内容)'),
+    'RxList.createIndexKeySelection': row('createSelection.spec.ts(示例级)', 'NA:按 index 键(与元素值无关)', 'collectionLedgerBurndown.spec.ts(undefined 行内容)', `${SWEEP}+${SPARSE_FUZZ}(校正循环洞位回归另见 deepReview2026H3Round3.spec.ts)`, 'collectionLedgerBurndown.spec.ts(batch 不等长 splice)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN/-0 行内容)'),
 
     // ---- RxMap 派生 ----
     'RxMap.keys':    row(BROAD, 'NA:Map key 构造性唯一', 'collectionLedgerBurndown.spec.ts(undefined value)', 'NA:非数组结构', MODEL, DESTROY, 'reproducedIssuesFixes.spec.ts(F10 delete(NaN),示例级)'),
@@ -94,22 +95,10 @@ export const INVENTORY: Record<string, Row> = {
     'RxSet.isDisjointFrom':      row('rxSet.spec.ts(示例级)', 'NA:Set 成员构造性唯一', 'collectionLedgerBurndown2.spec.ts', 'NA:非数组结构', 'collectionLedgerBurndown2.spec.ts(batch 谓词)', DESTROY, 'collectionLedgerBurndown2.spec.ts'),
 }
 
-// 原型上的非派生成员分类(新增公开方法必须归入某一类,否则测试失败)
-const READS: Record<string, string[]> = {
-    RxList: ['at', 'forEach', 'toArray'],
-    RxMap: ['get', 'forEach'],
-    RxSet: ['forEach', 'toArray'],
-}
-const MUTATIONS: Record<string, string[]> = {
-    RxList: ['push', 'pop', 'shift', 'unshift', 'splice', 'spliceArray', 'set', 'clear', 'reorder', 'reposition', 'swap', 'sortSelf', 'replaceData'],
-    RxMap: ['set', 'delete', 'clear'],
-    RxSet: ['add', 'delete', 'clear', 'replace', 'replaceData'],
-}
-const INTERNAL: Record<string, string[]> = {
-    RxList: ['constructor', 'doSplice', 'ensureAtomIndex', 'addAtomIndexesDep', 'removeAtomIndexesDep', 'pruneIndexKeyDeps', 'onUntrack', 'destroyResources', 'raw', 'indexKeyDeps'],
-    RxMap: ['constructor', 'destroyResources'],
-    RxSet: ['constructor', 'destroyResources'],
-}
+// 原型上的非派生成员分类(新增公开方法必须归入某一类,否则测试失败)。
+// 数据本体在 surfaceClassification.ts(与 entryPointSemanticsInventory 共享,
+// 一处修改两本账本同时生效)。
+import {READS, MUTATIONS, INTERNAL} from './surfaceClassification.js'
 
 const CLASSES: Record<string, any> = {RxList: RxList.prototype, RxMap: RxMap.prototype, RxSet: RxSet.prototype}
 
