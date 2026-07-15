@@ -61,6 +61,27 @@ export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, 
 
 const queuedRecomputes = new WeakSet<Computed>()
 
+// 一层深的数组拷贝:外层数组换新,数组型元素也换新(元素内的对象引用保留——
+// 值级共享是正常语义)。undefined/非数组字段原样透传。
+function copyNestedArray(value: unknown): unknown {
+    if (!Array.isArray(value)) return value
+    return value.map(item => (Array.isArray(item) ? item.slice() : item))
+}
+
+/**
+ * 协议载荷的防御副本(载荷所有权契约,README「参数契约」):info 的
+ * argv/methodResult 是对全部订阅者共享的广播。凡把 info 交给**任意用户代码**
+ * 的观察出口(onChange 的 handler、自定义调度器的 infos 参数)都发独立副本,
+ * 改写不会毒化兄弟订阅者;applyPatch 是协议消费者,拿共享引用、契约只读
+ * (每次 patch 拷贝会落在真正的热路径上)。
+ */
+export function copyTriggerInfoPayload(info: TriggerInfo): TriggerInfo {
+    const copy: TriggerInfo = {...info}
+    if (Array.isArray(copy.argv)) copy.argv = copyNestedArray(copy.argv) as any[]
+    if (Array.isArray(copy.methodResult)) copy.methodResult = copyNestedArray(copy.methodResult)
+    return copy
+}
+
 // 调度上下文（microtask/nextTick）没有可以同步传播异常的调用方：
 // 1. 一定要先出队再执行，否则 recompute 抛错（同步 getter 的异常会重抛）会把
 //    computed 永久卡在 queuedRecomputes 里，之后永远无法再被调度；
@@ -502,7 +523,8 @@ export class Computed extends ReactiveEffect {
             //   这时候的第一次 run 会变成 clean，所以 schedule 的 recompute 一定要是 forceRecompute 才能继续执行。
             const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? () => this.recomputeInternal(true) : this.boundRecompute
             if (this.scheduleNeedsInfos) {
-                this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, [...(this._triggerInfos ?? [])])
+                // 自定义调度器是用户代码:载荷发防御副本(见 copyTriggerInfoPayload)
+                this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, (this._triggerInfos ?? []).map(copyTriggerInfoPayload))
             } else {
                 this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty)
             }
@@ -688,6 +710,11 @@ export class Computed extends ReactiveEffect {
     get savedTriggerInfos(): Parameters<Notifier["trigger"]>[] {
         return this._savedTriggerInfos ?? (this._savedTriggerInfos = [])
     }
+    // CAUTION 协议载荷只读契约(README「参数契约」):argv/methodResult 是对全部
+    //  订阅者的共享广播。dev 的冻结执法放在载荷**产生点**(util.toProtocolPayload
+    //  的副本、RxMap 冷路径的 methodResult),而不是本 trigger 汇聚点——曾在此对
+    //  每次 trigger 的 argv 做 Object.freeze,ABBA 实测 dev 下 push +20%/swap +52%
+    //  (freeze 调用 + 冻结元素种类转换拖慢后续消费),热路径不可接受。
     trigger(...args: Parameters<Notifier["trigger"]>) {
         this.savedTriggerInfos.push(args)
     }

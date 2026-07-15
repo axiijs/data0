@@ -61,17 +61,36 @@ export function adversarialSpliceStart(rand: Rand, len: number): number {
     return Math.floor(rand() * (len + 1))
 }
 
-// ---- 对抗参数域(set key 维度):越界(产生稀疏洞)/负/小数 ----
+// ---- 对抗参数域(splice deleteCount 维度):负/NaN/Infinity/越界/小数 ----
+// 2026-H3 round5:R5-2 教训的同构盲区——deleteCount 此前只在一次性单测里对抗,
+// 各生成器恒为良性 0..3,"脏 deleteCount × batch 重放 × 派生族"的组合空间为零
+// (与"越界代表值只有 len+1..len+3"同一种生成器分域窄化)。归一化语义:
+// ToIntegerOrInfinity 后 clamp 到 [0, len-start](与 Array#splice 一致)。
+export function adversarialSpliceDeleteCount(rand: Rand, len: number): number {
+    const r = rand()
+    if (r < 0.08) return -1 - Math.floor(rand() * 2)   // 负 → 0
+    if (r < 0.14) return NaN                             // NaN → 0
+    if (r < 0.20) return Infinity                        // Infinity → 删到尾
+    if (r < 0.28) return len + Math.floor(rand() * 3)   // 越界 → clamp
+    if (r < 0.36) return Math.floor(rand() * 3) + 0.5   // 小数 → trunc
+    return Math.floor(rand() * 3)                        // 良性
+}
+
+// ---- 对抗参数域(set key 维度):越界(产生稀疏洞)/负/小数/数值上界 ----
 // 2026-H3 round3 教训:稀疏(OOB set)此前以"一次性 sweep"进入体系而不是生成器,
 // 该维度因此从不与操作序列组合——"先 OOB set、再不等长 splice"这种两步组合
 // 任何随机搜索都生成不出来,createIndexKeySelection 的校正循环崩溃因此存活。
 // 规则:契约外形态操作也必须以生成器进入组合空间(oracle 由调用方按二级契约降级,
 // 见 sparseOpsFuzz 的"不崩溃 + 强制全量重算后收敛"两级断言)。
+// 2026-H3 round5:key ≥ 2^32-1 的正整数不是数组下标(属性赋值、length 不变),
+// 曾穿透 isDenseIndexKey 物化幽灵行/成员并在 groupBy 前缀循环卡 ~2^32 次迭代;
+// 数值上界与负/小数同属"非下标 key"等价类,进入生成器常驻组合空间。
 export function adversarialSetIndex(rand: Rand, len: number): number {
     const r = rand()
-    if (r < 0.5) return len + 1 + Math.floor(rand() * 3)   // 越界:产生洞
-    if (r < 0.6) return -1 - Math.floor(rand() * 2)          // 负:数组属性赋值
-    if (r < 0.7) return Math.floor(rand() * len) + 0.5       // 小数:属性赋值
+    if (r < 0.45) return len + 1 + Math.floor(rand() * 3)  // 越界:产生洞
+    if (r < 0.55) return -1 - Math.floor(rand() * 2)         // 负:数组属性赋值
+    if (r < 0.62) return Math.floor(rand() * len) + 0.5      // 小数:属性赋值
+    if (r < 0.7) return 2 ** 32 - 1 + Math.floor(rand() * 3) // 数值上界:非下标正整数(属性赋值)
     return Math.floor(rand() * Math.max(len, 1))             // 区间内
 }
 
@@ -90,7 +109,7 @@ export function performRandomListOp(
     const r = rand()
     if (r < 0.22) {
         const start = adversarialSpliceStart(rand, len)
-        const deleteCount = Math.floor(rand() * 3)
+        const deleteCount = adversarialSpliceDeleteCount(rand, len)
         const items = Array.from({length: Math.floor(rand() * 3)}, () => nextValue())
         list.splice(start, deleteCount, ...items)
         return `splice(${start},${deleteCount},[${items}])`

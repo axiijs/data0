@@ -103,4 +103,27 @@ describe('形态 × 能力矩阵(整值读写/属性读/属性写触发)', () =>
         expect(a.x).toBeUndefined()
         stop()
     })
+
+    // 2026-H3 round5 特征钉扎:proxy 形态的元 API 键与自省边界。
+    // get 陷阱的元键('raw'/'call'/IS_ATOM)与用户值属性共享字符串命名空间——
+    // 同名时读取被元 API 遮蔽,而 set 陷阱不特判元键、写穿值对象(读写不对称);
+    // has/ownKeys 无陷阱,in/Object.keys 作用于 atom 函数本体而非值对象。
+    // 这些是当前实现的既定形态(README「传播模型」已记录);本组测试的职责是
+    // 让任何漂移(如未来补 has 陷阱或改遮蔽序)显式过审,而不是裁定对错。
+    test('proxy 形态:值属性名与元 API 同名时读被遮蔽、写落值对象', () => {
+        const a = atom<any>({call: 5, raw: 7, x: 1})
+        expect(typeof a.call).toBe('function')          // 'call' 被 call 转发元键遮蔽
+        expect(a.raw).toEqual({call: 5, raw: 7, x: 1})  // 'raw' 恒返回整值(公开 API)
+        expect(a.x).toBe(1)                              // 普通属性不受影响
+        a.call = 9                                       // set 陷阱不特判:写穿值对象
+        expect(a.raw.call).toBe(9)
+        expect(typeof a.call).toBe('function')           // 再读仍被元 API 遮蔽
+    })
+
+    test('proxy 形态:in/Object.keys 不转发到值对象(仅 get 转发)', () => {
+        const a = atom<any>({x: 1, y: 2})
+        expect(a.x).toBe(1)                 // 属性读转发正常
+        expect('x' in a).toBe(false)        // has 无陷阱:作用于函数本体
+        expect(Object.keys(a)).toEqual([])  // ownKeys 无陷阱:同上
+    })
 })

@@ -7,7 +7,7 @@ import {AsyncRxSlice} from '../src/AsyncRxSlice.js'
 import {atom} from '../src/atom.js'
 import {autorun} from '../src/common.js'
 import {computed, destroyComputed} from '../src/computed.js'
-import {notifier} from '../src/notify.js'
+import {batch, notifier} from '../src/notify.js'
 import {RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
 import {RxTime} from '../src/RxTime.js'
@@ -332,6 +332,33 @@ describe('known AsyncRxSlice state issues', () => {
             expect(slice.loadError()).toBeNull()
         } finally {
             slice.destroy()
+        }
+    })
+})
+
+describe('known trigger-payload ownership issues', () => {
+    // 2026-H3 round5 动态复现,裁定已执行(防御拷贝):splice/clear 等的返回数组
+    // 曾与 info.methodResult 同引用,batch/async applyPatch/onChange/自定义调度器
+    // 四类延迟消费窗口里调用方按原生 splice 预期改写返回数组会静默毒化全部
+    // patch 消费者与 digestReplay 重建。现协议载荷持独立副本(util.toProtocolPayload,
+    // dev 下冻结广播载荷),返回数组归调用方所有。等价类横扫见
+    // deepReview2026H3Round5.spec.ts 的 R5-D1 组。
+    test('splice return array can be mutated inside batch without corrupting deferred patches', () => {
+        const list = new RxList<number>([1, 2, 3, 4])
+        const groups = list.groupBy(item => item % 2)
+        try {
+            batch(() => {
+                const removed = list.splice(0, 2)
+                removed.length = 0 // 调用方按原生 splice 语义"回收"返回数组
+            })
+            expect({
+                g0: groups.data.get(0) ? [...groups.data.get(0)!.data] : null,
+                g1: groups.data.get(1) ? [...groups.data.get(1)!.data] : null,
+            }).toEqual({g0: [4], g1: [3]})
+        } finally {
+            for (const group of groups.data.values()) group.destroy()
+            groups.destroy()
+            list.destroy()
         }
     })
 })

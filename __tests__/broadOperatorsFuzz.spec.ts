@@ -6,6 +6,7 @@ import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
 import {
     adversarialSpliceStart,
+    adversarialSpliceDeleteCount,
     atomRowFactory,
     indexReadingMapFn,
     indexReadingModel,
@@ -30,9 +31,11 @@ type Op =
 function randomOp(rand: () => number, len: number, nextVal: () => number): Op {
     const r = rand()
     if (r < 0.35) {
-        // 对抗参数域(负数/越界/小数/NaN)统一由 fuzzKit 提供
+        // 对抗参数域(负数/越界/小数/NaN;deleteCount 的负/NaN/Infinity/小数)统一由 fuzzKit 提供
         const start = adversarialSpliceStart(rand, len)
-        const deleteCount = rand() < 0.2 ? Math.floor(rand() * 3) + len : Math.floor(rand() * 4)
+        const deleteCount = rand() < 0.5
+            ? adversarialSpliceDeleteCount(rand, len)
+            : (rand() < 0.2 ? Math.floor(rand() * 3) + len : Math.floor(rand() * 4))
         const items = Array.from({length: Math.floor(rand() * 4)}, nextVal)
         return {kind: 'splice', start, deleteCount, items}
     }

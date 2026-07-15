@@ -13,7 +13,7 @@ import {Atom, atom, isAtom} from "./atom.js";
 import {Dep, isDepEmpty} from "./dep.js";
 import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, warn} from "./util.js";
+import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, toProtocolPayload, warn} from "./util.js";
 import {reconstructDigestStates} from "./digestReplay.js";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
@@ -92,6 +92,9 @@ function assertAtomIndexesAligned(list: RxList<any>) {
     }
 }
 
+// 合法数组下标域是 [0, 2^32-2]:length 最大 2^32-1,下标必须小于 length。
+const MAX_ARRAY_INDEX_EXCLUSIVE = 2 ** 32 - 1
+
 /**
  * EKC(set)的 key 是否是稠密下标。负/小数/非数字 key 的 set 契约上等同数组
  * 属性赋值:不触及任何行元素,全量 computation(只遍历 [0, length))也看不见它。
@@ -99,9 +102,37 @@ function assertAtomIndexesAligned(list: RxList<any>) {
  * 会把"属性赋值"物化成真实行(filter 插幽灵行、groupBy/indexBy/toMap/toSet 加
  * 幽灵成员;2026-H3 round3 形态操作 fuzz 命中)。协议侧 key 仍原样透传
  * (README「RxList 参数契约」),内部消费者独立归一化——与 splice argv 同规则。
+ * CAUTION 数值上界与负/小数同属幽灵 EKC 等价类(2026-H3 round5 动态复现):
+ *  key ≥ 2^32-1 的正整数同样不是数组下标(data[2^32-1]=v 是属性赋值,不改
+ *  length、全量不可见),漏判会物化幽灵行/成员,且 groupBy 的前缀计数循环按
+ *  key 迭代 ~2^32 次(单次 set 卡整分钟)、ensureAtomIndex 撑长 atomIndexes
+ *  直接 RangeError 抛给 set() 调用方(data 已写、info 未发,状态撕裂)。
  */
 function isDenseIndexKey(key: unknown): key is number {
-    return typeof key === 'number' && Number.isInteger(key) && key >= 0
+    return typeof key === 'number' && Number.isInteger(key) && key >= 0 && key < MAX_ARRAY_INDEX_EXCLUSIVE
+}
+
+/**
+ * 字符串规范下标归一化(2026-H3 round5 裁定,README「参数契约」)。
+ * 平台规范:字符串 P 是数组下标 ⟺ ToString(ToUint32(P)) === P 且 ToUint32(P) ≠ 2^32-1
+ * ——`data["2"] = v` **真实写入第 2 行**(dataset/JSON/URL 参数都是字符串入口,
+ * TS 类型挡不住 JS 调用方)。守卫域若比平台窄,set("2") 会真改源而全部派生
+ * 静默失联、at(2) 订阅者(depsMap key 2)永久漏触发(2026-H3 round5 动态复现)。
+ * set/at 入口把规范下标字符串归一化为 number(与 splice 参数的
+ * ToIntegerOrInfinity 归一化同一原则:内部一律使用平台语义的规范形态);
+ * 非规范字符串("02"/"2.5"/"-0"/"1e3")平台本就视为属性,原样透传不动。
+ */
+function normalizeIndexKey(key: unknown): unknown {
+    if (typeof key === 'string') {
+        const n = Number(key)
+        if (Number.isInteger(n) && n >= 0 && n < MAX_ARRAY_INDEX_EXCLUSIVE && String(n) === key) {
+            if (__DEV__) {
+                warn(`RxList received string index key "${key}"; normalized to ${n} (canonical array index per spec). Pass numbers to avoid this.`)
+            }
+            return n
+        }
+    }
+    return key
 }
 
 // toSorted 批量回退阈值：bulk > 64 且（bulk×4 > 派生长度 或 bulk > 4096）时
@@ -109,6 +140,34 @@ function isDenseIndexKey(key: unknown): key is number {
 const TOSORTED_BULK_MIN = 64
 const TOSORTED_BULK_RATIO = 4
 const TOSORTED_BULK_CAP = 4096
+
+// SameValueZero(NaN 等于自身):与 Map 组键语义一致,用于 dev 稳定性比对
+function sameValueZero(a: unknown, b: unknown): boolean {
+    return a === b || (a !== a && b !== b)
+}
+
+// CAUTION 回调纯度契约的 dev 探测(2026-H3 round5 裁定,README「参数契约」):
+//  groupBy/indexBy 的 getKey 与 toSorted 的 comparator 在 pauseTracking 下执行,
+//  读响应式数据不建立任何依赖——变化不会触发重算(静默陈旧),且 patch 时
+//  getKey 与建组时返回不一致会破坏前缀计数(增量结构损坏)。契约:这些回调
+//  必须纯且确定。dev 下用 detached probe 隔离地跑一次回调:probe 捕获到
+//  响应式读取即警告;订阅随 probe 销毁即弃,不残留。reduce/reduceToAtom 的
+//  reduceFn 不探测(重复调用会向累加器重复写入;probe 会劫持其子 effect 的
+//  父子归属),纯度要求由 README 契约承载。
+function devDetectReactiveReads(label: string, run: () => unknown): unknown {
+    const probe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe())
+    try {
+        const result = probe.probe(run)
+        if (probe.hasCaptures()) {
+            warn(`${label} read reactive data during computation. Such reads are NOT tracked: `
+                + `changes will NOT retrigger this derivation (silent staleness). `
+                + `Derive a plain field first (e.g. list.map(...)) or use find/findIndex/map/filter which support reactive callbacks.`)
+        }
+        return result
+    } finally {
+        probe.destroy()
+    }
+}
 
 export type Order = [number, number]
 export type ReorderKind = 'swap' | 'move' | 'sort' | 'reorder'
@@ -256,7 +315,8 @@ export class RxList<T> extends Computed {
         try {
             const deletedItems = this.data.slice()
             this.data.length = 0
-            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: deletedItems })
+            // 载荷持独立副本(所有权契约,见 toProtocolPayload):返回数组归调用方
+            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [0, length], methodResult: toProtocolPayload(deletedItems) })
             this.sendTriggerInfos()
             return deletedItems
         } finally {
@@ -339,7 +399,8 @@ export class RxList<T> extends Computed {
 
         if (canUseMetadataFastPath && (isPureAppend || isPureClear)) {
             const result = spliceMany(this.data, normalizedStart, deleteItemsCount, items)
-            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
+            // 载荷持独立副本(所有权契约,见 toProtocolPayload);纯尾插时 result 恒空,零拷贝
+            this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: toProtocolPayload(result) })
             this.sendTriggerInfos()
             return result
         }
@@ -374,7 +435,8 @@ export class RxList<T> extends Computed {
         // CAUTION 无论有没有 indexKeyDeps 都要触发 Iterator_Key，
         //  特别这里注意，我们利用传了 key 就会把对应 key 的 dep 拿出来的特性来 trigger ITERATE_KEY.
         //  CAUTION 一定先 trigger method，这样可能后面某些被删除的 atomIndexes 变化就不需要了。
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: result })
+        //  载荷持独立副本(所有权契约,见 toProtocolPayload):返回数组归调用方。
+        this.trigger(this, TriggerOpTypes.METHOD, { method:'splice', key: ITERATE_KEY, argv: [start, deleteCount, ...items], methodResult: toProtocolPayload(result) })
         if (affected) {
             for (const [index, oldValue] of affected) {
                 this.trigger(this, TriggerOpTypes.SET, { key: index, newValue: this.data[index], oldValue })
@@ -412,10 +474,17 @@ export class RxList<T> extends Computed {
             warn('mutating a destroyed RxList is a no-op')
             return undefined as T
         }
+        // 规范下标字符串("2")归一化为 number:平台把它当真实行写入,守卫/订阅
+        // 记账必须与平台一致,否则源已变而派生与 at() 订阅者静默失联(见 normalizeIndexKey)
+        index = normalizeIndexKey(index) as number
         const oldValue = this.data[index]
         this.data[index] = value
 
-        if (this.atomIndexes && Number.isInteger(index) && index >= 0) {
+        // isDenseIndexKey(含数值上界)而不是裸 Number.isInteger && >= 0:
+        // key ≥ 2^32-1 时 data[key] 是属性赋值(length 不变),但 ensureAtomIndex
+        // 把 atomIndexes.length 撑到 key+1 > 2^32-1 会当场 RangeError——data 已写、
+        // trigger 还没发,调用方收到异常且派生结构永久漏掉本次变更(状态撕裂)。
+        if (this.atomIndexes && isDenseIndexKey(index)) {
             this.ensureAtomIndex(index)
         }
 
@@ -459,7 +528,9 @@ export class RxList<T> extends Computed {
             }
         })
 
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [newOrder], reorderInfo })
+        // argv[0] 持 newOrder 的浅副本(所有权契约,见 toProtocolPayload):调用方
+        // 传入的 order 数组仍归调用方,延迟消费窗口里改写它不再毒化 patch 消费者。
+        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [toProtocolPayload(newOrder)], reorderInfo })
         // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见：否则非 batch 下
         //  原子写同步执行 map 的行级 Computed，其 hasPendingStructuralInfos 守卫看不到
         //  pending 结构 info，按终态位置直写派生列表，随后 reorder patch 又搬移一次
@@ -577,6 +648,8 @@ export class RxList<T> extends Computed {
             return 0
         })
 
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads)
+        let devComparatorChecked = false
         return new RxList<T>(
             function computation(this: RxList<T>) {
                 // Full recompute: track source changes
@@ -584,6 +657,11 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE)
                 // Make a clone of source.data and sort it
                 const cloned = source.data.slice()
+                if (__DEV__ && !devComparatorChecked && cloned.length >= 2
+                    && cloned[0] !== undefined && cloned[1] !== undefined) {
+                    devComparatorChecked = true
+                    devDetectReactiveReads('RxList.toSorted comparator', () => compare!(cloned[0], cloned[1]))
+                }
                 cloned.sort(compare!)
                 return cloned
             },
@@ -684,6 +762,9 @@ export class RxList<T> extends Computed {
     }
     // CAUTION 这里手动 track index dep 的变化，是为了在 splice 的时候能手动去根据订阅的 index dep 触发，而不是直接触发所有的 index key。
     at(index: number): T|undefined{
+        // 规范下标字符串归一化(与 set 对称):at("2") 必须与 set(2) 的触发 key
+        // 落在同一个 dep 上,否则订阅永久漏触发(见 normalizeIndexKey)
+        index = normalizeIndexKey(index) as number
         // 与 Array.prototype.at 一致：支持负索引（从末尾回数）。
         // CAUTION 负索引的结果依赖 length，不能建 index dep（元素本身没变时对应
         //  index 不会触发 SET），track ITERATE_KEY——所有结构变更（splice/reorder/set）
@@ -1487,11 +1568,22 @@ export class RxList<T> extends Computed {
     }
     groupBy<K>(getKey: (item: T) => K) {
         const source = this
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads)
+        let devPurityChecked = false
         return new RxMap<K, RxList<T>>(
             function computation(this: RxMap<any, RxList<T>>) {
                 const groups = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
+                if (__DEV__ && !devPurityChecked && source.data.length > 0) {
+                    devPurityChecked = true
+                    const probeItem = source.data[0]
+                    const k1 = devDetectReactiveReads('RxList.groupBy getKey', () => getKey(probeItem))
+                    if (!sameValueZero(k1, getKey(probeItem))) {
+                        warn('RxList.groupBy getKey returned different keys for the same item (unstable key). '
+                            + 'Incremental group maintenance locates groups by key identity; unstable keys make it diverge from a full recompute.')
+                    }
+                }
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
                     const key = getKey(item)
@@ -1518,7 +1610,10 @@ export class RxList<T> extends Computed {
                         this.set(groupKey, new RxList([]))
                     }
                     let groupIndex = 0
-                    for (let i = 0; i < sourceIndex; i++) {
+                    // clamp 与 removeAtSourcePosition 对称(兄弟实现点一致性):
+                    // 前缀计数不得越过操作时源长度。
+                    const bound = Math.min(sourceIndex, stateNow.length)
+                    for (let i = 0; i < bound; i++) {
                         if (sameKey(getKey(stateNow[i]), groupKey)) groupIndex++
                     }
                     this.data.get(groupKey)!.splice(groupIndex, 0, item)
@@ -1673,11 +1768,26 @@ export class RxList<T> extends Computed {
         //  链永久毒化,违反 sparseSetOperatorsSweep 的"不崩溃且可恢复"等价类。
         //  洞位行(undefined)一律跳过:全量侧按 hasOwnProperty 跳洞(与 map 一致),
         //  patch 侧删除/替换遇 undefined 旧值视为"无旧 entry"。
+        // dev 纯度探测只跑一次(回调纯度契约,见 devDetectReactiveReads;
+        // 属性形式对 object-atom 行同样适用——proxy get 也会被 probe 捕获)
+        let devPurityChecked = false
         return new RxMap<any, T>(
             function computation(this: RxMap<any, T>) {
                 const map = new Map()
                 this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
+                if (__DEV__ && !devPurityChecked) {
+                    const probeItem = source.data.find(it => it != null)
+                    if (probeItem != null) {
+                        devPurityChecked = true
+                        const extract = (item: NonNullable<T>) => typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
+                        const k1 = devDetectReactiveReads('RxList.indexBy getKey', () => extract(probeItem))
+                        if (!sameValueZero(k1, extract(probeItem))) {
+                            warn('RxList.indexBy getKey returned different keys for the same item (unstable key). '
+                                + 'Incremental index maintenance locates entries by key identity; unstable keys make it diverge from a full recompute.')
+                        }
+                    }
+                }
                 for (let i = 0; i < source.data.length; i++) {
                     const item = source.data[i]
                     // 洞位与显式 null/undefined 行统一忽略(无法取 key)
@@ -1886,6 +1996,12 @@ export class RxList<T> extends Computed {
 
     public concat(...others: RxList<T>[]): RxList<T> {
         const sources = [this, ...others]
+        // CAUTION 结构级自别名(2026-H3 round5 动态复现):同一源出现在多个操作数
+        //  位置(a.concat(a) 跑马灯复制是现实用法)时,一次变更只到达一条 info,
+        //  而 sources.indexOf 恒定位到首个段——其余段静默漏 patch,增量与全量
+        //  重算分叉([1,2,3,1,2] vs [1,2,3,1,2,3])。位置增量无法对多段同时表达
+        //  (逐段应用会互相移动 offset),构造性回退全量重算(README 脚注)。
+        const hasDuplicateSources = new Set(sources).size !== sources.length
         return new RxList<T>(
             function computation(this: RxList<T>) {
                 // Track each source for incremental updates
@@ -1907,6 +2023,8 @@ export class RxList<T> extends Computed {
                 // 多源 batch 的 offset 取决于每条 patch 的中间长度；无法从最终
                 // source 快照无歧义还原时直接全量重算。
                 if (triggerInfos.length !== 1) return false
+                // 同一源占多个段:单条 info 无法按 indexOf 定位唯一段(见构造处说明)
+                if (hasDuplicateSources) return false
                 // Figure out which source changed, then incrementally update
                 for (const info of triggerInfos) {
                     const sourceIndex = sources.indexOf(info.source as RxList<T>)
@@ -1931,7 +2049,7 @@ export class RxList<T> extends Computed {
                         this.spliceArray(offset + spliceStart, deletedItems.length, newItems)
                     } else if (method === 'reorder') {
                         return false
-                    } else if (typeof key === 'number' && Number.isInteger(key) && key >= 0) {
+                    } else if (isDenseIndexKey(key)) {
                         // CAUTION 段长守卫：越界 set（契约内透传）会让源段长度跳变
                         //  （len 3 → set(10) → len 11），EKC 的 key 落在旧段之外时按
                         //  段内偏移直写会覆盖到后续源的段（B 段元素整体错位，结构性

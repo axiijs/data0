@@ -1,5 +1,5 @@
 import { Atom, isAtom } from "./atom.js";
-import {DirtyCallback, Computed, GetterContext} from "./computed.js";
+import {copyTriggerInfoPayload, DirtyCallback, Computed, GetterContext} from "./computed.js";
 import { TriggerInfo } from "./notify.js";
 import { TrackOpTypes, TriggerOpTypes } from "./operations.js";
 import { RxList } from "./RxList.js";
@@ -98,7 +98,13 @@ export function onChange(source:Atom|RxList<any>|RxSet<any>|RxMap<any, any>, han
         }
         
     }, function applyPatch(this:Computed, data:any, triggerInfos:TriggerInfo[]) {
-        handler([...triggerInfos])
+        // 防御副本(载荷所有权契约,README「参数契约」):info 的 argv/methodResult
+        // 是对全部订阅者共享的广播,handler 是任意用户代码——给它独立副本
+        // (外层数组 + 一层嵌套:RxSet.replace 的 [newItems,deletedItems]、
+        // RxMap 的 entry 对、reorder 的 Order 对),改写不再毒化兄弟订阅者。
+        // onChange 是观察 API 而非热路径,O(载荷) 拷贝可接受;曾用 dev 冻结
+        // 执法,但冻结落在 trigger 热路径上(ABBA: push +20%/swap +52%),弃用。
+        handler(triggerInfos.map(copyTriggerInfoPayload))
     })
 
     instance.run([], true)
