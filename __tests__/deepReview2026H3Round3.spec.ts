@@ -316,6 +316,27 @@ describe('R3-8 toSorted × reorder:tie 稳定序跟随源序,必须回退全量(
     })
 })
 
+describe('R3-9 selection itemToIndicators:全量重建清空记账(有界性回归)', () => {
+    // 泄漏本体(旧 indicator 不可回收)由 scripts/audit-reachability.mjs 的 WeakRef
+    // 检查钉住(修复前 FAIL);本测试钉 CI 可断言的行为面:重复 item × 反复全量
+    // 重建后,记账仍精确驱动当前行(重建若不清账,死 indicator 累积在 Set 里,
+    // 行级 deleteIndicator 的降级/删除路径会在污染的 Set 上漂移)。
+    test('重复 item × force recompute churn × 行删除:存活行 indicator 仍精确', () => {
+        const list = new RxList<number>([7, 7])
+        const sel = new RxSet<number>([])
+        const selection = createSelection(list, sel)
+        for (let i = 0; i < 3; i++) selection.recompute(true)
+        sel.add(7)
+        expect(selection.data.map(r => r[1].raw)).toEqual([true, true])
+        list.splice(0, 1) // 删一行,孪生行存活
+        expect(selection.data.length).toBe(1)
+        expect(selection.data[0][1].raw).toBe(true)
+        sel.delete(7)
+        expect(selection.data[0][1].raw).toBe(false)
+        selection.destroy(); list.destroy(); sel.destroy()
+    })
+})
+
 describe('R3-M notify.ts mutation 审计盲区补杀', () => {
     test('shouldTrigger=false 对 primitive atom 写路径同样生效(triggerPrimitiveAtomValue 的暂停门)', async () => {
         // 既有 shouldTrigger 覆盖只走 keyed trigger(notifier.trigger);primitive atom

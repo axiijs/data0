@@ -1958,6 +1958,7 @@ type SelectionInner = {
     updateIndicatorsFromCurrentValueChange:any,
     stopAutoResetValue:any,
     deleteIndicator:any,
+    resetIndicators:any,
     currentValues:any
 }
 export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<T|number>|Atom<T|null|number>, autoResetValue = false): SelectionInner {
@@ -2102,6 +2103,16 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
 
     stopAutoResetValue?.run()
 
+    // CAUTION 全量重建时必须清空记账(2026-H3 round3 GC 审计命中的记账无界类,
+    //  同 depsMap host 摘除/pruneIndexKeyDeps 的规则:谁建条目谁给回收路径):
+    //  computation 每次全量重算为每行 createNewIndicator,旧行的条目无人回收——
+    //  force recompute/错误恢复路径下 Map 值升级 Set 后无界累积,且 currentValues
+    //  每次变化都遍历写全部死 indicator(写放大)。行级增删的精确回收仍走
+    //  deleteIndicator;这里只服务"全部行重建"的语义。
+    function resetIndicators() {
+        itemToIndicators.clear()
+    }
+
     return {
         trackIndicators,
         trackCurrentValues,
@@ -2109,6 +2120,7 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         updateIndicatorsFromCurrentValueChange,
         stopAutoResetValue,
         deleteIndicator,
+        resetIndicators,
         currentValues
     }
 }
@@ -2156,6 +2168,8 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
     return new RxList(
         function computation(this:Computed ) {
             inners.forEach(inner => {
+                // 全量重建 = 所有旧行废弃:先清 indicator 记账再逐行重建(见 resetIndicators)
+                inner.resetIndicators()
                 inner.trackIndicators(this)
                 inner.trackCurrentValues(this)
             })
