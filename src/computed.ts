@@ -1,6 +1,6 @@
 import {getDebugName,} from "./debug";
 import {InputTriggerInfo, Notifier, notifier, TriggerInfo} from './notify'
-import {assert, isAsync, isGenerator, nextTick, warn} from "./util";
+import {assert, isAsync, isAsyncGenerator, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
 import {ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
@@ -247,6 +247,13 @@ export class Computed extends ReactiveEffect {
         }
         markRetainedReactiveEffectKind(this, 'Computed', this.getRetainedDiagnosticSource())
 
+        // CAUTION async generator getter 必须 loud-fail(2026-H3 round6 工程面):
+        //  它两个形态检测都不命中,会被当同步 getter——computed 的值静默变成一个
+        //  从未被推进的 AsyncGenerator 对象(无告警的错误形态)。跨 await 追踪
+        //  请用同步 generator getter(逐段追踪),异步计算用 async getter。
+        assert(!isAsyncGenerator(getter),
+            'async generator getter is not supported: use an async getter (tracks deps before the first await) or a sync generator getter (tracks per segment)')
+
         this.isAsyncGetter = isAsync(getter)
         this.isGeneratorGetter = isGenerator(getter)
 
@@ -257,6 +264,10 @@ export class Computed extends ReactiveEffect {
 
         this.manualTracking = !!applyPatch
         if (this.applyPatch) {
+            // async generator patch 与 getter 同理 loud-fail:两个检测都不命中时
+            // 会走 runSimplePatch,返回的 AsyncGenerator 对象被当作"patch 成功"。
+            assert(!isAsyncGenerator(this.applyPatch),
+                'async generator applyPatch is not supported: use an async or sync-generator applyPatch')
             // 有 patch 时，dep 的增量 track 也是自己完成的。
             this.useDepMarker = false
             this.isAsyncPatch = isAsync(this.applyPatch)
@@ -674,8 +685,8 @@ export class Computed extends ReactiveEffect {
         this.inPatch = true
         // patch 也使用 recomputeId 是因为要判断是否被强制 fullRecompute 打断
         const recomputeId = ++this.recomputeId
-
-        this.dispatch('recomputeDeps')
+        // (曾在此派发 'recomputeDeps' 事件:全仓与下游均无监听者,死事件已移除;
+        //  patch 轮的可观察事件是 prepareRecompute 里的 'recompute'/'cleanup'。)
 
         this.prepareRecompute()
 
@@ -731,7 +742,7 @@ export class Computed extends ReactiveEffect {
             notifier.digestEffectSession()
         }
     }
-    // 由 this.run/onTrack/forceDirtyDepsRecompute 调用
+    // 由 handleTriggered/调度器经 boundRecompute 调用
     // CAUTION 原型方法 + 惰性 bound 版本（scheduleRecompute 需要脱离 this 调用）
     _boundRecompute?: (forceRecompute?: boolean) => void
     get boundRecompute() {

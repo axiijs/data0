@@ -51,12 +51,24 @@ export function warn(message: string ) {
     }
 }
 
+// CAUTION 基于原生构造器名的形态检测(README「async 契约」已成文的两个边界):
+//  1. async generator(async function*)的 constructor 是 AsyncGeneratorFunction,
+//     isAsync/isGenerator 都不命中——若不显式拒绝,会被当同步 getter,computed
+//     的值静默变成一个从未被推进的 AsyncGenerator 对象。Computed 构造时用
+//     isAsyncGenerator loud-fail。
+//  2. 构建工具把 async 降级转译(target < ES2017)后是普通函数,无法检测——
+//     属契约外(data0 面向现代 ES 目标)。
+//  ?. 防御 Object.create(null) 原型的函数(constructor 为 undefined)。
 export function isAsync(fn: Function) {
-    return fn.constructor.name === 'AsyncFunction'
+    return fn.constructor?.name === 'AsyncFunction'
 }
 
 export function isGenerator(fn: Function) {
-    return fn.constructor.name === 'GeneratorFunction'
+    return fn.constructor?.name === 'GeneratorFunction'
+}
+
+export function isAsyncGenerator(fn: Function) {
+    return fn.constructor?.name === 'AsyncGeneratorFunction'
 }
 
 // CAUTION 为了一般场景中的新能，不深度 replace!

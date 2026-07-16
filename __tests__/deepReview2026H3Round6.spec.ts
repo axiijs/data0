@@ -302,6 +302,44 @@ describe('R6-3 batch 错误组合矩阵(body 异常恒优先,digest 恒执行)',
     })
 })
 
+describe('工程面: async generator getter/patch 必须 loud-fail(静默错误形态清偿)', () => {
+    // isAsync/isGenerator 都不命中 AsyncGeneratorFunction——曾被当同步 getter,
+    // computed 的值静默变成一个从未被推进的 AsyncGenerator 对象;patch 同形
+    // (返回的 generator 对象被当作 patch 成功)。现在构造时报错(dev/prod 一致)。
+    test('async generator getter 构造时抛错', () => {
+        expect(() => computed(async function* () {
+            yield 1
+            return 2
+        } as any)).toThrow('async generator getter is not supported')
+    })
+
+    test('async generator applyPatch 构造时抛错', () => {
+        expect(() => computed(
+            function (this: any) { return 1 },
+            async function* () { yield; return 'ok' } as any,
+        )).toThrow('async generator applyPatch is not supported')
+    })
+
+    test('同步 generator getter 与 async getter 不受影响(守卫只挡 async generator)', async () => {
+        const dep = atom(1)
+        const gen = computed(function* (this: any) {
+            const v: number = yield dep()
+            return v * 2
+        } as any)
+        const asy = computed(async function (this: any) {
+            return dep() + 10
+        } as any)
+        await new Promise(resolve => setTimeout(resolve, 5))
+        try {
+            expect((gen as any).raw).toBe(2)
+            expect((asy as any).raw).toBe(11)
+        } finally {
+            destroyComputed(gen)
+            destroyComputed(asy)
+        }
+    })
+})
+
 describe('R6-4 isAtom ⇒ AtomBase 契约(atom.fixed/atom.lazy 的 raw)', () => {
     test('atom.fixed:isAtom、raw、调用读值三面一致', () => {
         const fixed = atom.fixed(42)
