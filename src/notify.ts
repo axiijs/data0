@@ -365,6 +365,9 @@ export class Notifier {
     if (type === TriggerOpTypes.CLEAR) {
       // collection being cleared
       // trigger all effects for target
+      // CAUTION 库内无生产触发方(RxMap.clear 走逐 key DELETE + METHOD):本分支
+      //  是留给「手动 notifier.trigger 的自定义结构」(LinkedList 式用法)的协议面,
+      //  枚举成员是公开 API,勿当死代码删除(2026-H3 round6 工程面清偿时裁定保留)。
       deps = [...depsMap.values()]
 
     } else {
@@ -606,10 +609,28 @@ export function batch<T>(fn: () => T): T {
     trackStackDepthBefore = notifier.trackStack.length
   }
   notifier.createEffectSession()
+  let bodyThrew = false
   try {
     return fn()
+  } catch (err) {
+    bodyThrew = true
+    throw err
   } finally {
-    notifier.digestEffectSession()
+    // CAUTION body 异常优先（2026-H3 round6 R6-3）：fn 抛错时 digest 仍必须执行
+    //  （session 一旦创建必须消化，且其余订阅者不能被 body 异常牵连丢标脏），
+    //  但 digest 重抛的订阅者 firstError 会按 JS 的 finally-throw 语义**静默替换**
+    //  在途的 body 异常——调用方只看到订阅者错误，自己代码的原始异常完全丢失。
+    //  body 异常在途时订阅者错误降级为 console.error 上报（与 digest 内
+    //  "第二个及以后的错误" 的既有兜底同款），body 异常照常传播。
+    if (bodyThrew) {
+      try {
+        notifier.digestEffectSession()
+      } catch (digestErr) {
+        console.error('[data0] suppressed subscriber error in batch digest (the batch body itself threw; propagating the body error):', digestErr)
+      }
+    } else {
+      notifier.digestEffectSession()
+    }
     if (__DEV__) {
       assert(ReactiveEffect.activeScopes.length === scopesDepthBefore, 'activeScopes depth not restored after batch (scope leak)')
       assert(notifier.trackStack.length === trackStackDepthBefore, 'trackStack depth not restored after batch (pause/reset imbalance)')

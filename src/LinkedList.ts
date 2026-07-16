@@ -10,6 +10,13 @@ class ListNode<T> {
     }
 }
 
+/**
+ * 响应式双向链表(手动 notifier.trigger 协议的示例级结构)。
+ *
+ * CAUTION 维护状态(2026-H3 round6 工程面盘点):axii/axle 两个下游均未使用
+ * (axii 有自己的 LinkedList 实现),功能面为最小集。保留导出以维持 API 兼容,
+ * 但新代码优先使用 RxList;如未来确认无外部使用者,可在 major 版本移除。
+ */
 export class LinkedList<T extends object> implements Iterable<ListNode<T>>{
     head?: ListNode<T>
     tail?: ListNode<T>

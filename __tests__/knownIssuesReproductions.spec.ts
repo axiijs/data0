@@ -8,7 +8,7 @@ import {atom} from '../src/atom.js'
 import {autorun} from '../src/common.js'
 import {computed, destroyComputed} from '../src/computed.js'
 import {batch, notifier} from '../src/notify.js'
-import {RxList} from '../src/RxList.js'
+import {createSelection, RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
 import {RxTime} from '../src/RxTime.js'
 
@@ -363,6 +363,140 @@ describe('known trigger-payload ownership issues', () => {
     })
 })
 
+describe('known selection equality-semantics issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复:createSelection 的 atom 单选模式曾在三个
+    // 入口用 `===` 判等,而记账 Map(itemToIndicators)与 RxSet 多选路径都是
+    // SameValueZero——NaN item 下三个入口互相分叉:
+    //   1) createNewIndicator: `currentValues.raw === item` → 全量重建时 NaN 行恒 false;
+    //   2) updateIndicatorsFromCurrentValueChange(atom 分支) → Map.get(NaN) 命中 → 增量置 true;
+    //   3) deleteCurrentValueIfItemRemoved: `item === currentValues.raw` → NaN 选中值
+    //      在 item 删除后不回收(RxSet 分支的 Set.has 可回收,两模式行为不一致)。
+    // 修复:atom 分支统一 SameValueZero(与记账/RxSet 侧对齐,判等门覆盖同一
+    // 语义的全部入口)。等价类横扫见 deepReview2026H3Round6.spec.ts 的 R6-1 组。
+    test('atom-mode selection keeps NaN indicators consistent between incremental update and full rebuild', () => {
+        const source = new RxList<number>([NaN, 1])
+        const selected = atom<number | null>(null)
+        const incrementalSel = createSelection(source, selected as any)
+        let fullSel: ReturnType<typeof createSelection<number>> | undefined
+        try {
+            selected(NaN)
+            const incremental = incrementalSel.data.map(([, indicator]) => indicator.raw)
+            // 同一 source/currentValues 的全新构建 = 全量重算语义
+            fullSel = createSelection(source, selected as any)
+            const full = fullSel.data.map(([, indicator]) => indicator.raw)
+            expect(incremental).toEqual(full)
+        } finally {
+            fullSel?.destroy()
+            incrementalSel.destroy()
+            source.destroy()
+        }
+    })
+
+    test('atom-mode selection with autoResetValue releases a removed NaN item like the RxSet mode does', () => {
+        const source = new RxList<number>([NaN, 1, 2])
+        const selected = atom<number | null>(NaN)
+        const selection = createSelection(source, selected as any, true)
+        try {
+            source.splice(0, 1) // 删除唯一的 NaN 行
+            // RxSet 多选模式(SameValueZero)会回收选中值;atom 模式应一致
+            expect(selected.raw).toBeNull()
+        } finally {
+            selection.destroy()
+            source.destroy()
+        }
+    })
+})
+
+describe('known lazily-cached-structure lifecycle issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复:AsyncRxSlice.fetch() 惰性创建的
+    // autoFetchPromise computed 曾没有用 ReactiveEffect.createDetached 隔离
+    // ——首次 fetch 发生在 autorun/computed 内(条件驱动拉取是常见形态)时被收集
+    // 为宿主 child,宿主重算的 destroyChildren 把它销毁;autoFetchPromise 字段仍
+    // 指向已销毁实例,此后 getRemoteData 的响应式参数变化不再触发重新拉取,
+    // fetch() 永远返回旧 promise(静默陈旧,无任何报警)。
+    // 与历史缺陷「RxList.length 在 autorun 中读会被当作 children 误销毁」同一
+    // 等价类(实例缓存的惰性结构 × 创建作用域生命周期)。修复:autoFetchPromise
+    // 与 RxTime.resolve 的内部 autorun(同类漏网入口)都改经 createDetached 创建;
+    // 全等价类横扫(length/keys/values/entries/size 家族)见
+    // deepReview2026H3Round6.spec.ts 的 R6-2 组。
+    test('AsyncRxSlice keeps auto-refetching after the reactive scope that first called fetch() reruns', async () => {
+        const fetchedPages: number[] = []
+        const page = atom(1)
+        const slice = new AsyncRxSlice<number>([], async () => {
+            const currentPage = page() // 第一个 await 之前的同步读:建立依赖
+            fetchedPages.push(currentPage)
+            return [currentPage]
+        })
+        const rerun = atom(0)
+        const stop = autorun(() => {
+            rerun()
+            slice.fetch()
+        }, true)
+        try {
+            await new Promise(resolve => setTimeout(resolve, 5))
+            expect(fetchedPages).toEqual([1])
+            rerun(1) // 宿主重算 → destroyChildren 销毁 autoFetchPromise
+            await new Promise(resolve => setTimeout(resolve, 5))
+            page(2) // 拉取参数变化,应重新拉取
+            await new Promise(resolve => setTimeout(resolve, 5))
+            expect(fetchedPages).toContain(2)
+        } finally {
+            stop()
+            slice.destroy()
+        }
+    })
+})
+
+describe('known batch error-masking issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复(裁定 = body 异常优先):batch() 的 fn 抛错
+    // 后,finally 中 digestEffectSession 若也重抛订阅者的 firstError,JS 的
+    // finally-throw 语义会**静默替换**在途的 body 异常——调用方只看到订阅者
+    // 错误,自己代码的原始异常完全丢失(也没有 console.error 兜底)。
+    // 修复:body 异常在途时 digest 照常执行(其余订阅者不受牵连),订阅者错误
+    // 降级 console.error 上报,body 异常照常传播;无 body 异常时行为不变
+    // (第一个订阅者错误抛给调用方,README §3 原契约)。错误组合矩阵见
+    // deepReview2026H3Round6.spec.ts 的 R6-3 组。
+    test('batch propagates the body error instead of silently replacing it with a subscriber error', () => {
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const source = atom(1)
+        const stop = autorun(() => {
+            if (source() > 1) throw new Error('SUBSCRIBER_ERROR')
+        }, true)
+        let caught: unknown
+        try {
+            batch(() => {
+                source(2) // 排队一个 digest 时会抛错的订阅者
+                throw new Error('BODY_ERROR')
+            })
+        } catch (error) {
+            caught = error
+        } finally {
+            stop()
+            consoleSpy.mockRestore()
+        }
+        expect((caught as Error).message).toBe('BODY_ERROR')
+    })
+})
+
+describe('known atom.fixed/atom.lazy interface issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复(裁定 = 补全接口):atom.fixed/atom.lazy
+    // 通过 IS_ATOM 标记宣称自己是 Atom(isAtom 为 true),却曾不实现 AtomBase 的
+    // `.raw`——所有「isAtom 检查后读 .raw」的消费点拿到 undefined,最直接的是
+    // AtomComputed.replaceData 的解包路径:computed(() => atom.fixed(42)) 的值
+    // 是 undefined 而不是 42(atom.lazy 同形)。修复:fixed/lazy 补 raw 访问器
+    // (语义与两种 atom 形态一致:读值不追踪,lazy 经 pauseTracking 隔离)。
+    // 接口契约横扫见 deepReview2026H3Round6.spec.ts 的 R6-4 组。
+    test('computed getter returning atom.fixed resolves to the fixed value', () => {
+        const fixed = atom.fixed(42)
+        const result = computed(() => fixed)
+        try {
+            expect(result.raw).toBe(42)
+        } finally {
+            destroyComputed(result)
+        }
+    })
+})
+
 describe('known RxTime semantic issues', () => {
     // 已知未修（2026-H3 round4 review 动态复现，待语义裁定）：eq 的唤醒 timeout
     // 刻意排在越点后 +2ms（浮点防御），而谓词是点相等 v === 0——唤醒时刻已越过
@@ -424,9 +558,58 @@ describe('repository and release evidence', () => {
         expect(mismatches).toEqual([])
     })
 
+    test('package manifest wires dual dev/prod builds and require-condition types', () => {
+        // 2026-H3 round6 工程面契约:dev 构建经 `development` 条件触达消费者的
+        // 开发模式(纯度探测/销毁警告/不变量断言),无条件解析仍拿 prod;
+        // require 条件必须有 .d.cts(node16 解析下 ESM 形状的 d.ts 会被判伪装)。
+        const packageJson = JSON.parse(readFileSync(resolve('package.json'), 'utf8'))
+        const root = packageJson.exports['.']
+        expect(root.import.development).toBe('./dist/data0.dev.js')
+        expect(root.import.default).toBe('./dist/data0.js')
+        expect(root.require.development).toBe('./dist/data0.dev.umd.cjs')
+        expect(root.require.default).toBe('./dist/data0.umd.cjs')
+        expect(root.import.types).toBe('./dist/index.d.ts')
+        expect(root.require.types).toBe('./dist/index.d.cts')
+        // 旧字段对齐:main 供无 exports 支持的 CJS 解析(必须是 cjs 而不是 ESM),
+        // module 供老打包器;build 脚本必须同时产出双构建与 .d.cts。
+        expect(packageJson.main).toBe('dist/data0.umd.cjs')
+        expect(packageJson.module).toBe('dist/data0.js')
+        expect(packageJson.scripts.build).toContain('--mode dev')
+        expect(packageJson.scripts.build).toContain('postbuild')
+    })
+
     if (process.platform === 'win32') {
-        test.skip('release version argument cannot execute a second shell command', () => {})
+        test.skip('release pushes version tags to the remote', () => {})
     } else {
+        test('release pushes version tags to the remote', () => {
+            // 2026-H3 round6 工程面静态确认的缺陷:裸 `git push` 不推 tags,
+            // v2.10.0-v2.12.0 三个已发布版本远端无对应 tag。现在 release 脚本
+            // 必须 --follow-tags(annotated)+ --tags(lightweight 兜底)。
+            const sandbox = mkdtempSync(join(tmpdir(), 'data0-release-tags-'))
+            const fakeBin = join(sandbox, 'bin')
+            const gitLog = join(sandbox, 'git-args.log')
+            mkdirSync(fakeBin)
+            // fake git 把参数记录进日志(stdout 保持干净,git status 的 isClean 判定依赖空输出)
+            writeFileSync(join(fakeBin, 'git'), `#!/bin/sh\necho "$@" >> ${JSON.stringify(gitLog)}\nexit 0\n`)
+            chmodSync(join(fakeBin, 'git'), 0o755)
+            writeFileSync(join(fakeBin, 'pnpm'), '#!/bin/sh\nexit 0\n')
+            chmodSync(join(fakeBin, 'pnpm'), 0o755)
+            try {
+                const result = spawnSync(process.execPath, [resolve('scripts/release.js'), '9.9.9'], {
+                    cwd: sandbox,
+                    env: {...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`},
+                    encoding: 'utf8',
+                    timeout: 5_000,
+                })
+                expect(result.status).toBe(0)
+                const calls = readFileSync(gitLog, 'utf8')
+                expect(calls).toContain('push --follow-tags')
+                expect(calls).toContain('push --tags')
+            } finally {
+                rmSync(sandbox, {recursive: true, force: true})
+            }
+        })
+
         test('release version argument cannot execute a second shell command', () => {
             const sandbox = mkdtempSync(join(tmpdir(), 'data0-release-repro-'))
             const fakeBin = join(sandbox, 'bin')

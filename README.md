@@ -63,7 +63,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - batch 内的写入立即生效于**数据本身**(atom 的 `.raw`、`RxList.data`),但订阅者(含 computed 的重算与标脏)推迟到 batch 退出时统一执行。
 - 因此 **batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值**(AGENTS.md A2),batch 退出后恢复一致。需要读写一致时在 batch 外读,或使用 `autorun`(见下;其默认调度下重跑在 microtask,同步场景请传 `true`)。
 - **batch 退出后,所有派生结构必须等于从终态 source 全量重算的结果**(A1/A2 的"仍属缺陷"边界)。一次 digest 重放多条变更(batch 多操作、自定义延迟调度器积累)时,部分算子会自动回退全量重算以保证该不变量(见支持矩阵脚注),下游只应依赖结果一致性,不应依赖"必然增量"。
-- batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。
+- batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。**batch 体自身抛错时体异常优先**:digest 仍照常执行(排队的订阅者不受牵连),期间的订阅者错误降级为 `console.error` 上报,调用方收到的是自己代码的原始异常(不会被订阅者错误静默替换)。
 
 ### 3.1 `autorun` 调度
 
@@ -84,6 +84,8 @@ doubled.destroy(); evens.destroy(); list.destroy()
 ### 5. async 契约
 
 - **async getter 只追踪第一个 `await` 之前读取的依赖**;需要跨 await 追踪时使用 generator getter(逐段追踪)。
+- **async generator getter/applyPatch(`async function*`)不支持,构造时报错**(否则会被静默当作同步 getter,computed 的值变成一个从未被推进的 AsyncGenerator 对象)。异步计算用 async getter,跨 await 追踪用同步 generator getter。
+- async/generator 形态检测基于原生构造器(`AsyncFunction`/`GeneratorFunction`):**构建工具把 async 降级转译(target < ES2017)后无法检测**,会被当作"返回 Promise 的同步 getter"。data0 面向现代 ES 目标,请勿把 getter 转译到 ES2017 以下。
 - **async applyPatch 同样只在同步段建立追踪**;挂起期间到达的源变更会排队,由后续 patch 轮次消化,不丢失。
 - **destroy 取消在途 async patch**:destroy 后已挂起的 applyPatch 恢复执行时,其结果不再被应用,对已销毁实例的写入是 no-op(见 §6)。
 - async 错误经 `cleanPromise` reject 与 `error` 事件派发;两者都无人监听时 `console.error` 兜底,不产生 unhandled rejection。
@@ -130,13 +132,22 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 其可执行定义在 `__tests__/architectureSemantics.spec.ts`。
 
+## 构建产物与 dev 告警
+
+npm 包内含 **dev/prod 双构建**,经 `exports` 的 `development` 条件分发:
+
+- **默认(生产/无条件解析)**:`dist/data0.js`(ESM)/ `dist/data0.umd.cjs`(CJS),`__DEV__:false`——零断言零告警,与历史单构建完全一致。
+- **`development` 条件**:`dist/data0.dev.js` / `dist/data0.dev.umd.cjs`,`__DEV__:true`——纯度探测、销毁后变更警告、全局不变量断言全部生效。Vite(≥5.1)与 webpack 5 的开发模式自动命中该条件;Node 用 `node --conditions=development`。
+- 类型:`import` 条件走 `dist/index.d.ts`,`require` 条件走 `dist/index.d.cts`(node16/nodenext 解析下 CJS 类型不再被判"伪装成 ESM")。
+- **双格式提示**:同一进程内不要混用 `import` 与 `require` 加载 data0(双包危害)——两份模块实例各持独立的 notifier/作用域栈,跨实例的依赖追踪静默失效。按 `exports` 解析的现代打包器不会混用;手写互操作时统一走一种格式。
+
 ## 开发与验证
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm test --run        # 全量测试(含差分 fuzz、交错枚举、不变量自检)
 pnpm type-check
-pnpm build
+pnpm build             # 双构建:prod + dev(--mode dev)+ .d.cts
 pnpm exec vitest run --coverage
 pnpm bench             # 性能基准(热路径改动必须跑)
 ```

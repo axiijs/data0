@@ -17,7 +17,12 @@ try {
   execFileSync('pnpm', ['install', '--frozen-lockfile'], {stdio: 'inherit'})
   execFileSync('pnpm', ['run', 'build'], {stdio: 'inherit'})
   execFileSync('pnpm', ['version', version], {stdio: 'inherit'})
-  execFileSync('git', ['push'], {stdio: 'inherit'})
+  // CAUTION 必须把 version 产生的 tag 推上远端(2026-H3 round6 工程面静态确认:
+  //  裸 `git push` 不推 tags,v2.10.0-v2.12.0 三个已发布版本远端无对应 tag,
+  //  发布不可审计溯源)。--follow-tags 推随提交可达的 annotated tag,
+  //  --tags 兜底 lightweight 形态(pnpm/npm version 的 tag 形态因版本而异)。
+  execFileSync('git', ['push', '--follow-tags'], {stdio: 'inherit'})
+  execFileSync('git', ['push', '--tags'], {stdio: 'inherit'})
   execFileSync('pnpm', ['publish', './'], {stdio: 'inherit'})
 } catch (e) {
   console.error(e)

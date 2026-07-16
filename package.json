@@ -17,10 +17,11 @@
     "vue": "^3.4.38"
   },
   "type": "module",
+  "sideEffects": false,
   "scripts": {
     "test": "vitest",
     "test:prod": "vitest run -c vitest.prod.config.ts",
-    "build": "vite build",
+    "build": "vite build && vite build --mode dev && node scripts/postbuild.mjs",
     "release": "node scripts/release.js",
     "bench": "vitest bench",
     "bench-dev": "vite --port 7000",
@@ -28,7 +29,8 @@
     "type-check": "tsc --noEmit",
     "mutation": "stryker run"
   },
-  "main": "dist/data0.js",
+  "main": "dist/data0.umd.cjs",
+  "module": "dist/data0.js",
   "types": "dist/index.d.ts",
   "typings": "dist/index.d.ts",
   "files": [
@@ -38,9 +40,17 @@
   "license": "MIT",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/data0.js",
-      "require": "./dist/data0.umd.cjs"
-    }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "development": "./dist/data0.dev.js",
+        "default": "./dist/data0.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "development": "./dist/data0.dev.umd.cjs",
+        "default": "./dist/data0.umd.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   }
 }

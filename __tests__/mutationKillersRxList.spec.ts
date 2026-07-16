@@ -75,7 +75,7 @@ describe('变更方法契约守卫', () => {
         dupSource.destroy()
 
         const dupTuples = new RxList<[string, number]>([['a', 1], ['a', 2]])
-        expect(() => dupTuples.toMap()).toThrow('indexBy key is already exist')
+        expect(() => dupTuples.toMap()).toThrow('toMap key is already exist')
         dupTuples.destroy()
 
         // 增量侧：patch 中 push 重复 key

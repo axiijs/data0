@@ -1,6 +1,7 @@
 import {RxList} from "./RxList.js";
 import {Atom, atom} from "./atom.js";
 import {computed, destroyComputed} from "./computed.js";
+import {ReactiveEffect} from "./reactiveEffect.js";
 
 type GetRemoteData<T> = (cursor?: number, length?: number, stop?: number, fetchBeforeCursor?: boolean) => Promise<T[]>
 
@@ -20,7 +21,16 @@ export class AsyncRxSlice<T> extends RxList<T>{
     }
     fetch(): Promise<any>{
         if (!this.autoFetchPromise) {
-            this.autoFetchPromise = computed(this.fetchFullRemoteData) as Atom<Promise<any>>
+            // CAUTION createDetached(2026-H3 round6 R6-2):实例缓存的惰性结构,
+            //  生命周期归实例(destroyResources)。不隔离的话,首次 fetch 发生在
+            //  autorun/computed 内(条件驱动拉取)时会被收集为宿主 child,宿主
+            //  重算即销毁——autoFetchPromise 字段仍指向已销毁 computed,此后
+            //  getRemoteData 的响应式参数变化不再触发重新拉取,fetch() 永远
+            //  返回旧 promise(静默陈旧)。与 RxList.length/RxMap.keys 同一
+            //  等价类(实例缓存惰性结构 × 创建作用域生命周期)。
+            this.autoFetchPromise = ReactiveEffect.createDetached(() =>
+                computed(this.fetchFullRemoteData) as Atom<Promise<any>>
+            )
         }
         return this.autoFetchPromise()
     }
