@@ -33,16 +33,22 @@ import {RxSet} from '../src/RxSet.js'
 //   batchReplay  — 多 info 单次 digest 重放(方法 7)
 //   destroy      — 僵尸/泄漏对称性(方法 8)
 //   weirdNum     — NaN/-0 元素值(Object.is 与 SameValueZero 分歧;2026-H2 裁定后新列)
-const DIMENSIONS = ['unique', 'duplicates', 'undefinedVal', 'sparseOOB', 'batchReplay', 'destroy', 'weirdNum'] as const
+//   callbackReturn — 回调返回值形态(方法 24/R8-1:TS 签名是无人执法的承诺,
+//                    「存储回调返回值并按类型驱动控制流」的实现点必须对非布尔
+//                    返回值封闭;谓词族按真值语义消费,fuzzKit.truthyPredicateForms)
+const DIMENSIONS = ['unique', 'duplicates', 'undefinedVal', 'sparseOOB', 'batchReplay', 'destroy', 'weirdNum', 'callbackReturn'] as const
 type Dimension = typeof DIMENSIONS[number]
 
 // 格子取值:资产 spec 文件名(可加注释) | 'UNCOVERED' | 'NA:<构造性理由>'
 type Cell = string
 type Row = Record<Dimension, Cell>
 
-// weirdNum 列缺省 UNCOVERED:新维度先显后清,禁止默认谎报
-const row = (unique: Cell, duplicates: Cell, undefinedVal: Cell, sparseOOB: Cell, batchReplay: Cell, destroy: Cell, weirdNum: Cell = 'UNCOVERED'): Row =>
-    ({unique, duplicates, undefinedVal, sparseOOB, batchReplay, destroy, weirdNum})
+// weirdNum 列缺省 UNCOVERED:新维度先显后清,禁止默认谎报。
+// callbackReturn 列缺省 NA:该维度只攻击「消费谓词返回值」的算子(filter/find 族),
+// 其余算子的回调返回值即数据/键/序本身(mapFn 的值、getKey 的键、comparator 的序),
+// 不存在"按返回值类型驱动控制流"的实现点;消费谓词的算子逐行显式过账。
+const row = (unique: Cell, duplicates: Cell, undefinedVal: Cell, sparseOOB: Cell, batchReplay: Cell, destroy: Cell, weirdNum: Cell = 'UNCOVERED', callbackReturn: Cell = 'NA:无谓词回调(回调返回值即数据/键/序,无类型驱动的控制流)'): Row =>
+    ({unique, duplicates, undefinedVal, sparseOOB, batchReplay, destroy, weirdNum, callbackReturn})
 
 const BROAD = 'broadOperatorsFuzz.spec.ts'
 const DUP = 'duplicateValuesFuzz.spec.ts'
@@ -57,16 +63,16 @@ const WEIRD = 'weirdNumbersFuzz.spec.ts'
 export const INVENTORY: Record<string, Row> = {
     // ---- RxList 派生 ----
     'RxList.map':            row(`${BROAD}+deepReview2026H3Round4.spec.ts(读 index 行 × reorder 触发序)`, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
-    'RxList.filter':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
+    'RxList.filter':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD, 'deepReview2026H3Round8.spec.ts(R8-1:truthy 非布尔谓词族差分,存储点布尔化)'),
     'RxList.toSorted':       row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, `${WEIRD}(NaN-aware comparator;裸数值 comparator × NaN 属契约外,见 README)`),
     'RxList.slice':          row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, 'NA:按区间位置增量,不按值定位'),
     'RxList.concat':         row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}(段长跳变回退回归另见 deepReview2026H3Round3.spec.ts)`, BATCH, DESTROY, 'NA:按段位置增量,不按值定位'),
     'RxList.groupBy':        row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
     'RxList.toSet':          row(BROAD, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
-    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD),
-    'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
-    'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
-    'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`),
+    'RxList.findIndex':      row(`${BROAD}(含响应式谓词)`, DUP, H2, `${SWEEP}+${SPARSE_FUZZ}`, BATCH, DESTROY, WEIRD, 'deepReview2026H3Round8.spec.ts(R8-1 宽容性钉扎:真值判断消费,构造性免疫)'),
+    'RxList.find':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, SWEEP, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`, 'deepReview2026H3Round8.spec.ts(R8-1 宽容性钉扎)'),
+    'RxList.some':           row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`, 'deepReview2026H3Round8.spec.ts(R8-1 宽容性钉扎)'),
+    'RxList.every':          row(`via findIndex: ${BROAD}`, `via findIndex: ${DUP}`, `via findIndex: ${H2}`, `via findIndex: ${SWEEP}`, `via findIndex: ${BATCH}`, DESTROY, `via findIndex: ${WEIRD}`, 'deepReview2026H3Round8.spec.ts(R8-1 宽容性钉扎)'),
     'RxList.indexBy':        row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined 行跳过)+deepReview2026H3Round4.spec.ts(插入/EKC 双侧 null 行守卫)', `${SWEEP}+collectionLedgerBurndown2.spec.ts(属性形式修复回归)`, 'collectionLedgerBurndown.spec.ts(删+插同 key)+deepReview2026H3Round4.spec.ts(batch 含 null 行)', DESTROY, 'collectionLedgerBurndown2.spec.ts(NaN key)'),
     'RxList.toMap':          row('rxList.spec.ts(示例级)', 'NA:key 唯一性契约(重复 key 断言拒绝)', 'collectionLedgerBurndown2.spec.ts(undefined value 元组)+deepReview2026H3Round4.spec.ts(插入/EKC 双侧 undefined 行守卫)', 'collectionLedgerBurndown2.spec.ts(OOB set 修复回归)', 'collectionLedgerBurndown.spec.ts(删+插同 key)', 'collectionLedgerBurndown.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN key 元组)'),
     'RxList.reduce':         row('reduceOperator.spec.ts(示例级差分)', 'reduceOperator.spec.ts(示例级差分)', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown2.spec.ts', 'collectionLedgerBurndown.spec.ts(batch 尾追加/混合)+deepReview2026H3Round2.spec.ts(越界 clamp 尾插按操作时长度)', 'reduceOperator.spec.ts(僵尸检查)', 'collectionLedgerBurndown2.spec.ts(NaN/-0 透传)'),
