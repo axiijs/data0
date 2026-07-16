@@ -43,15 +43,25 @@ export type DirtyCallback = (recompute: (force?: boolean) => void, markDirty: ()
 export type SkipIndicator = { skip: boolean }
 
 
+// CAUTION Rx 类结构（RxList/RxMap/RxSet 及其派生）自身就是 Computed 实例，不经
+//  computed() 工厂注册进 computedToInternal。README §6 承诺「.destroy() 或
+//  destroyComputed 均可」——注册表未命中时必须回退到实例本身，否则对 Rx 结构调用
+//  destroyComputed/recompute 是一个 cryptic 的 `undefined.destroy` TypeError
+//  （2026-H3 round7 R7-5 动态复现）。
+function resolveComputedInternal(computedItem: ComputedData): Computed | undefined {
+    return computedToInternal.get(computedItem)
+        ?? (computedItem instanceof Computed ? computedItem : undefined)
+}
+
 export function destroyComputed(computedItem: ComputedData) {
-    const internal = computedToInternal.get(computedItem)!
+    const internal = resolveComputedInternal(computedItem)!
     // CAUTION 走实例方法而不是静态 ReactiveEffect.destroy：子类（RxList/RxMap/RxSet）
     //  可能覆写 destroy 附加行为，绕过实例方法会跳过它们。
     internal.destroy()
 }
 
 export function getComputedInternal(computedItem: ComputedData) {
-    return computedToInternal.get(computedItem)
+    return resolveComputedInternal(computedItem)
 }
 
 export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, source: string) {
@@ -504,8 +514,13 @@ export class Computed extends ReactiveEffect {
     private handleTriggered(immediate: boolean) {
         // markDirty, initial 状态不需要 mark dirty
         if (this._status === STATUS_CLEAN) {
-            this.dispatch('dirty')
+            // CAUTION 状态写入先于用户钩子（2026-H3 round7 R7-3 等价类：用户钩子抛错
+            //  不得阻断状态机推进）：dispatch('dirty') 是用户代码，抛错会中止本次
+            //  handleTriggered。先置 DIRTY 保证后续任何触发都能正常走"已脏→重算"
+            //  路径追平终态；若先 dispatch 后置位，持续抛错的监听者会把 status 永久
+            //  钉在 CLEAN——之后所有写入都被吞掉（永久静默陈旧）。
             this.setStatus(STATUS_DIRTY)
+            this.dispatch('dirty')
         }
 
 
@@ -603,10 +618,17 @@ export class Computed extends ReactiveEffect {
         if (this.applyPatch) {
             this.phase = PATCH_PHASE
         }
-        if (!this.preventEffectSession) {
-            notifier.digestEffectSession()
+        // CAUTION digest 会同步执行下游订阅者（用户代码），可能抛错：本 computed 的
+        //  数据与状态此刻已完成写入，cleanPromise 必须照常 settle——否则 await
+        //  recompute() 的调用方会因下游的错误而永久挂起（错误本身照常向外传播：
+        //  同步路径抛给 mutator，async 收尾由 fullRecompute 链尾的 catch 上报）。
+        try {
+            if (!this.preventEffectSession) {
+                notifier.digestEffectSession()
+            }
+        } finally {
+            this.settleCleanPromise()
         }
-        this.settleCleanPromise()
         this.dispatch('clean')
     }
     // CAUTION 同步 computed 走完全同步的路径：这样用户 getter 的异常能同步抛到
@@ -624,7 +646,19 @@ export class Computed extends ReactiveEffect {
         // 每次 full recompute 清空所有的 triggerInfos，这样才能使 patchable recompute 不错乱。
         if (this._triggerInfos) this._triggerInfos.length = 0
 
-        this.prepareRecompute()
+        // CAUTION prepareRecompute 里跑的是用户钩子（onRecompute/onCleanup 回调、
+        //  context.onCleanup 注册的清理），且此刻 status 已写成 RECOMPUTING：钩子
+        //  抛错若不走统一错误恢复，状态永久卡在 RECOMPUTING——同步 computed 此后
+        //  每次上游写入都对 mutator 抛误导性的"detect recompute in sync recompute"
+        //  断言且永不重算（2026-H3 round7 R7-3 动态复现）。与 getter 抛错同一处置：
+        //  handleRecomputeError 复位 DIRTY 后 rethrow（同步调用方可观测）。
+        try {
+            this.prepareRecompute()
+        } catch (err) {
+            // recomputeId 守卫：钩子内重入 destroy 时 recomputeId 已推进，不再回写状态。
+            if (this.recomputeId === recomputeId) this.handleRecomputeError(err, true)
+            throw err
+        }
         // 默认行为，重算并且重新收集依赖
         // CAUTION 用户一定要自己保证在第一次 await 之前读取了所有依赖。
         if (this.isAsync) {
@@ -639,6 +673,13 @@ export class Computed extends ReactiveEffect {
                 if (this.recomputeId !== recomputeId) return
                 restoreEffectDeps(this, previousDeps)
                 this.handleRecomputeError(err)
+            }).catch((finishErr: any) => {
+                // CAUTION finish 阶段（订阅者派发/clean 回调）的异常在 async 收尾没有
+                //  同步调用方：不兜底就是 unhandled rejection（Node 默认崩进程，违反
+                //  README §5；2026-H3 round7 R7-4 动态复现）。此错误属于下游订阅者，
+                //  本 computed 的数据与状态已完成写入；订阅者自身的错误恢复已在
+                //  digest 的逐 effect 边界处理过，这里只负责上报。
+                console.error('[data0] uncaught error while finishing async recompute:', finishErr)
             })
         }
 
@@ -677,9 +718,14 @@ export class Computed extends ReactiveEffect {
         }
         this.setStatus(STATUS_CLEAN)
         this.setUpdatedAt(Date.now())
-        this.sendTriggerInfos()
+        // CAUTION 与 finishFullRecompute 的 digest 同理：sendTriggerInfos 同步执行
+        //  下游订阅者，抛错时本轮 patch 已完成，cleanPromise 必须照常 settle。
+        try {
+            this.sendTriggerInfos()
+        } finally {
+            this.settleCleanPromise()
+        }
         this.dispatch('clean')
-        this.settleCleanPromise()
     }
     patchRecompute(): any {
         this.inPatch = true
@@ -688,7 +734,17 @@ export class Computed extends ReactiveEffect {
         // (曾在此派发 'recomputeDeps' 事件:全仓与下游均无监听者,死事件已移除;
         //  patch 轮的可观察事件是 prepareRecompute 里的 'recompute'/'cleanup'。)
 
-        this.prepareRecompute()
+        // CAUTION 与 fullRecompute 的同名守卫同一等价类（R7-3）：prepareRecompute 的
+        //  用户钩子抛错必须走统一错误恢复。这里 inPatch 已置 true，若不复位，
+        //  async patch 结构此后所有触发都只排队 info、永不消化（**静默**永久冻结，
+        //  比同步路径的误导性断言更隐蔽）。handleRecomputeError 统一复位
+        //  inPatch/DIRTY/FULL_RECOMPUTE_PHASE 后 rethrow。
+        try {
+            this.prepareRecompute()
+        } catch (err) {
+            if (recomputeId === this.recomputeId) this.handleRecomputeError(err, true)
+            throw err
+        }
 
         if (this.isPatchAsync) {
             this.expectCleanPromise()
@@ -702,6 +758,12 @@ export class Computed extends ReactiveEffect {
             }, (err: any) => {
                 if (recomputeId !== this.recomputeId) return
                 this.handleRecomputeError(err)
+            }).catch((finishErr: any) => {
+                // finish 阶段（订阅者派发/回退全量重算的同步 getter 异常）在 async
+                //  收尾没有同步调用方：console 兜底，禁止 unhandled rejection
+                //  （README §5；R7-4）。相关状态已由 handleRecomputeError/digest
+                //  的逐 effect 边界各自复位，这里只负责上报。
+                console.error('[data0] uncaught error while finishing async patch recompute:', finishErr)
             })
         }
 
@@ -952,14 +1014,15 @@ export class AtomComputed extends Computed{
 }
 
 // 强制重算。返回 cleanPromise，async computed 的调用方可以 await 本轮计算完成。
+// Rx 类结构同样支持（注册表回退语义见 resolveComputedInternal）。
 export function recompute(computedItem: ComputedData, force = false) {
-    const internal = computedToInternal.get(computedItem)!
+    const internal = resolveComputedInternal(computedItem)!
     return internal.recompute(force)
 }
 
 // 目前 debug 用的
 export function isComputed(target: any) {
-    return !!computedToInternal.get(target)
+    return !!resolveComputedInternal(target)
 }
 
 // debug 时用的

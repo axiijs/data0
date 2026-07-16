@@ -177,7 +177,8 @@ export class RxMap<K, V> extends Computed{
     declare _entries?: RxList<[K, V]>
     declare _size?: Atom<number>
     keys(): RxList<K> {
-        return this._keys ?? (this._keys = ReactiveEffect.createDetached(() => {
+        if (this._keys) return this._keys
+        this._keys = ReactiveEffect.createDetached(() => {
             const source = this
             return new RxList<K>(
                 function computation(this: RxList<K>) {
@@ -212,16 +213,26 @@ export class RxMap<K, V> extends Computed{
                     }
                 }
             )
-        }))
+        })
+        // 已销毁结构的 meta 首读:快照值保留,立即随葬(等价类说明见 RxList.length)
+        if (!this.active) this._keys.destroy()
+        return this._keys
     }
     values(): RxList<V> {
-        return this._values ?? (this._values = ReactiveEffect.createDetached(() => this.keys().map(key => this.get(key)!)))
+        if (this._values) return this._values
+        this._values = ReactiveEffect.createDetached(() => this.keys().map(key => this.get(key)!))
+        if (!this.active) this._values.destroy()
+        return this._values
     }
     entries(): RxList<[K, V]> {
-        return this._entries ?? (this._entries = ReactiveEffect.createDetached(() => this.keys().map(key => [key, this.get(key)] as [K, V])))
+        if (this._entries) return this._entries
+        this._entries = ReactiveEffect.createDetached(() => this.keys().map(key => [key, this.get(key)] as [K, V]))
+        if (!this.active) this._entries.destroy()
+        return this._entries
     }
     get size(): Atom<number> {
-        return this._size ?? (this._size = ReactiveEffect.createDetached(() => {
+        if (this._size) return this._size
+        this._size = ReactiveEffect.createDetached(() => {
             const source = this
             return computed(
                 function computation(this: Computed) {
@@ -232,7 +243,9 @@ export class RxMap<K, V> extends Computed{
                     data(source.data.size)
                 }
             )
-        }))
+        })
+        if (!this.active) destroyComputed(this._size)
+        return this._size
     }
     /**
      * @internal

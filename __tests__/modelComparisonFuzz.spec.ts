@@ -119,7 +119,9 @@ describe('model comparison: 系统级管道网 ≡ 朴素参考模型', () => {
                     expect(sortNum([...uni.data]), `union ${ctx}`).toEqual(sortNum(model.uni()))
                     expect(sortNum([...inter.data]), `inter ${ctx}`).toEqual(sortNum(model.inter()))
                     expect(sortNum([...sym.data]), `sym ${ctx}`).toEqual(sortNum(model.sym()))
-                    expect(sortNum([...aAsList.data]), `toList ${ctx}`).toEqual(sortNum(model.aAsList()))
+                    // toList 是有序 RxList:含序比较(模型即 [...setA.data] 的迭代序;
+                    // replace 重排经全量回退对齐,R7-2)
+                    expect([...aAsList.data], `toList ${ctx}`).toEqual(model.aAsList())
                     expect(setASize.raw, `setA.size ${ctx}`).toBe(setA.data.size)
                     expect(keys.data, `keys ${ctx}`).toEqual(model.keys())
                     expect(values.data, `values ${ctx}`).toEqual(model.values())

@@ -223,7 +223,8 @@ function createRxListWithSelectionInners<T>(source:RxList<T>, ...inners: Selecti
             // CAUTION 行必须随源同步重排（indicator 挂在行元组上随行移动，成员与
             //  选中集都不变）。旧实现把 reorder 落进 explicit key change 分支，
             //  用 ITERATE_KEY（Symbol）当 index 去 set，选择列表从此与源失序。
-            list.reorder(triggerInfo.argv![0] as Order[], triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
+            // pairsOwned:argv[0] 的 pair 在源头 trigger 已深拷,协议消费者只读
+            list.reorder(triggerInfo.argv![0] as Order[], triggerInfo.reorderInfo as ReorderPatchInfo | undefined, true)
         } else {
             //explicit key change
             const {  newValue, key } = triggerInfo
@@ -346,7 +347,8 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
             // 行随源重排，但选中的 index 不动：重排后受影响区间逐行按新 index 校正
             // （洞位行 ?. 跳过，同上 splice 校正循环的说明）
             const reorderInfo = triggerInfo.reorderInfo as ReorderPatchInfo | undefined
-            list.reorder(triggerInfo.argv![0] as Order[], reorderInfo)
+            // pairsOwned:argv[0] 的 pair 在源头 trigger 已深拷,协议消费者只读
+            list.reorder(triggerInfo.argv![0] as Order[], reorderInfo, true)
             const selectedIndexes = getSelectedIndexes()
             const affected = reorderInfo?.affectedRange
             const start = affected ? Math.max(affected[0], 0) : 0
