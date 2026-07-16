@@ -6,7 +6,8 @@ import {describe, expect, test, vi} from 'vitest'
 import {AsyncRxSlice} from '../src/AsyncRxSlice.js'
 import {atom} from '../src/atom.js'
 import {autorun} from '../src/common.js'
-import {computed, destroyComputed} from '../src/computed.js'
+import {computed, Computed, destroyComputed} from '../src/computed.js'
+import {TrackOpTypes, TriggerOpTypes} from '../src/operations.js'
 import {batch, notifier} from '../src/notify.js'
 import {createSelection, RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
@@ -520,6 +521,126 @@ describe('known RxTime semantic issues', () => {
             expect(sawTrue).toBe(true)
         } finally {
             vi.useRealTimers()
+        }
+    })
+})
+
+describe('known inline-dispatch channel issues (2026-H3 round9, pending adjudication)', () => {
+    // 方法 25(派发通道敌意差分)动态复现,待裁定。攻击轴:同一「多订阅者 ×
+    // 敌意场景(错误注入/派发中重入写)」在三条派发通道下执行——
+    //   ① 非 batch atom 写的内联通道(triggerPrimitiveAtomValue/triggerEffects 循环);
+    //   ② batch 的 session digest 通道;
+    //   ③ Rx 结构变更方法的结构通道(dispatchStructuralThen/sendTriggerInfos,恒有 session)。
+    // ②③ 对两个敌意场景都有防线(逐 effect try/catch;重入写 info 追加到队尾保持
+    // 因果序),① 双双缺失——同一语义三个入口保护深度不一致(R7 兄弟实现点纪律、
+    // R8-8「一 loud 一 silent」的同族形态)。
+
+    // 缺陷形态 1:内联通道首订阅者抛错 → 剩余订阅者既不执行也不标脏(status 停留
+    // CLEAN),静默陈旧;幂等重写(Object.is 判等门拦截)无法救回,只有写入**不同值**
+    // 或 force recompute 才能追平。batch 通道同场景下兄弟订阅者照常执行
+    // (digest 逐 effect try/catch,首错 digest 后重抛),README §3 只对 batch 成文。
+    // 裁定方向:内联循环补 digest 同款隔离(首错循环后重抛) vs README 把
+    // 「非 batch 首订阅者抛错跳过其余订阅者」成文为契约边界。
+    test.fails('inline atom dispatch: sibling subscribers still run when the first subscriber throws', () => {
+        const a = atom(0)
+        let boomOnce = true
+        const c1 = computed(() => {
+            const v = a() as number
+            if (v === 1 && boomOnce) { boomOnce = false; throw new Error('subscriber boom') }
+            return v
+        })
+        const c2 = computed(() => (a() as number) * 2)
+        try {
+            expect(() => a(1)).toThrow('subscriber boom')
+            // batch 通道同场景下 c2 会是 2(deepReview round6 R6-3 组);内联通道
+            // 目前是 0(静默陈旧),且 a(1) 幂等重写被判等门拦截、无法救回。
+            expect(c2.raw).toBe(2)
+        } finally {
+            destroyComputed(c1)
+            destroyComputed(c2)
+        }
+    })
+
+    // 缺陷形态 2:派发中重入写(handleTriggered 注释点名支持的「平衡状态」回写:
+    // 先订阅的 autorun 看到非法值同步改写同一 atom)下,内联通道对**后订阅**的
+    // 消费者交付乱序 info——嵌套写的 [1→2] 先于外层写的 [null→1] 到达(onChange
+    // 实测 [[1,2],[null,1]]),delta 型消费者(createSelection/createIndexKeySelection
+    // 的 atom 单选分支按 oldValue→false/newValue→true 增量消费)据此把 indicator
+    // 置成「1 与 2 同时选中」;后续正常写入永远不再触及 item 1 → **永久卡 true**,
+    // 只有 force recompute 能追平(A1 边界「终值错误/不收敛」,属"仍属缺陷"域)。
+    // 同场景 batch 通道 info 保持因果序、终态正确;RxSet 多选模式(结构通道,
+    // 恒有 session)同样正确——同一 API 的两个模式(R6-1 轴)× 两条通道分叉。
+    // 裁定方向:(a) 内联 atom 派发包一层 micro-session(与结构通道对齐,热路径
+    // 代价待测);(b) selection 家族的 atom 分支改「按终态 raw 对账」而不是信任
+    // delta(消费侧修复,不救 onChange 用户);(c) README 把「内联重入写下 info
+    // 对后订阅者非因果序」成文为契约边界并给出 batch 规避指引。
+    test.fails('inline reentrant atom write: selection indicators converge to the full-recompute state', () => {
+        const list = new RxList<number>([0, 1, 2])
+        const cur = atom<number | null>(null)
+        // 先订阅的平衡回写:1 不可选,自动跳到 2(与 handleTriggered 注释的
+        // pending→processing 模式同形)
+        const stop = autorun(() => {
+            if (cur() === 1) cur(2)
+        }, true)
+        const selection = createSelection(list, cur)
+        try {
+            cur(1)
+            expect(cur.raw).toBe(2)
+            // 全量重算语义:只有 item 2 选中。当前实测 [false, true, true],
+            // 且 cur(0)/cur(null) 等后续写入永远修不掉 item 1 的 true。
+            expect(selection.data.map(([, ind]) => ind.raw)).toEqual([false, false, true])
+        } finally {
+            stop()
+            selection.destroy()
+            list.destroy()
+        }
+    })
+})
+
+describe('known skipIndicator semantic gaps (2026-H3 round9, pending adjudication)', () => {
+    // 静态确认 + 动态复现,待裁定。skipIndicator 是 computed() 的公开第 5 参
+    // (axii 自己的 LightBindingEffect 只在本地消费同名概念,并不传给 data0),
+    // 在 data0 仓内:零 README 文档、零测试、coreSurfaceInventory 零登记
+    // (账本按导出面普查,参数级表面漏网)。
+    // 动态行为:Computed.run/runFromTrigger/runFromAtomTrigger 在 skip 窗口内
+    // 直接 return——info 被丢弃且不标脏。对 patch 型 computed,解除 skip 后的
+    // 下一次触发只增量重放**新** info,skip 窗口内丢弃的变更永久缺失(增量 ≠
+    // 全量重算,静默分叉,只有 force recompute 能追平)。非 patch 型解除后一次
+    // 触发即自愈(全量读终态)。
+    // 裁定方向:skip 窗口内至少记「错过触发」标记,解除后首次触发回退全量
+    // (与 handleRecomputeError 的 FULL_RECOMPUTE_PHASE 复位同款);或文档成文
+    // 「skip 期间的变更永久丢失,解除后须自行 force recompute」。
+    test.fails('patch computed catches up with mutations dropped during a skip window', () => {
+        const source = new RxList<number>([1, 2, 3])
+        const skip = {skip: false}
+        const mirror = computed<number[]>(
+            function computation(this: Computed) {
+                ;(this as any).manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                return source.data.slice()
+            },
+            function applyPatch(this: Computed, data: any, infos: any[]) {
+                const arr = (data.raw as number[]).slice()
+                for (const info of infos) {
+                    if (info.method !== 'splice') return false
+                    arr.splice(info.argv[0] as number, (info.methodResult as unknown[]).length, ...info.argv.slice(2))
+                }
+                data(arr)
+            },
+            true,
+            undefined,
+            skip,
+        )
+        try {
+            expect(mirror.raw).toEqual([1, 2, 3])
+            skip.skip = true
+            source.push(4) // skip 窗口内的变更:info 被 run() 丢弃
+            skip.skip = false
+            source.push(5) // 解除后的变更:patch 只重放本条
+            // 全量重算语义应为 [1,2,3,4,5];当前实测 [1,2,3,5](4 永久缺失)
+            expect(mirror.raw).toEqual([1, 2, 3, 4, 5])
+        } finally {
+            destroyComputed(mirror)
+            source.destroy()
         }
     })
 })
