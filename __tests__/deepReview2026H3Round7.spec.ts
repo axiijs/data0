@@ -463,4 +463,52 @@ describe('R7-6 destroy 后惰性 meta 首读:快照语义,零残留活 effect', 
         expect(getComputedInternal(len)!.active).toBe(false)
         expect(len()).toBe(2)
     })
+
+    test('meta getter 幂等性:重复读取返回同一实例(缓存门是承载语义的,mutation 复审补杀)', () => {
+        // 缓存门变异成恒 miss 时,每次读取都会新建派生结构:订阅翻倍、
+        // destroyResources 只销毁最后一个(先建的全部泄漏)。五个惰性 meta 全员断言。
+        const list = new RxList([1, 2])
+        expect(list.length).toBe(list.length)
+        const m = new RxMap<string, number>({a: 1})
+        expect(m.keys()).toBe(m.keys())
+        expect(m.values()).toBe(m.values())
+        expect(m.entries()).toBe(m.entries())
+        expect(m.size).toBe(m.size)
+        const s = new RxSet([1])
+        expect(s.size).toBe(s.size)
+        list.destroy(); m.destroy(); s.destroy()
+    })
+
+    test('destroy 后行级 effect 僵尸检查:行内 atom 变化不再驱动 mapFn(行为钉扎)', () => {
+        // 注:destroyResources 的 frames 销毁循环变异(清空循环体)不被本测试检出——
+        // rowComputed 同时是 mapped 的 child,destroyChildren 兜底销毁(构造性遮蔽,
+        // mutation 幸存分类 (c) 防御分支,与 dep.ts 的 reattach 分支同类接受)。
+        // 本测试钉的是可观察行为本身:readsItemAtom 行 × destroy 的僵尸不可达。
+        const rowAtom = atom(1)
+        const source = new RxList([{v: rowAtom}])
+        let mapRuns = 0
+        const mapped = source.map(item => {
+            mapRuns++
+            return item.v()
+        })
+        expect(mapped.data).toEqual([1])
+        expect(mapRuns).toBe(1)
+        mapped.destroy()
+        rowAtom(2)
+        expect(mapRuns).toBe(1)   // 行级 effect 已随 mapped 销毁,mapFn 不得重跑
+        source.destroy()
+    })
+
+    test('RxMap.keys × delete 的 SameValueZero 子句:NaN key 在场时删除其他 key 不误删 NaN(mutation 复审补杀)', () => {
+        // 变异 `(key !== key && deletedKey !== deletedKey)` → `(key !== key && true)` 时,
+        // 谓词对任何 NaN key 恒真:NaN 排在前面时 delete('a') 会从 keys 列表误删 NaN。
+        const m = new RxMap<any, number>([[NaN, 1], ['a', 2], ['b', 3]])
+        const keys = m.keys()
+        expect(keys.data).toEqual([NaN, 'a', 'b'])
+        m.delete('a')
+        expect(keys.data).toEqual([NaN, 'b'])
+        m.delete(NaN)
+        expect(keys.data).toEqual(['b'])
+        destroyComputed(keys); m.destroy()
+    })
 })
