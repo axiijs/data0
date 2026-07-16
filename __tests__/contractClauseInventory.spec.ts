@@ -137,7 +137,20 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
     'C4.6 applyPatch 协议消费者只读共享广播': {
         section: '4.', kind: 'obligation',
         quote: '`triggerInfo.argv`/`methodResult` 只读**',
-        assets: 'NA:下游消费者义务——协议只读性由本契约承载,onChange/调度器出口的副本由 C4.4/C4.5 资产钉扎',
+        // CAUTION 本 NA 注记曾声称"onChange/调度器出口的副本由 C4.4/C4.5 资产钉扎"
+        //  ——虚假的覆盖声明(2026-H3 round8 教训):C4.4/C4.5 的资产全部行使
+        //  "调用方改原始数组"方向,handler 改自己副本的方向零覆盖,reorder pair
+        //  共享因此存活。观察出口的 grant 现在是独立条款 C4.11。
+        assets: 'NA:下游 applyPatch 消费者义务——协议只读性由本契约承载;观察出口的副本 grant 见 C4.11',
+    },
+    'C4.11 观察出口收到载荷副本,可自由处置': {
+        section: '4.', kind: 'grant',
+        // grant 的行使空间是 行使者 × 对象 × 方向 的叉乘:C4.4/C4.5 行使的是
+        // "调用方改原始载荷",本条款行使"handler/调度器深改写**自己收到的副本**
+        // (含 reorder pair 与 reorderInfo)不得毒化兄弟订阅者"(R8-2),以及
+        // "副本中的用户值保引用身份"(R8-3)。
+        quote: '收到的也是载荷副本,可自由处置',
+        assets: ['deepReview2026H3Round8.spec.ts'],
     },
     'C4.7 getKey/comparator/reduceFn 纯度契约 + dev 探测': {
         section: '4.', kind: 'obligation',
@@ -343,6 +356,33 @@ describe('兄弟契约实现点差分', () => {
         expect(reorderInfo.argv![0]).toEqual([[0, 1], [1, 0]])
 
         stopWatch(); mapped.destroy(); source.destroy()
+    })
+
+    test('载荷隔离深度跨出口一致(handler 方向,R8-2):handler 深改写自己的副本后,patch 消费者与后注册 handler 都不受影响', () => {
+        // C4.11 的行使方向补全:round7 只测了"调用方改原始数组"(上一个测试),
+        // 本测试行使"先注册的 handler 改**自己收到的副本**里的 pair/reorderInfo"
+        // ——两个方向共同覆盖 grant 的行使空间(行使者 × 对象 的叉乘)。
+        const source = new RxList([10, 20, 30])
+        const stopHostile = onChange(source, (infos: TriggerInfo[]) => {
+            for (const info of infos) {
+                if (info.method === 'reorder') {
+                    for (const pair of info.argv![0] as [number, number][]) { pair[0] = 0; pair[1] = 0 }
+                    const ri = info.reorderInfo as {oldIndexToNewIndex?: Map<number, number>} | undefined
+                    ri?.oldIndexToNewIndex?.clear()
+                }
+            }
+        })
+        const mapped = source.map(x => x * 2)
+        const received: TriggerInfo[][] = []
+        const stopWatch = onChange(source, (infos: TriggerInfo[]) => { received.push(infos) })
+
+        source.swap(0, 2)
+        expect(source.data).toEqual([30, 20, 10])
+        expect(mapped.data).toEqual([60, 40, 20])
+        const reorderInfo = received.flat().find(info => info.method === 'reorder')!
+        expect(reorderInfo.argv![0]).toEqual([[0, 2], [2, 0]])
+
+        stopHostile(); stopWatch(); mapped.destroy(); source.destroy()
     })
 
     test('replace 回退语义跨兄弟一致:RxMap.keys × replace 与 RxSet.toList × replace 都全量重算', () => {

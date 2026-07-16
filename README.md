@@ -47,7 +47,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 ### 1. 变更边界与所有权(零拷贝采纳)
 
 - 响应性完全建立在"**通过实例方法修改**"之上。`RxList.splice/set/push/...`、`RxMap.set/delete/...`、`RxSet.add/delete/replace` 内部负责触发;没有 Proxy 兜底。
-- **构造与 `RxSet.replace` 直接采纳传入容器的引用**(`new RxList(arr)` 后 `list.data === arr`),视为所有权移交。之后绕过方法直改原容器(`arr.push(x)`)不会触发任何通知,派生结构静默失联——这是契约内行为,不是缺陷(详见 AGENTS.md A3)。
+- **构造与 `RxSet.replace` 直接采纳传入容器的引用**(`new RxList(arr)` 后 `list.data === arr`),视为所有权移交。之后绕过方法直改原容器(`arr.push(x)`)不会触发任何通知,派生结构静默失联——这是契约内行为,不是缺陷(详见 AGENTS.md A3)。同名方法的采纳语义并不一致:`RxList.replaceData` 与 `RxMap.replace` **就地更新既有容器**(splice/逐 key 增删,不采纳入参),只有构造与 `RxSet.replace` 采纳引用;`toArray` 同理分叉——`RxList.toArray()` 返回内部数组(只读视图),`RxSet.toArray()` 返回快照副本(特征钉扎见 `__tests__/deepReview2026H3Round8.spec.ts`)。
 - `data`(以及 atom 的 `.raw`)是**只读视图**:可以读,不可以写。
 
 ### 2. 传播模型(急切推,同步)
@@ -75,7 +75,9 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - `splice(start, deleteCount, ...items)` 的参数按 `Array.prototype.splice` 规范归一化(ToIntegerOrInfinity:NaN→0、小数截断、负数从尾部回退、越界 clamp、`-0`→`+0`)。
 - **`toSorted(compare)` 的 comparator 必须对元素值域构成一致全序**(与 `Array#sort` 的 consistent-comparator 要求相同)。`NaN` 元素 × 裸数值 comparator(`(a,b)=>a-b` 返回 NaN)违反一致性,属契约外;需要含 `NaN` 的列表请用 NaN 归一化的 comparator。同理,列表可能**驻留** `undefined` 元素(含稀疏洞被 reorder 物化)时,comparator 必须与 `Array#sort` 的强制规则一致地把 `undefined` 排到末尾(引擎从不为 undefined 调用 comparator、一律排尾;把 undefined 排前的 comparator 与全量语义必然分叉,属契约外)——**变更本身**涉及 undefined 时仍自动回退全量,无须 comparator 处理。元素身份(增量删除定位)按 `Object.is`(`NaN` 可定位,`0`/`-0` 可区分);等值 tie 组内存在可区分成员时增量删除自动回退全量重算。
 - **`triggerInfo.argv` 透传用户原始参数**(不归一化)。这是 axii/axle 依赖的协议;消费 argv 的派生结构必须自行归一化(内部实现均已如此)。
-- **变更方法返回的数组归调用方所有**(与原生 `Array#splice` 预期一致):`splice`/`clear` 的删除项、`RxSet.replace` 的 `[newItems, deletedItems]` 返回后可自由改写——协议载荷持有独立副本,batch/async applyPatch 等延迟消费不受影响(`reorder` 传入的 order 数组**连同其中的 `[from, to]` 对**同理,调用后仍归调用方,可复用/改写——协议载荷深拷到 Order 对一层)。观察出口(`onChange` 的 handler、自定义调度器的 infos 参数)收到的也是载荷副本,可自由处置。**直接实现 `applyPatch` 的协议消费者拿到的是共享广播,`triggerInfo.argv`/`methodResult` 只读**(逐 patch 拷贝会落在热路径上,该边界靠本契约约束)。
+- **变更方法返回的数组归调用方所有**(与原生 `Array#splice` 预期一致):`splice`/`clear` 的删除项、`RxSet.replace` 的 `[newItems, deletedItems]` 返回后可自由改写——协议载荷持有独立副本,batch/async applyPatch 等延迟消费不受影响(`reorder` 传入的 order 数组**连同其中的 `[from, to]` 对**同理,调用后仍归调用方,可复用/改写——协议载荷深拷到 Order 对一层)。观察出口(`onChange` 的 handler、自定义调度器的 infos 参数)收到的也是载荷副本,可自由处置——副本深度按协议形状对齐:`reorder` 的 Order 对与 `reorderInfo` 一并独立(改写自己的副本不会毒化兄弟订阅者),`splice` 删除项/插入项、`RxMap.set` 的旧值等**用户值保持引用身份**(按身份记账的观察方可直接匹配)。**直接实现 `applyPatch` 的协议消费者拿到的是共享广播,`triggerInfo.argv`/`methodResult` 只读**(逐 patch 拷贝会落在热路径上,该边界靠本契约约束)。
+- **谓词回调按真值语义消费**(与 `Array#filter` 平台惯例一致):`filter`/`find`/`findIndex`/`some`/`every` 的回调返回 number/string 等 truthy/falsy 非布尔值是契约内用法——TS 签名的 `boolean` 只是类型层约定,运行时按真值处理(`filter` 在存储点布尔化;返回值形态族差分见 `__tests__/deepReview2026H3Round8.spec.ts`)。
+- **`reorder` 的 pairs 必须构成子集置换**(from/to 集合相等、各自无重复、均为界内整数);`swap` 的两个区间不得重叠(重叠语义自相矛盾,两种构建都拒绝并抛错)。dev 构建对公开 `reorder` 校验置换性并抛错,prod 构建不校验(契约外输入的行为未定义);`sortSelf`/`reposition`/`swap` 内部生成的 pairs 构造性合法,不付校验成本。
 - **`groupBy`/`indexBy` 的 getKey、`toSorted` 的 comparator、`reduce`/`reduceToAtom` 的 reduceFn 必须是纯的确定函数**:它们在追踪暂停下执行,**读取响应式数据不建立依赖**——数据变化不会触发重分组/重排/重算(静默陈旧),且 patch 时与建组时返回不一致会破坏增量记账。需要按响应式字段分组/排序时,先用 `map` 把它物化成普通字段(`list.map(t => ({...t, st: t.status()})).groupBy(x => x.st)`);`find`/`findIndex`/`some`/`every` 与 `map`/`filter` 支持响应式回调(见支持矩阵)。同一 item 的 getKey 必须返回一致的键(按 SameValueZero 判等;每次返回新对象的"不稳定键"会使增量与全量重算分叉)。dev 构建对首个元素做一次探测,违反两条契约都会告警。
 - **`EXPLICIT_KEY_CHANGE` 必须消费 `info.newValue`(以及需要时的 `methodResult` 旧值),不要回读 `source.data[key]`**。batch/延迟调度下一次 digest 可能同时含 EKC 与结构操作;重放时 `source.data` 已是终态,按终态下标读出会与操作时位置错位,导致宿主镜像与源分叉。data0 自身的 map/filter 等增量路径已按协议字段消费。
 - `set(index, value)` 的契约是**替换已存在的稠密行**。**规范下标字符串会归一化为 number**(平台规范:`data["2"] = v` 就是写第 2 行——`set("2", v)`/`at("2")` 与 `set(2, v)`/`at(2)` 完全等价,dev 构建告警提示改传 number);越界/负数/非整数/非规范字符串("02"/"2.5")/≥ 2^32-1 的 key 属于契约外用法:行为等同普通数组赋值(可能产生稀疏数组、`length` computed 不更新;≥ 2^32-1 的正整数不是数组下标,`length` 完全不变),key 原样透传给下游。若列表已有 `atomIndexes`(`map` 使用了 index 参数),越界 set 会为写入位分配 index atom,派生 `map(index)` 不再因此崩溃;稀疏洞位仍按数组语义保留。
@@ -97,7 +99,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - **destroy 后结构只读**:已销毁实例的变更方法(`splice`/`set`/`add`/`replace` 等)一律 no-op(dev 构建打印警告),数据保持销毁当刻的快照;destroy 也会取消在途 async patch 的后续应用。销毁的派生结构从此不再接收 source 的任何更新。销毁后读取惰性 meta(`length`/`keys`/`size` 等)返回快照值,且不会留下常驻的活 effect。
 - **用户回调抛错不冻结状态机**:`onRecompute`/`onCleanup`/`context.onCleanup` 注册的清理在重算生命周期内抛错时,与 getter 抛错同一处置——错误同步抛给触发变更的调用方(async 路径 `console.error` 兜底),computed 复位为脏,后续任何触发都会全量重算追平终态,不会停留在"永久陈旧/每次写入抛误导性断言"的卡死状态。
 - 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理(包括其 `context.onCleanup` 注册的清理与惰性 meta);不希望被收集时用 `ReactiveEffect.createDetached`。
-- `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次;`map` 回退全量重算时,旧行的 cleanup 同样各执行一次。
+- `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次;`map` 回退全量重算时,旧行的 cleanup 同样各执行一次。行含响应式依赖而发生**行级重算**时,重算前先执行上一轮注册的清理(与 computed 的 `context.onCleanup`"每轮重算前执行"语义一致)——每轮注册恰好执行一次,行删除时执行的是最后一轮的注册。
 
 ## 派生结构 × 源操作支持矩阵
 

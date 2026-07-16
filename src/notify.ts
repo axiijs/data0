@@ -164,10 +164,24 @@ export class Notifier {
     //  重新抛给 batch 调用方，其余错误 console.error 上报（不静默吞掉）。
     let hasError = false
     let firstError: unknown
+    // CAUTION 循环诊断阈值(2026-H3 round8 R8-8,仅 dev):非 batch 下互触发环会被
+    //  "detect recompute in sync recompute" 断言当场喝止,batch 的 digest 队列却
+    //  允许无界追加(重入合法:级联触发是正常语义)——真正非收敛的环在 batch 内
+    //  是**静默无限循环**(挂死无任何信号),同一形态在两个入口一 loud 一 silent。
+    //  死循环本身无法用测试表达(先有界才可断言),这里在处理量越过
+    //  「max(初始队列 × 16, 100_000)」时 console.error 一次(不中断、不改语义:
+    //  合法的大 batch 初始队列可以很大,倍数 + 绝对量双门避免误报),把挂死变成
+    //  可诊断。生产构建零开销。
+    const digestCycleWarnAt = __DEV__ ? Math.max(queue.length * 16, 100_000) : 0
     try {
         // CAUTION queue.length 每轮重新读取：digest 过程中新触发（含重入）的 effect
         //  会追加到队尾，在同一次 digest 中被处理（与旧的 Set 迭代语义一致）。
         for (let i = 0; i < queue.length; i++) {
+            if (__DEV__ && i === digestCycleWarnAt) {
+                console.error(`[data0] batch digest has processed ${i} effects and the queue is still growing — `
+                    + `likely a non-converging effect cycle (subscribers re-triggering each other endlessly). `
+                    + `The digest will keep running; if this hangs, break the cycle or move the writes out of the subscribers.`)
+            }
             const effect = queue[i]
             effect._inSession = false
             const infos = effect._sessionInfos

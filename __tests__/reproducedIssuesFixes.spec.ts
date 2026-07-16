@@ -338,9 +338,15 @@ describe('F5: map context.onCleanup 槽位对齐', () => {
             source.splice(0, 1)
             expect(log).toEqual(['cleanup-a#1'])
             log.length = 0
-            dep(1) // 行 b 重算,重新注册 #3
+            // 行 b 重算:先执行上一轮注册的 #2(2026-H3 round8 R8-5——与 computed 的
+            // context.onCleanup"每轮重算前执行"语义对齐;此前 #2 被新注册静默顶掉,
+            // mapFn 每轮分配的资源逐轮泄漏),再注册 #3
+            dep(1)
+            expect(log).toEqual(['cleanup-b#2'])
             source.splice(0, 1) // 删除 b:执行最新注册的 #3
-            expect(log).toEqual(['cleanup-b#3'])
+            expect(log).toEqual(['cleanup-b#2', 'cleanup-b#3'])
+            // 槽位对齐的本意仍被验证:两次 cleanup 都属于行 b,不落旧位置
+            expect(log.every(entry => entry.startsWith('cleanup-b'))).toBe(true)
         } finally {
             mapped.destroy()
             source.destroy()
