@@ -63,7 +63,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - batch 内的写入立即生效于**数据本身**(atom 的 `.raw`、`RxList.data`),但订阅者(含 computed 的重算与标脏)推迟到 batch 退出时统一执行。
 - 因此 **batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值**(AGENTS.md A2),batch 退出后恢复一致。需要读写一致时在 batch 外读,或使用 `autorun`(见下;其默认调度下重跑在 microtask,同步场景请传 `true`)。
 - **batch 退出后,所有派生结构必须等于从终态 source 全量重算的结果**(A1/A2 的"仍属缺陷"边界)。一次 digest 重放多条变更(batch 多操作、自定义延迟调度器积累)时,部分算子会自动回退全量重算以保证该不变量(见支持矩阵脚注),下游只应依赖结果一致性,不应依赖"必然增量"。
-- batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。
+- batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。**batch 体自身抛错时体异常优先**:digest 仍照常执行(排队的订阅者不受牵连),期间的订阅者错误降级为 `console.error` 上报,调用方收到的是自己代码的原始异常(不会被订阅者错误静默替换)。
 
 ### 3.1 `autorun` 调度
 

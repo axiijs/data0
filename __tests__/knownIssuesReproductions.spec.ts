@@ -363,19 +363,17 @@ describe('known trigger-payload ownership issues', () => {
     })
 })
 
-describe('known selection equality-semantics issues (2026-H3 round6)', () => {
-    // 已知未修(2026-H3 round6 review 动态复现,待修复):createSelection 的 atom
-    // 单选模式在三个入口用 `===` 判等,而记账 Map(itemToIndicators)与 RxSet
-    // 多选路径都是 SameValueZero——NaN item 下三个入口互相分叉:
+describe('known selection equality-semantics issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复:createSelection 的 atom 单选模式曾在三个
+    // 入口用 `===` 判等,而记账 Map(itemToIndicators)与 RxSet 多选路径都是
+    // SameValueZero——NaN item 下三个入口互相分叉:
     //   1) createNewIndicator: `currentValues.raw === item` → 全量重建时 NaN 行恒 false;
     //   2) updateIndicatorsFromCurrentValueChange(atom 分支) → Map.get(NaN) 命中 → 增量置 true;
     //   3) deleteCurrentValueIfItemRemoved: `item === currentValues.raw` → NaN 选中值
     //      在 item 删除后不回收(RxSet 分支的 Set.has 可回收,两模式行为不一致)。
-    // 违反「增量 ≡ 全量重算」不变量与方法 18/19 的「判等门覆盖同一语义所有入口」
-    // 规则。修复方向:atom 分支统一 SameValueZero(与记账/RxSet 侧对齐)。
-    // 备注:coverageInventory 的 createSelection × weirdNum 格子引用的资产只覆盖
-    // RxSet 多选路径,atom 单选路径是「值域 × 入口」盲格(§3.3 R4-2 同款教训)。
-    test.fails('atom-mode selection keeps NaN indicators consistent between incremental update and full rebuild', () => {
+    // 修复:atom 分支统一 SameValueZero(与记账/RxSet 侧对齐,判等门覆盖同一
+    // 语义的全部入口)。等价类横扫见 deepReview2026H3Round6.spec.ts 的 R6-1 组。
+    test('atom-mode selection keeps NaN indicators consistent between incremental update and full rebuild', () => {
         const source = new RxList<number>([NaN, 1])
         const selected = atom<number | null>(null)
         const incrementalSel = createSelection(source, selected as any)
@@ -394,7 +392,7 @@ describe('known selection equality-semantics issues (2026-H3 round6)', () => {
         }
     })
 
-    test.fails('atom-mode selection with autoResetValue releases a removed NaN item like the RxSet mode does', () => {
+    test('atom-mode selection with autoResetValue releases a removed NaN item like the RxSet mode does', () => {
         const source = new RxList<number>([NaN, 1, 2])
         const selected = atom<number | null>(NaN)
         const selection = createSelection(source, selected as any, true)
@@ -409,18 +407,19 @@ describe('known selection equality-semantics issues (2026-H3 round6)', () => {
     })
 })
 
-describe('known lazily-cached-structure lifecycle issues (2026-H3 round6)', () => {
-    // 已知未修(2026-H3 round6 review 动态复现,待修复):AsyncRxSlice.fetch() 惰性
-    // 创建的 autoFetchPromise computed 没有用 ReactiveEffect.createDetached 隔离
+describe('known lazily-cached-structure lifecycle issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复:AsyncRxSlice.fetch() 惰性创建的
+    // autoFetchPromise computed 曾没有用 ReactiveEffect.createDetached 隔离
     // ——首次 fetch 发生在 autorun/computed 内(条件驱动拉取是常见形态)时被收集
     // 为宿主 child,宿主重算的 destroyChildren 把它销毁;autoFetchPromise 字段仍
     // 指向已销毁实例,此后 getRemoteData 的响应式参数变化不再触发重新拉取,
     // fetch() 永远返回旧 promise(静默陈旧,无任何报警)。
     // 与历史缺陷「RxList.length 在 autorun 中读会被当作 children 误销毁」同一
-    // 等价类(实例缓存的惰性结构 × 创建作用域生命周期);RxList.length/
-    // RxMap.keys/size 已用 createDetached 修复,AsyncRxSlice.autoFetchPromise
-    // 是该等价类的漏网入口(RxTime.resolve 的 autorun 同属此类,未单独钉扎)。
-    test.fails('AsyncRxSlice keeps auto-refetching after the reactive scope that first called fetch() reruns', async () => {
+    // 等价类(实例缓存的惰性结构 × 创建作用域生命周期)。修复:autoFetchPromise
+    // 与 RxTime.resolve 的内部 autorun(同类漏网入口)都改经 createDetached 创建;
+    // 全等价类横扫(length/keys/values/entries/size 家族)见
+    // deepReview2026H3Round6.spec.ts 的 R6-2 组。
+    test('AsyncRxSlice keeps auto-refetching after the reactive scope that first called fetch() reruns', async () => {
         const fetchedPages: number[] = []
         const page = atom(1)
         const slice = new AsyncRxSlice<number>([], async () => {
@@ -448,15 +447,17 @@ describe('known lazily-cached-structure lifecycle issues (2026-H3 round6)', () =
     })
 })
 
-describe('known batch error-masking issues (2026-H3 round6)', () => {
-    // 已知未修(2026-H3 round6 review 动态复现,待裁定):batch() 的 fn 抛错后,
-    // finally 中 digestEffectSession 若也重抛订阅者的 firstError,JS 的
+describe('known batch error-masking issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复(裁定 = body 异常优先):batch() 的 fn 抛错
+    // 后,finally 中 digestEffectSession 若也重抛订阅者的 firstError,JS 的
     // finally-throw 语义会**静默替换**在途的 body 异常——调用方只看到订阅者
     // 错误,自己代码的原始异常完全丢失(也没有 console.error 兜底)。
-    // README §3 只裁定了「订阅者互不阻断,第一个错误抛给调用方」,没有裁定
-    // body 异常与订阅者异常同时出现时的优先级。裁定方向:body 异常优先传播、
-    // 订阅者错误 console.error 上报(或两者聚合成 AggregateError)。
-    test.fails('batch propagates the body error instead of silently replacing it with a subscriber error', () => {
+    // 修复:body 异常在途时 digest 照常执行(其余订阅者不受牵连),订阅者错误
+    // 降级 console.error 上报,body 异常照常传播;无 body 异常时行为不变
+    // (第一个订阅者错误抛给调用方,README §3 原契约)。错误组合矩阵见
+    // deepReview2026H3Round6.spec.ts 的 R6-3 组。
+    test('batch propagates the body error instead of silently replacing it with a subscriber error', () => {
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
         const source = atom(1)
         const stop = autorun(() => {
             if (source() > 1) throw new Error('SUBSCRIBER_ERROR')
@@ -471,20 +472,21 @@ describe('known batch error-masking issues (2026-H3 round6)', () => {
             caught = error
         } finally {
             stop()
+            consoleSpy.mockRestore()
         }
         expect((caught as Error).message).toBe('BODY_ERROR')
     })
 })
 
-describe('known atom.fixed/atom.lazy interface issues (2026-H3 round6)', () => {
-    // 已知未修(2026-H3 round6 review 动态复现,待裁定):atom.fixed/atom.lazy
-    // 通过 IS_ATOM 标记宣称自己是 Atom(isAtom 为 true),却不实现 AtomBase 的
-    // `.raw`——所有「isAtom 检查后读 .raw」的消费点拿到 undefined。
-    // 最直接的消费点是 AtomComputed.replaceData(computed getter 返回 atom 时
-    // 解包 .raw 存快照):computed(() => atom.fixed(42)) 的值是 undefined 而不是
-    // 42(atom.lazy 同形)。裁定方向:给 fixed/lazy 补 raw 访问器,或让它们
-    // 不再通过 isAtom,或把「computed 返回 atom 会解包 raw 快照」的行为整体成文。
-    test.fails('computed getter returning atom.fixed resolves to the fixed value', () => {
+describe('known atom.fixed/atom.lazy interface issues (2026-H3 round6, fixed)', () => {
+    // 2026-H3 round6 动态复现,已修复(裁定 = 补全接口):atom.fixed/atom.lazy
+    // 通过 IS_ATOM 标记宣称自己是 Atom(isAtom 为 true),却曾不实现 AtomBase 的
+    // `.raw`——所有「isAtom 检查后读 .raw」的消费点拿到 undefined,最直接的是
+    // AtomComputed.replaceData 的解包路径:computed(() => atom.fixed(42)) 的值
+    // 是 undefined 而不是 42(atom.lazy 同形)。修复:fixed/lazy 补 raw 访问器
+    // (语义与两种 atom 形态一致:读值不追踪,lazy 经 pauseTracking 隔离)。
+    // 接口契约横扫见 deepReview2026H3Round6.spec.ts 的 R6-4 组。
+    test('computed getter returning atom.fixed resolves to the fixed value', () => {
         const fixed = atom.fixed(42)
         const result = computed(() => fixed)
         try {

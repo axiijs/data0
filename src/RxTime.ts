@@ -1,5 +1,6 @@
 import {Atom, isAtom, atom} from "./atom.js";
 import {autorun} from "./common";
+import {ReactiveEffect} from "./reactiveEffect.js";
 import {assert} from "./util.js";
 
 // CAUTION value 的合法域与 simplifying 的实现严格对齐:add/sub 支持 RxTime 嵌套,
@@ -112,7 +113,12 @@ export class RxTime {
     }
     resolve(compare: (v:number) => boolean): Atom<boolean> {
         const result = atom(false)
-         const stop = autorun(() => {
+        // CAUTION createDetached(2026-H3 round6,R6-2 等价类):resolve 的结果缓存在
+        //  实例(this.data)、清理归实例(disposers/destroy)。内部 autorun 若被创建
+        //  时所在的 autorun/computed 收集为 child,宿主一重算它就被销毁——data 从此
+        //  不再随时间推进,而实例的 disposers 还持着已死引用(半销毁脑裂)。
+        //  生命周期归属实例的内部 effect 必须与创建作用域隔离(同 AsyncRxSlice.fetch)。
+         const stop = ReactiveEffect.createDetached(() => autorun(() => {
              // 立刻计算结果
              const currentTimestamp = Date.now()
              const [coefficient, constant] = this.simplifying()
@@ -140,7 +146,7 @@ export class RxTime {
                  }, timeoutTime)
 
              }
-        },true)
+        },true))
         this.addDisposer(stop)
 
         this.data = result

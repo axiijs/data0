@@ -235,16 +235,39 @@ function trackAtomValue(target: object, primitive = false) {
     notifier.track(target, TrackOpTypes.ATOM, 'value')
 }
 
+// CAUTION fixed/lazy 必须实现 AtomBase 的 `.raw`(2026-H3 round6 R6-4):它们经
+//  IS_ATOM 通过 isAtom,所有「isAtom 后读 .raw」的消费点(AtomComputed.replaceData
+//  的解包、selection 的 currentValues.raw 等)都依赖该契约——缺失时
+//  computed(() => atom.fixed(42)) 会被解包成 undefined(静默错值)。
+//  raw 的语义与两种 atom 形态一致:读值且不建立依赖(lazy 的 getter 可能读
+//  响应式数据,经 pauseTracking 隔离)。
 atom.fixed = function<T>(initValue: T) {
     function getValue() {
         return initValue
     }
     def(getValue, ReactiveFlags.IS_ATOM, true)
+    Object.defineProperty(getValue, 'raw', {
+        configurable: true,
+        enumerable: false,
+        get: () => initValue,
+    })
     return getValue as Atom<T>
 }
 
 atom.lazy = function<T>(getter: () => T) {
     def(getter, ReactiveFlags.IS_ATOM, true)
+    Object.defineProperty(getter, 'raw', {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+            notifier.pauseTracking()
+            try {
+                return getter()
+            } finally {
+                notifier.resetTracking()
+            }
+        },
+    })
     return getter as Atom<T>
 }
 

@@ -2236,8 +2236,13 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
     //  indicator 是 atom（函数），与 Set 用 instanceof 可靠区分。
     const itemToIndicators: Map<any, Atom<boolean> | Set<Atom<boolean>>> = new Map()
 
+    // CAUTION atom 单选分支的判等必须是 SameValueZero(2026-H3 round6 R6-1):
+    //  记账 Map(itemToIndicators)与 RxSet 多选分支天然是 SameValueZero,atom
+    //  分支曾用 ===——NaN item 下「增量置 indicator(Map.get 命中)vs 全量重建
+    //  (=== 不命中)」分叉,autoReset 也回收不了 NaN 选中值。判等门必须覆盖
+    //  同一语义的全部入口(全量重建/增量更新/autoReset 回收,方法 18/19 规则)。
     function createNewIndicator(item:T) {
-        const indicator = atom(isAtom(currentValues) ? currentValues.raw === item : currentValues.data.has(item))
+        const indicator = atom(isAtom(currentValues) ? sameValueZero(currentValues.raw, item) : currentValues.data.has(item))
         const existing = itemToIndicators.get(item)
         if (existing === undefined) {
             itemToIndicators.set(item, indicator)
@@ -2256,7 +2261,9 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         // （includes/Set.has 都是 SameValueZero，与 Map/Set 成员语义一致，NaN 亦可命中。）
         if (survivors ? survivors.has(item) : source.data.includes(item)) return
         if (isAtom(currentValues)) {
-            if (item === currentValues.raw) {
+            // SameValueZero 与 createNewIndicator/记账 Map 对齐(R6-1):===
+            // 会让已删除的 NaN 选中值永不回收(RxSet 分支的 Set.has 可回收)。
+            if (sameValueZero(item, currentValues.raw)) {
                 currentValues(null)
             }
         } else {
