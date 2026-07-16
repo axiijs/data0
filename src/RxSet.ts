@@ -321,8 +321,14 @@ export class RxSet<T> extends Computed {
         })
     }
     forEach(handler: (item: T) => void) {
-        this.data.forEach(handler)
+        // CAUTION track 先于迭代(2026-H3 round8 R8-6,与 RxList/RxMap.forEach 对齐):
+        //  handler 是用户代码,可能抛错——曾 track 在迭代之后,computed 首算中
+        //  handler 抛错时依赖零建立,错误恢复(DIRTY)后源的任何变更都不再触发
+        //  本 computed(restoreEffectDeps 恢复的"上一次成功依赖集"是空集),
+        //  永久静默陈旧;RxList/RxMap 的同名方法 track 在前,同形态可自愈。
+        //  同一 API 的兄弟实现点语义必须一致(R6-1 规则的 forEach 实例)。
         notifier.track(this, TrackOpTypes.ITERATE, ITERATE_KEY)
+        this.data.forEach(handler)
     }
     toList(): RxList<T> {
         const base = this

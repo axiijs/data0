@@ -216,6 +216,28 @@ export function atomRowFactory(): (label: string) => AtomRow {
 export const itemAtomReadingMapFn = (row: AtomRow) => `${row.id}:${row.label()}`
 export const itemAtomReadingModel = (src: AtomRow[]) => src.map(row => `${row.id}:${row.label.raw}`)
 
+// ---- 回调返回值形态维度(2026-H3 round8 R8-1 教训) ----
+// "回调读什么"(上方行形态维度,R4-1 轴)之外的**正交轴**:"回调返回什么"。
+// TS 签名的 boolean 是运行时无人执法的承诺(JS 调用方随便违反),平台
+// Array#filter 的惯例是真值语义;typed 测试天然遵守签名——要表达违约输入必须
+// `as unknown as boolean`,类型纪律越严,测试越系统性地避开无类型调用方的真实
+// 行为。凡「存储回调返回值并以其**类型**驱动控制流」的实现点(filter 行级
+// isFirstRun 曾用 typeof 判首跑)都是本维度的攻击面;findIndex/some/every/once
+// 只以真值判断消费返回值,构造性免疫(round8 已钉扎)。
+// 谓词族按同一逻辑语义(非零/非空为真)给出多种返回值形态,fuzz 并行差分。
+export const truthyPredicateForms = {
+    /** 基线:严格布尔 */
+    boolean: (v: number) => v !== 0,
+    /** 平台惯例:返回 number 本身(0 falsy / 非 0 truthy) */
+    number: (v: number) => v as unknown as boolean,
+    /** 字符串形态:'' falsy / 非空 truthy */
+    string: (v: number) => (v === 0 ? '' : `v${v}`) as unknown as boolean,
+    /** null/对象混合形态:null falsy / 对象 truthy */
+    nullable: (v: number) => (v === 0 ? null : {v}) as unknown as boolean,
+} as const
+/** 全部形态共享的语义模型 */
+export const truthyPredicateModel = (v: number) => v !== 0
+
 // ---- 触发精确度计数器(观察面:谁被重算了几次) ----
 // 2026-H3 round3 教训:全部差分 fuzz 只对比终值,"结果正确但多做了工作"类缺陷
 // (值未变的幽灵触发、无关源的误触发)对值 oracle 天然不可见。本计数器把

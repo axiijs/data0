@@ -71,8 +71,8 @@ export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, 
 
 const queuedRecomputes = new WeakSet<Computed>()
 
-// 一层深的数组拷贝:外层数组换新,数组型元素也换新(元素内的对象引用保留——
-// 值级共享是正常语义)。undefined/非数组字段原样透传。
+// 一层深的数组拷贝:外层数组换新,数组型元素也换新。仅用于内层是**协议容器**
+// 的形状(RxSet.replace 的 [newItems,deletedItems]、RxMap replace/clear 的 entry 对)。
 function copyNestedArray(value: unknown): unknown {
     if (!Array.isArray(value)) return value
     return value.map(item => (Array.isArray(item) ? item.slice() : item))
@@ -84,11 +84,63 @@ function copyNestedArray(value: unknown): unknown {
  * 的观察出口(onChange 的 handler、自定义调度器的 infos 参数)都发独立副本,
  * 改写不会毒化兄弟订阅者;applyPatch 是协议消费者,拿共享引用、契约只读
  * (每次 patch 拷贝会落在真正的热路径上)。
+ *
+ * CAUTION 拷贝深度必须按**协议形状**逐 method 对齐(2026-H3 round8 R8-2/R8-3):
+ *  「一层嵌套」的通用启发式在两个方向上都错——
+ *  1. reorder 的 pair 嵌套两层(argv[0] = Order[],pair 在第二层):一层拷贝下
+ *     handler 改写"自己的副本"里的 pair 会静默毒化全部 patch 消费者(map 派生
+ *     silent 乱序),违反「收到的也是载荷副本,可自由处置」;reorderInfo
+ *     (oldIndexToNewIndex/affectedRange)同为协议容器,同理需独立副本。
+ *  2. splice 的 argv 元素 / methodResult 删除项是**用户值**:无差别 slice
+ *     数组型用户元素会破坏引用身份(RxList<number[]> 的删除项与原行不再同一
+ *     引用),按身份记账的 handler 静默失配。用户值一律保引用透传——handler
+ *     改用户值内容改的是用户自己的数据,不属载荷毒化。
+ *  形状表与 trigger 侧的载荷构造一一对应(consumerContractReplay 钉扎):
+ *    splice        argv=[start,deleteCount,...items(用户值)]  methodResult=删除项(用户值)
+ *    reorder       argv=[Order[]](pair 深拷)                 reorderInfo(协议容器,深拷)
+ *    replace       RxSet: methodResult=[newItems[],deletedItems[]](内层协议容器,一层拷)
+ *                  RxMap: methodResult=entry 对数组(一层拷,k/v 保身份)
+ *    clear(RxMap)  methodResult=entry 对数组(一层拷)
+ *    set(RxMap)    methodResult=[hasValue, oldValue](外层拷,oldValue 保身份)
+ *    delete(RxMap) methodResult=oldValue(用户值本身,不动)
  */
 export function copyTriggerInfoPayload(info: TriggerInfo): TriggerInfo {
     const copy: TriggerInfo = {...info}
-    if (Array.isArray(copy.argv)) copy.argv = copyNestedArray(copy.argv) as any[]
-    if (Array.isArray(copy.methodResult)) copy.methodResult = copyNestedArray(copy.methodResult)
+    if (copy.method === 'reorder') {
+        if (Array.isArray(copy.argv)) {
+            copy.argv = copy.argv.map(item =>
+                Array.isArray(item)
+                    ? item.map(pair => (Array.isArray(pair) ? pair.slice() : pair))
+                    : item
+            ) as any[]
+        }
+        const ri = copy.reorderInfo as
+            | {affectedRange?: [number, number] | null, oldIndexToNewIndex?: Map<number, number>}
+            | undefined
+        if (ri && typeof ri === 'object') {
+            copy.reorderInfo = {
+                ...ri,
+                affectedRange: Array.isArray(ri.affectedRange)
+                    ? [ri.affectedRange[0], ri.affectedRange[1]]
+                    : ri.affectedRange,
+                oldIndexToNewIndex: ri.oldIndexToNewIndex instanceof Map
+                    ? new Map(ri.oldIndexToNewIndex)
+                    : ri.oldIndexToNewIndex,
+            }
+        }
+        return copy
+    }
+    if (Array.isArray(copy.argv)) copy.argv = copy.argv.slice()
+    if (Array.isArray(copy.methodResult)) {
+        if (copy.method === 'replace' || copy.method === 'clear') {
+            copy.methodResult = copyNestedArray(copy.methodResult)
+        } else if (copy.method !== 'delete') {
+            // splice 的删除项 / set 的 [hasValue, oldValue] 等:外层协议数组换新,
+            // 元素(用户值)保引用身份
+            copy.methodResult = (copy.methodResult as unknown[]).slice()
+        }
+        // delete(RxMap)的 methodResult 是用户值本身:保持引用,不动
+    }
     return copy
 }
 
@@ -222,6 +274,8 @@ export class Computed extends ReactiveEffect {
     declare callbacks?: CallbacksType
     declare skipIndicator?: SkipIndicator
     declare preventEffectSession: boolean
+    // async getter 形态提示的每实例去重标记(见 callAsyncGetter);默认值在原型上
+    declare _asyncGetterWarned: boolean
     constructor(
         getter?: GetterType,
         applyPatch?: ApplyPatchType,
@@ -346,7 +400,14 @@ export class Computed extends ReactiveEffect {
     }
     callAsyncGetter(): any {
         const getterContext = this.createGetterContext()
-        warn('async getter can only track reactive data before first await. If you want to track more data, please use generator getter.')
+        // CAUTION 每实例告警一次(2026-H3 round8 R8-9):这不是"每次调用都在犯"的
+        //  误用警告,而是关于 getter **声明形态**的一次性事实提示——曾无条件放在
+        //  每次 full recompute 的路径上,高频重算的 async computed 在 dev 控制台
+        //  刷屏,并淹没真正 actionable 的告警(warn 的信噪比也是观察面)。
+        if (__DEV__ && !this._asyncGetterWarned) {
+            this._asyncGetterWarned = true
+            warn('async getter can only track reactive data before first await. If you want to track more data, please use generator getter.')
+        }
         this.prepareTracking(true)
         this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
         try {
@@ -985,6 +1046,7 @@ export class Computed extends ReactiveEffect {
 Computed.prototype.scheduleNeedsInfos = false
 Computed.prototype._cleanExpected = false
 Computed.prototype.preventEffectSession = false
+Computed.prototype._asyncGetterWarned = false
 
 /**
  * @category Basic

@@ -525,6 +525,31 @@ export class RxList<T> extends Computed {
             warn('mutating a destroyed RxList is a no-op')
             return
         }
+        // CAUTION 公开 reorder 的代数不变量(2026-H3 round8 R8-7,dev 构建校验):
+        //  pairs 必须构成**子集置换**——from/to 各自无重复、集合相等、均为界内
+        //  整数下标。违反时的直写路径静默损坏:越界 to 把列表撑长出洞
+        //  (reorder([[0,5]]) 于长度 3 → 长度 6 + 洞,派生全部跟着出洞)、重复 to
+        //  两行写同一位置(丢一行)、from/to 集不等则有位置被复制/丢失——全部
+        //  不抛错。内部调用方(swap/reposition/sortSelf 自建、patch 再派发)构造
+        //  性合法(swap 的重叠已在入口 assert),经 pairsOwned 跳过;prod 构建
+        //  不校验(契约外输入行为未定义,README「参数契约」已成文)。
+        if (__DEV__ && !pairsOwned) {
+            const froms = new Set<number>()
+            const tos = new Set<number>()
+            for (let i = 0; i < newOrder.length; i++) {
+                const from = newOrder[i][0]
+                const to = newOrder[i][1]
+                assert(Number.isInteger(from) && from >= 0 && from < this.data.length
+                    && Number.isInteger(to) && to >= 0 && to < this.data.length,
+                    'reorder pair out of range')
+                assert(!froms.has(from) && !tos.has(to), 'reorder pairs must not duplicate positions')
+                froms.add(from)
+                tos.add(to)
+            }
+            for (const from of froms) {
+                assert(tos.has(from), 'reorder pairs must form a (subset) permutation: from/to position sets must match')
+            }
+        }
         const originIndexes = newOrder.map(item => item[0])
         const newIndexes = newOrder.map(item => item[1])
         const oldIndexAtoms = this.atomIndexes ? originIndexes.map(index => this.atomIndexes![index]) : null
@@ -548,8 +573,11 @@ export class RxList<T> extends Computed {
         //  下内层 pair 仍与调用方共享,batch/async patch 等延迟消费窗口里调用方复用/
         //  改写 pair(对象池、原地更新)会静默毒化全部 patch 消费者(map 派生 silent
         //  乱序)。README「reorder 传入的 order 数组调用后仍归调用方」授予的自由必须
-        //  覆盖 pair 一层;onChange 出口的 copyTriggerInfoPayload 早已按"外层 + 一层
-        //  嵌套"拷贝,trigger 侧与其对齐。pairsOwned(内部自建/上游已拷)跳过。
+        //  覆盖 pair 一层;观察出口的 copyTriggerInfoPayload 按协议形状同样深拷到
+        //  pair 一层(R8-2 修正:R7-1 曾在此声称观察出口"早已对齐",实际其一层拷贝
+        //  停在 Order[] 数组、pair 共享——注释里的对齐声明从未被行为测试验证过,
+        //  handler 改写自己副本里的 pair 曾静默毒化兄弟订阅者)。
+        //  pairsOwned(内部自建/上游已拷)跳过。
         let orderPayload: Order[]
         if (pairsOwned) {
             orderPayload = newOrder
@@ -604,6 +632,12 @@ export class RxList<T> extends Computed {
     swap(start: number, newStart:number, limit:number = 1) {
         assert(start >= 0 && limit > 0 && start+limit <= this.data.length, 'start index out of range')
         assert(newStart >= 0 && newStart+limit <= this.data.length, 'newStart index out of range')
+        // CAUTION 重叠区间守卫(2026-H3 round8 R8-7):swap 对重叠区间的语义自相
+        //  矛盾(同一目标位被写两次),曾静默执行——生成的 pair 双向复制重叠段,
+        //  元素**多重集都不保持**(swap(0,1,2) 于 [a,b,c] 得 [b,c,b]:a 永久丢失、
+        //  b 复制两份),silent 数据损坏。既有断言只查越界不查重叠,守卫域窄于
+        //  语义前置条件。start === newStart 的自交换是无害 no-op,放行。
+        assert(start === newStart || Math.abs(newStart - start) >= limit, 'swap ranges must not overlap')
         const newOrder:Order[] = []
         for (let i = 0; i < limit; i++) {
             newOrder.push([start + i, newStart + i])
@@ -907,7 +941,7 @@ export class RxList<T> extends Computed {
             return source.ensureAtomIndex(index)
         }
 
-        function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined): [U, ReactiveEffect[]] {
+        function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined, slot?: MapCleanupSlot): [U, ReactiveEffect[]] {
             const probe = itemProbe ?? (itemProbe = ReactiveEffect.createDetached(() => new MapItemDependencyProbe()))
             const value = probe.probe(() => mapFn(item, useIndex || addedAtomIndexesDep ? indexAtomFor(index) : source.atomIndexes?.[index]!, mapContext!)) as U
             if (!probe.hasCaptures()) return [value, EMPTY_ITEM_FRAME]
@@ -922,6 +956,20 @@ export class RxList<T> extends Computed {
                 }
                 newItemIndex = indexAtomFor(index)
             }
+            // CAUTION 行级重算前先执行上一轮注册的 cleanup(2026-H3 round8 R8-5):
+            //  context.onCleanup 在 Computed 侧的语义是"每轮重算前执行一次"
+            //  (prepareRecompute),行级 mapFn 重跑同样是一次重算——旧实现只覆盖
+            //  slot.fn(新注册静默顶掉旧注册),mapFn 每轮分配的资源(事件监听、
+            //  订阅)随重跑逐轮泄漏,只有最后一轮的 cleanup 在行删除时执行。
+            //  同名 API 的兄弟实现点语义必须一致(R6-1 规则的 onCleanup 实例)。
+            //  与 prepareRecompute 同款"先复位再调用":cleanup 只执行一次。
+            const runRowCleanup = slot === undefined ? undefined : () => {
+                const fn = slot.fn
+                if (fn) {
+                    slot.fn = undefined
+                    fn()
+                }
+            }
             const rowComputed: Computed = new Computed(() => {
                 // CAUTION 特别注意这里面的变量，我们只希望 track 用户 mapFn 里面用到的外部 reactive 对象，不希望 track 到自己的 key/index。
                 if (newItemIndex) {
@@ -934,17 +982,19 @@ export class RxList<T> extends Computed {
                         (list._triggerInfos !== undefined && list._triggerInfos.length > 0) ||
                         (list._inSession && list._sessionInfos !== undefined && list._sessionInfos.length > 0)
                     if (!hasPendingStructuralInfos) {
+                        runRowCleanup?.()
                         list.set(finalIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
                     } else {
                         // 行是否仍存活：终态 atomIndexes 里该位置的 atom 必须是自己
                         // （身份比较）。不是自己说明本行已被待重放的结构操作移除，
-                        // 不能再用它的 item 运行 mapFn。
+                        // 不能再用它的 item 运行 mapFn（其 cleanup 由结构重放的删除路径执行）。
                         if (source.atomIndexes?.[finalIndex] !== newItemIndex) return
                         // 按行 effect frame 的身份定位行的当前（pre-patch）位置：
                         // 新值写在旧位置上，随后的结构重放会把它随行搬到终态位置。
                         const frames = list._effectFramesArray
                         const currentIndex = frames ? frames.findIndex(frame => frame !== undefined && frame.indexOf(rowComputed) !== -1) : -1
                         if (currentIndex !== -1) {
+                            runRowCleanup?.()
                             list.set(currentIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
                         }
                     }
@@ -1001,7 +1051,7 @@ export class RxList<T> extends Computed {
                         // 不为对齐 splice 索引的占位再逐行分配空数组
                         this.effectFramesArray![i] = EMPTY_ITEM_FRAME
                     } else {
-                        const [value, frame] = runItemAndCollectEffect(this, sourceData[i], i, mapContext)
+                        const [value, frame] = runItemAndCollectEffect(this, sourceData[i], i, mapContext, useContext ? cleanupSlots![i] : undefined)
                         result[i] = value
                         this.effectFramesArray![i] = frame
                     }
@@ -1057,7 +1107,7 @@ export class RxList<T> extends Computed {
                                 newItem = mapFn(newItemsInArg, useIndex || addedAtomIndexesDep ? indexAtomFor(newIndex) : source.atomIndexes?.[newIndex]!, mapContext!)
                                 effectFrames![index] = EMPTY_ITEM_FRAME
                             } else {
-                                const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext)
+                                const [value, frame] = runItemAndCollectEffect(this, newItemsInArg, newIndex, mapContext, useContext ? newSlots[index] : undefined)
                                 newItem = value
                                 effectFrames![index] = frame
                             }
@@ -1132,6 +1182,7 @@ export class RxList<T> extends Computed {
                             triggerInfo.newValue as T,
                             index,
                             mapContext,
+                            useContext ? cleanupSlots![index] : undefined,
                         )
                         this.set(index, newItem)
                         this.effectFramesArray![index]?.forEach((effect) => {
@@ -1491,7 +1542,14 @@ export class RxList<T> extends Computed {
         //  (2026-H3 round3 形态操作 fuzz 的错误注入探针动态命中。)
         mapList = this.map((item) => {
             return computed(({lastValue} ) => {
-                const matched = filterFn(item)
+                // CAUTION 谓词返回值必须在此处布尔化(2026-H3 round8 R8-1):下方
+                //  isFirstRun 用「raw 是否 boolean」区分首跑与重跑,truthy 非布尔
+                //  返回值(`filter(it => it.count())`,平台 Array#filter 惯用形态)
+                //  会让每次行级重跑都被误判为首跑——truthy→truthy 重复插行、
+                //  truthy→falsy 永不移除、falsy→truthy 插错位置,三形态全部
+                //  静默分叉。TS 签名的 boolean 是无人执法的承诺(JS 调用方随便
+                //  违反),归一化必须发生在运行时的存储点。
+                const matched = !!filterFn(item)
                 // AtomComputed 初始值为 null：首次运行时 raw 还不是 boolean
                 const isFirstRun = typeof lastValue.raw !== 'boolean'
                 if (isFirstRun) {
@@ -1870,6 +1928,11 @@ export class RxList<T> extends Computed {
                         // set(i, null/undefined)：全量语义跳过该行，无新 entry
                         if (newValue != null) {
                             const newKey = typeof inputIndexKey === 'function' ? inputIndexKey(newValue as T) : (newValue as NonNullable<T>)[inputIndexKey]
+                            // CAUTION 守卫对称性(2026-H3 round8 R8-4):全量 computation 与
+                            //  splice 插入侧都 assert 重复 key,EKC 插入侧曾缺——set() 撞已有
+                            //  key 静默覆盖 entry,派生 Map 与全量重算永久分叉(全量侧会抛)。
+                            //  凡全量侧 assert 的关系不变量,patch 每个插入入口必须同 assert。
+                            assert(!this.data.has(newKey), 'indexBy key is already exist')
                             this.set(newKey, newValue as T)
                         }
                     }
@@ -1918,6 +1981,9 @@ export class RxList<T> extends Computed {
                             //  插入侧直接解构时 push(undefined) 当场 TypeError 抛给变更
                             //  调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
                             if (entry === undefined) return
+                            // 守卫对称性(R8-4,与 indexBy 同族):全量侧 assert 重复 key,
+                            // 插入入口曾静默覆盖(entry 撞 key 后派生 Map 与全量分叉)
+                            assert(!this.data.has(entry[0]), 'toMap key is already exist')
                             this.set(entry[0], entry[1])
                         })
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
@@ -1930,6 +1996,8 @@ export class RxList<T> extends Computed {
                         // set(i, undefined)：全量语义跳过该行，无新 entry
                         if (newValue !== undefined) {
                             const [newKey, newItem] = newValue as [any, any]
+                            // 守卫对称性(R8-4):EKC 插入入口与全量/splice 侧同 assert
+                            assert(!this.data.has(newKey), 'toMap key is already exist')
                             this.set(newKey, newItem)
                         }
                     }
