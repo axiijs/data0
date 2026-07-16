@@ -558,9 +558,58 @@ describe('repository and release evidence', () => {
         expect(mismatches).toEqual([])
     })
 
+    test('package manifest wires dual dev/prod builds and require-condition types', () => {
+        // 2026-H3 round6 工程面契约:dev 构建经 `development` 条件触达消费者的
+        // 开发模式(纯度探测/销毁警告/不变量断言),无条件解析仍拿 prod;
+        // require 条件必须有 .d.cts(node16 解析下 ESM 形状的 d.ts 会被判伪装)。
+        const packageJson = JSON.parse(readFileSync(resolve('package.json'), 'utf8'))
+        const root = packageJson.exports['.']
+        expect(root.import.development).toBe('./dist/data0.dev.js')
+        expect(root.import.default).toBe('./dist/data0.js')
+        expect(root.require.development).toBe('./dist/data0.dev.umd.cjs')
+        expect(root.require.default).toBe('./dist/data0.umd.cjs')
+        expect(root.import.types).toBe('./dist/index.d.ts')
+        expect(root.require.types).toBe('./dist/index.d.cts')
+        // 旧字段对齐:main 供无 exports 支持的 CJS 解析(必须是 cjs 而不是 ESM),
+        // module 供老打包器;build 脚本必须同时产出双构建与 .d.cts。
+        expect(packageJson.main).toBe('dist/data0.umd.cjs')
+        expect(packageJson.module).toBe('dist/data0.js')
+        expect(packageJson.scripts.build).toContain('--mode dev')
+        expect(packageJson.scripts.build).toContain('postbuild')
+    })
+
     if (process.platform === 'win32') {
-        test.skip('release version argument cannot execute a second shell command', () => {})
+        test.skip('release pushes version tags to the remote', () => {})
     } else {
+        test('release pushes version tags to the remote', () => {
+            // 2026-H3 round6 工程面静态确认的缺陷:裸 `git push` 不推 tags,
+            // v2.10.0-v2.12.0 三个已发布版本远端无对应 tag。现在 release 脚本
+            // 必须 --follow-tags(annotated)+ --tags(lightweight 兜底)。
+            const sandbox = mkdtempSync(join(tmpdir(), 'data0-release-tags-'))
+            const fakeBin = join(sandbox, 'bin')
+            const gitLog = join(sandbox, 'git-args.log')
+            mkdirSync(fakeBin)
+            // fake git 把参数记录进日志(stdout 保持干净,git status 的 isClean 判定依赖空输出)
+            writeFileSync(join(fakeBin, 'git'), `#!/bin/sh\necho "$@" >> ${JSON.stringify(gitLog)}\nexit 0\n`)
+            chmodSync(join(fakeBin, 'git'), 0o755)
+            writeFileSync(join(fakeBin, 'pnpm'), '#!/bin/sh\nexit 0\n')
+            chmodSync(join(fakeBin, 'pnpm'), 0o755)
+            try {
+                const result = spawnSync(process.execPath, [resolve('scripts/release.js'), '9.9.9'], {
+                    cwd: sandbox,
+                    env: {...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`},
+                    encoding: 'utf8',
+                    timeout: 5_000,
+                })
+                expect(result.status).toBe(0)
+                const calls = readFileSync(gitLog, 'utf8')
+                expect(calls).toContain('push --follow-tags')
+                expect(calls).toContain('push --tags')
+            } finally {
+                rmSync(sandbox, {recursive: true, force: true})
+            }
+        })
+
         test('release version argument cannot execute a second shell command', () => {
             const sandbox = mkdtempSync(join(tmpdir(), 'data0-release-repro-'))
             const fakeBin = join(sandbox, 'bin')
