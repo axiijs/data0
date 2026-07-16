@@ -562,6 +562,13 @@ describe('R8-7 swap 重叠 assert 与公开 reorder 校验', () => {
         // 数据未被触碰(assert 在任何写入之前)
         expect(list.data).toEqual(['a', 'b', 'c'])
         list.destroy()
+
+        // 非零起点的重叠(mutation 盲区补杀:|newStart − start| 变异成 |newStart + start|
+        // 后 1+2=3 ≥ 2 会放行本形态,silent 丢数据)
+        const list2 = new RxList(['a', 'b', 'c', 'd'])
+        expect(() => list2.swap(1, 2, 2)).toThrow('swap ranges must not overlap')
+        expect(list2.data).toEqual(['a', 'b', 'c', 'd'])
+        list2.destroy()
     })
 
     test('swap 合法形态不受影响:相邻/远距/自交换(no-op)', () => {
@@ -586,6 +593,24 @@ describe('R8-7 swap 重叠 assert 与公开 reorder 校验', () => {
         expect(() => list.reorder([[0, 1]])).toThrow('from/to position sets must match')
         list.destroy(); list = make()
         expect(() => list.reorder([[0.5, 1] as any])).toThrow('reorder pair out of range')
+        list.destroy()
+    })
+
+    test('公开 reorder 校验的边界子句精确性(mutation 盲区补杀)', () => {
+        if (!__DEV__) return
+        // 每个用例只违反**一个**边界子句,且按消息精确断言:单子句被变异
+        // (>=0 删除 / < 变 <=)后违规会漏到"position sets must match"兄弟断言,
+        // 消息不同,本测试当场变红——单纯 toThrow() 杀不死这些子句变异。
+        const make = () => new RxList(['a', 'b', 'c'])
+        let list = make()
+        expect(() => list.reorder([[-1, 0]])).toThrow('reorder pair out of range')   // from >= 0
+        list.destroy(); list = make()
+        expect(() => list.reorder([[0, -1]])).toThrow('reorder pair out of range')   // to >= 0
+        list.destroy(); list = make()
+        expect(() => list.reorder([[3, 0]])).toThrow('reorder pair out of range')    // from < length(=3)
+        list.destroy(); list = make()
+        expect(() => list.reorder([[0, 3]])).toThrow('reorder pair out of range')    // to < length(=3)
+        expect(list.data.length).toBe(3) // 越界 to 未直写撑长列表
         list.destroy()
     })
 
