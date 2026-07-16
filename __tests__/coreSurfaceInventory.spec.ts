@@ -130,6 +130,19 @@ export const CORE_INVENTORY: Record<string, Row> = {
         'NA:同步 digest',
         'invariantAssertions.spec.ts(栈深复原/静止态断言)',
         'NA:无调度'),
+    // 生命周期钩子是独立的错误注入表面(2026-H3 round7 R7-3 教训):onRecompute/
+    // onCleanup/context.onCleanup 清理与 dirty/clean 监听者同样是库在重算周期内
+    // 同步调用的用户代码,但此前按"观察设施"归类、从未进入注入表面的行集合——
+    // 钩子窗口位于 setStatus(RECOMPUTING)/inPatch=true 之后,抛错曾永久卡死状态机
+    // (同步:误导性断言;async patch:静默冻结)。注入用例必须附 recovery probe
+    // (再触发一次并断言自愈)——冻结类缺陷在抛错当步不可见。
+    'computed.lifecycleHooks(onRecompute/onCleanup/context.onCleanup/dirty/clean)': row(
+        'computed.spec.ts(callbacks/onCleanup 语义)+coverage.spec.ts',
+        'deepReview2026H3Round7.spec.ts(R7-3 全形态横扫:sync full/sync patch/async getter/async patch × 钩子抛错→自愈)',
+        'destroySemantics.spec.ts(onDestroy 派发)+verifiedReviewFixes.spec.ts(F4)',
+        'NA:钩子同步执行,交错由宿主计算形态承载',
+        'deepReview2026H3Round7.spec.ts(dirty 监听者抛错×标脏先行)',
+        'deepReview2026H3Round7.spec.ts(async 调度路径钩子抛错 console 兜底后自愈)'),
     'reactiveEffect.children': row(
         'computed.spec.ts(inner destroy/惰性集合)+common.spec.ts(uncontrolled child)',
         'reduceOperator.spec.ts+rxList.spec.ts(行级 effect 回收,间接)',

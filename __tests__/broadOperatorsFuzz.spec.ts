@@ -107,6 +107,7 @@ describe('broad fuzz: unique values, all operators', () => {
                     expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    // Oracle 弱化注明(§3.3):RxSet 是内容语义,迭代序不属承诺面(README 矩阵脚注)
                     expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
                     expectGroupByEqualsModel(grouped, src, x => x % 3, ctx)
                     expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x % 5 === 0))
@@ -276,7 +277,9 @@ describe('broad fuzz: RxSet operations and RxMap derivations', () => {
                     expect(sortNum([...inter.data]), ctx).toEqual(sortNum(A.filter(x => B.includes(x))))
                     expect(sortNum([...sym.data]), ctx).toEqual(sortNum([...A.filter(x => !B.includes(x)), ...B.filter(x => !A.includes(x))]))
                     expect(sortNum([...uni.data]), ctx).toEqual(sortNum([...new Set([...A, ...B])]))
-                    expect(sortNum([...asList.data]), `toList ${ctx}`).toEqual(sortNum(A))
+                    // toList 是有序 RxList:断言含序(≡ Set 迭代序;replace 重排经
+                    // 全量回退对齐,R7-2)。RxSet 本身按内容比较(排序)——Set 语义无序。
+                    expect([...asList.data], `toList ${ctx}`).toEqual(A)
                 }
             } finally {
                 diff.destroy(); inter.destroy(); sym.destroy(); uni.destroy()

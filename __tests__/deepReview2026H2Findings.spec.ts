@@ -376,6 +376,7 @@ describe('resident sweep: undefined 合法元素值域 × 核心派生算子差�
                     expect(filtered.data, `filter ${ctx}`).toEqual(src.filter(x => x !== undefined && x % 2 === 0))
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 3))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    // Oracle 弱化注明(§3.3):RxSet 是内容语义,迭代序不属承诺面(README 矩阵脚注)
                     expect([...asSet.data].sort(), `toSet ${ctx}`).toEqual([...new Set(src)].sort())
                     for (const [k, g] of grouped.data) {
                         expect(g.data, `group[${k}] ${ctx}`).toEqual(src.filter(x => (x === undefined ? 'u' : x % 2) === k))

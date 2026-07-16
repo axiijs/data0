@@ -333,7 +333,7 @@ export class RxSet<T> extends Computed {
                 return [...base.data]
             },
             function applyPatch(this: RxList<T>, data:any, triggerInfos: TriggerInfo[]) {
-                triggerInfos.forEach(({methodResult, method, argv, newValue, source, result}) => {
+                for (const {method, argv} of triggerInfos) {
                     let newItems: T[] = []
                     let deletedItems: T[] = []
                     if (method === 'add')  {
@@ -341,8 +341,15 @@ export class RxSet<T> extends Computed {
                     } else if (method === 'delete') {
                         deletedItems = [argv![0]]
                     } else {
-                        // 只支持 replace method
-                        [newItems, deletedItems] = methodResult as [T[], T[]]
+                        // CAUTION replace 回退全量重算(2026-H3 round7 R7-2):replace 采纳的
+                        //  新 Set 决定**全部成员的迭代序**(含存活成员的相对顺序),按
+                        //  [newItems, deletedItems] 增量维护只能改成员不能改序——toList 是
+                        //  有序 RxList,增量结果与全量重算([...set.data])的顺序分叉,错误
+                        //  恢复/force recompute 的重建会让同一集合状态呈现不同行序
+                        //  (「增量 ≡ 全量重算」不变量含顺序)。RxMap.keys × replace 的
+                        //  先例即回退(兄弟实现点一致性);add/delete 与 Set 插入序天然
+                        //  对齐,保持增量。
+                        return false
                     }
 
                     newItems.forEach(x => {
@@ -355,7 +362,7 @@ export class RxSet<T> extends Computed {
                         const index = this.data.findIndex(item => item === x || (item !== item && x !== x))
                         if (index !== -1) this.splice(index, 1)
                     })
-                })
+                }
             }
         )
     }
@@ -366,7 +373,8 @@ export class RxSet<T> extends Computed {
     // CAUTION size 惰性创建（createDetached 说明见 RxMap 的同名注释）
     declare _size?: Atom<number>
     get size(): Atom<number> {
-        return this._size ?? (this._size = ReactiveEffect.createDetached(() => {
+        if (this._size) return this._size
+        this._size = ReactiveEffect.createDetached(() => {
             const source = this
             return computed(
                 function computation(this: Computed) {
@@ -377,7 +385,10 @@ export class RxSet<T> extends Computed {
                     data(source.data.size)
                 }
             )
-        }))
+        })
+        // 已销毁结构的 meta 首读:快照值保留,立即随葬(等价类说明见 RxList.length)
+        if (!this.active) destroyComputed(this._size)
+        return this._size
     }
     /**
      * @internal

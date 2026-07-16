@@ -515,7 +515,12 @@ export class RxList<T> extends Computed {
         if (this.atomIndexes.length <= index) this.atomIndexes.length = index + 1
         return this.atomIndexes[index] ?? (this.atomIndexes[index] = atom(index))
     }
-    reorder(newOrder: Order[], reorderInfo = createReorderPatchInfo('reorder', newOrder)) {
+    // CAUTION pairsOwned(@internal):newOrder 中的 Order 对是否已归 data0 所有。
+    //  公开调用(默认 false)采纳的是**调用方的 pair 对象**,协议载荷必须深拷一层
+    //  (R7-1);内部调用方(swap/reposition/sortSelf 自建 pair、map/selection patch
+    //  再派发上游已拷贝的 argv[0])的 pair 本就 data0 所有,跳过拷贝——swap 是
+    //  reorder 最热形态,每次白付 O(pairs) 分配实测 +21%(干净进程 ABBA)。
+    reorder(newOrder: Order[], reorderInfo = createReorderPatchInfo('reorder', newOrder), pairsOwned = false) {
         if (!this.active) {
             warn('mutating a destroyed RxList is a no-op')
             return
@@ -538,9 +543,27 @@ export class RxList<T> extends Computed {
             }
         })
 
-        // argv[0] 持 newOrder 的浅副本(所有权契约,见 toProtocolPayload):调用方
-        // 传入的 order 数组仍归调用方,延迟消费窗口里改写它不再毒化 patch 消费者。
-        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [toProtocolPayload(newOrder)], reorderInfo })
+        // CAUTION argv[0] 必须深拷到 Order 对一层(2026-H3 round7 R7-1):Order 对
+        //  本身是协议载荷的语义内容(位置),不是不透明的用户值——外层 slice 浅副本
+        //  下内层 pair 仍与调用方共享,batch/async patch 等延迟消费窗口里调用方复用/
+        //  改写 pair(对象池、原地更新)会静默毒化全部 patch 消费者(map 派生 silent
+        //  乱序)。README「reorder 传入的 order 数组调用后仍归调用方」授予的自由必须
+        //  覆盖 pair 一层;onChange 出口的 copyTriggerInfoPayload 早已按"外层 + 一层
+        //  嵌套"拷贝,trigger 侧与其对齐。pairsOwned(内部自建/上游已拷)跳过。
+        let orderPayload: Order[]
+        if (pairsOwned) {
+            orderPayload = newOrder
+        } else if (newOrder.length === 0) {
+            orderPayload = toProtocolPayload(newOrder)
+        } else {
+            // 下标循环而不是 map + 参数解构:数组参数解构走迭代器协议,热路径白付
+            orderPayload = new Array(newOrder.length)
+            for (let i = 0; i < newOrder.length; i++) {
+                const pair = newOrder[i]
+                orderPayload[i] = [pair[0], pair[1]]
+            }
+        }
+        this.trigger(this, TriggerOpTypes.METHOD, { method:'reorder', key: ITERATE_KEY, argv: [orderPayload], reorderInfo })
         // CAUTION 结构 info 必须先于 index atom 的值写入对订阅者可见：否则非 batch 下
         //  原子写同步执行 map 的行级 Computed，其 hasPendingStructuralInfos 守卫看不到
         //  pending 结构 info，按终态位置直写派生列表，随后 reorder patch 又搬移一次
@@ -575,7 +598,8 @@ export class RxList<T> extends Computed {
                 newOrder.push([i, i - limit])
             }
         }
-        return this.reorder(newOrder, createReorderPatchInfo('move', newOrder, { start, newStart, limit }))
+        // pairsOwned:pair 由本方法自建,未暴露给调用方
+        return this.reorder(newOrder, createReorderPatchInfo('move', newOrder, { start, newStart, limit }), true)
     }
     swap(start: number, newStart:number, limit:number = 1) {
         assert(start >= 0 && limit > 0 && start+limit <= this.data.length, 'start index out of range')
@@ -585,7 +609,8 @@ export class RxList<T> extends Computed {
             newOrder.push([start + i, newStart + i])
             newOrder.push([newStart + i, start + i])
         }
-        return this.reorder(newOrder, createReorderPatchInfo('swap', newOrder, { start, newStart, limit }))
+        // pairsOwned:pair 由本方法自建,未暴露给调用方
+        return this.reorder(newOrder, createReorderPatchInfo('swap', newOrder, { start, newStart, limit }), true)
     }
     sortSelf(compare: (a: T, b:T)=> number) {
         const sortedOldIndexes = new Array<number>(this.data.length)
@@ -598,7 +623,8 @@ export class RxList<T> extends Computed {
         for (let newIndex = 0; newIndex < sortedOldIndexes.length; newIndex++) {
             newOrder[newIndex] = [sortedOldIndexes[newIndex]!, newIndex]
         }
-        return this.reorder(newOrder, createReorderPatchInfo('sort', newOrder))
+        // pairsOwned:pair 由本方法自建,未暴露给调用方
+        return this.reorder(newOrder, createReorderPatchInfo('sort', newOrder), true)
     }
     private static binarySearchInsert<S>(arr: S[], item: S, compare: (a: S, b: S) => number): number {
         // A simple binary search to find the insertion index
@@ -1074,7 +1100,8 @@ export class RxList<T> extends Computed {
                             this.effectFramesArray![newIndex] = movedFrames[index]
                             if (cleanupSlots) cleanupSlots[newIndex] = movedSlots![index]
                         })
-                        this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined)
+                        // pairsOwned:argv[0] 的 pair 在源头 trigger 已深拷,协议消费者只读
+                        this.reorder(order, triggerInfo.reorderInfo as ReorderPatchInfo | undefined, true)
                     } else {
                         // explicit key change
                         // CAUTION 非稠密 key（负/小数）的 set 是数组属性赋值,不触及任何
@@ -1950,9 +1977,10 @@ export class RxList<T> extends Computed {
     //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
     declare _length?: Atom<number>
     get length(): Atom<number> {
-        return this._length ?? (this._length = ReactiveEffect.createDetached(() => {
+        if (this._length) return this._length
+        const length = ReactiveEffect.createDetached(() => {
             const source = this
-            const length = computed(
+            const created = computed(
                 function computation(this: Computed) {
                     this.manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
                     return source.data!.length
@@ -1961,9 +1989,16 @@ export class RxList<T> extends Computed {
                     data(source.data.length)
                 }
             )
-            setComputedRetainedDiagnosticSource(length, 'RxList.length')
-            return length
-        }))
+            setComputedRetainedDiagnosticSource(created, 'RxList.length')
+            return created
+        })
+        this._length = length
+        // CAUTION 已销毁结构的 meta 首读（2026-H3 round7）：destroyResources 只能清理
+        //  当时已存在的 meta，销毁后首读会重建一个**活的** computed 订阅已销毁的
+        //  source——值是正确快照（销毁后变更皆 no-op），但 effect 常驻泄漏且逃过
+        //  一切销毁路径。创建后立即随葬：快照值保留（destroy 不清 data），零残留订阅。
+        if (!this.active) destroyComputed(length)
+        return length
     }
 
     // indexKeyDeps 的退订清扫：Notifier 不会在 effect 退订时回调 RxList，
