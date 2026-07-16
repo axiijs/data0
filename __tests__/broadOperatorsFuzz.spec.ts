@@ -107,6 +107,7 @@ describe('broad fuzz: unique values, all operators', () => {
                     expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    // Oracle 弱化注明(§3.3):RxSet 是内容语义,迭代序不属承诺面(README 矩阵脚注)
                     expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
                     expectGroupByEqualsModel(grouped, src, x => x % 3, ctx)
                     expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x % 5 === 0))

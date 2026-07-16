@@ -14,7 +14,7 @@ import {RxList} from '../src/RxList.js'
  * source.data 全量重算。这正是 A1/A2 划出的"仍属缺陷"边界（batch 结束后必须
  * 与全量重算一致）。
  */
-import {adversarialSpliceDeleteCount, adversarialSpliceStart, mulberry32} from './fuzzKit.js'
+import {adversarialSpliceDeleteCount, adversarialSpliceStart, clobberCallerOwnedArray, mulberry32} from './fuzzKit.js'
 import {expectGroupByEqualsModel} from './stateOracle.js'
 
 describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', () => {
@@ -48,7 +48,10 @@ describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', 
                     const deleteCount = adversarialSpliceDeleteCount(rand, dataLen)
                     const items = Array.from({length: Math.floor(rand() * 3)}, () => counter++)
                     history.push(`splice(${start},${deleteCount},[${items}])`)
-                    source.splice(start, deleteCount, ...items)
+                    const removed = source.splice(start, deleteCount, ...items)
+                    // 敌意调用方维度(R7-1 等价类):README 授予"返回数组归调用方",
+                    // 在 batch 的延迟消费窗口内行使——毒化会表现为派生分叉
+                    if (rand() < 0.5) clobberCallerOwnedArray(removed)
                 } else if (r < 0.5 && dataLen > 0) {
                     const index = Math.floor(rand() * dataLen)
                     const value = counter++
@@ -57,7 +60,18 @@ describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', 
                 } else if (r < 0.6) {
                     history.push('sortSelf')
                     source.sortSelf((a, b) => a - b)
-                } else if (r < 0.68 && dataLen >= 2) {
+                } else if (r < 0.64 && dataLen >= 2) {
+                    // 公开 reorder(调用方持有 order 数组)+ 调用后深改写 Order 对:
+                    // "order 数组连同其中的 [from,to] 对调用后仍归调用方"(README,
+                    // R7-1 等价类;pair 一层的共享曾在 batch 窗口下毒化 map 派生)
+                    const i = Math.floor(rand() * dataLen)
+                    let j = Math.floor(rand() * dataLen)
+                    if (j === i) j = (j + 1) % dataLen
+                    const order: [number, number][] = [[i, j], [j, i]]
+                    history.push(`reorder([[${i},${j}],[${j},${i}]])+clobber`)
+                    source.reorder(order)
+                    clobberCallerOwnedArray(order)
+                } else if (r < 0.7 && dataLen >= 2) {
                     const limit = 1
                     const start = Math.floor(rand() * dataLen)
                     const newStart = Math.floor(rand() * dataLen)
@@ -103,6 +117,8 @@ describe('batch replay fuzz: 多操作 batch 后派生结构 ≡ 全量重算', 
                     expect(sorted.data, `toSorted ${ctx}`).toEqual(src.slice().sort((a, b) => a - b))
                     expect(sliced.data, `slice ${ctx}`).toEqual(src.slice(1, 4))
                     expect(concated.data, `concat ${ctx}`).toEqual([...src, ...other.data])
+                    // Oracle 弱化注明(§3.3):RxSet 是内容语义,迭代序不属承诺面(README 矩阵脚注);
+                    // 序可观察的是 toList(有序 RxList),其含序断言见 broadOperatorsFuzz/round7
                     expect([...asSet.data].sort((a, b) => a - b), `toSet ${ctx}`).toEqual([...new Set(src)].sort((a, b) => a - b))
                     expectGroupByEqualsModel(grouped, src, x => x % 3, ctx)
                     expect(found.raw, `findIndex ${ctx}`).toBe(src.findIndex(x => x % 5 === 0))

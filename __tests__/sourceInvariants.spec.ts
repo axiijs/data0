@@ -113,3 +113,81 @@ describe('源码不变量：spread 进函数调用必须有界', () => {
         expect(violations[1]).toContain('unbounded')
     })
 })
+
+/**
+ * R7-3 等价类的静态执法（「不变量升格」登记项,2026-H3 round7）:
+ * 重算生命周期内一切用户代码窗口必须处于统一错误恢复(handleRecomputeError)
+ * 的覆盖之内。prepareRecompute() 是钩子窗口的唯一汇聚点(onRecompute/onCleanup
+ * 回调、context.onCleanup 清理都在里面执行),且位于 setStatus(RECOMPUTING)/
+ * inPatch=true 之后——裸调用时钩子抛错会把状态机永久卡死(同步:每次写入抛
+ * 误导性断言;async patch:静默冻结)。本审计强制:computed.ts 中每个
+ * `this.prepareRecompute()` 调用点的前一行非空实代码必须是 `try {`(即调用
+ * 被 try/catch 包裹,catch 内走 handleRecomputeError——行为面由
+ * deepReview2026H3Round7 的全形态横扫执法,这里执法结构形状,防未来新增
+ * 调用点绕过保护)。
+ */
+function findUnguardedPrepareRecompute(content: string): string[] {
+    const lines = content.split('\n')
+    const violations: string[] = []
+    lines.forEach((line, i) => {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('//') || trimmed.startsWith('*')) return
+        if (!trimmed.includes('this.prepareRecompute()')) return
+        // 定义处(prepareRecompute() {)不是调用点
+        if (/prepareRecompute\(\)\s*\{/.test(trimmed)) return
+        // 向上找前一行非空、非注释的实代码
+        let j = i - 1
+        while (j >= 0) {
+            const prev = lines[j].trim()
+            if (prev !== '' && !prev.startsWith('//') && !prev.startsWith('*') && !prev.startsWith('/*')) break
+            j--
+        }
+        const prevCode = j >= 0 ? lines[j].trim() : ''
+        if (prevCode !== 'try {') {
+            violations.push(`computed.ts:${i + 1}: prepareRecompute() 调用未被 try 直接包裹: ${trimmed}`)
+        }
+    })
+    return violations
+}
+
+describe('源码不变量：用户钩子窗口必须在错误恢复保护内(R7-3)', () => {
+    test('computed.ts 中每个 prepareRecompute() 调用点必须被 try 直接包裹', () => {
+        const computedSrc = srcFiles().find(f => f.name === 'computed.ts')!
+        const violations = findUnguardedPrepareRecompute(computedSrc.content)
+        expect(
+            violations,
+            `以下 prepareRecompute() 调用点缺少错误恢复保护(钩子抛错会永久卡死状态机,` +
+            `处置见 fullRecompute/patchRecompute 的同名 try/catch):\n${violations.join('\n')}`
+        ).toEqual([])
+        // 可达性自检:computed.ts 里确实存在被审计的调用点(防扫描器静默失效)
+        const callSites = computedSrc.content.split('\n')
+            .filter(l => l.includes('this.prepareRecompute()') && !/prepareRecompute\(\)\s*\{/.test(l))
+        expect(callSites.length).toBeGreaterThanOrEqual(2)
+    })
+
+    test('扫描器自检：能检出裸调用、能放过 try 包裹与定义处', () => {
+        const guarded = [
+            '        try {',
+            '            this.prepareRecompute()',
+            '        } catch (err) {',
+        ].join('\n')
+        expect(findUnguardedPrepareRecompute(guarded)).toEqual([])
+
+        const unguarded = [
+            '        this.inPatch = true',
+            '        this.prepareRecompute()',
+        ].join('\n')
+        expect(findUnguardedPrepareRecompute(unguarded).length).toBe(1)
+
+        const definition = '    prepareRecompute() {'
+        expect(findUnguardedPrepareRecompute(definition)).toEqual([])
+
+        // 注释间隔不影响判定(向上跳过注释找实代码)
+        const guardedWithComment = [
+            '        try {',
+            '            // 说明注释',
+            '            this.prepareRecompute()',
+        ].join('\n')
+        expect(findUnguardedPrepareRecompute(guardedWithComment)).toEqual([])
+    })
+})

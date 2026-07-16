@@ -167,6 +167,25 @@ export function performRandomListOp(
     return `unshift(${v})`
 }
 
+// ---- 敌意调用方维度(caller-rights exercise;2026-H3 round7 R7-1 教训) ----
+// README 把一组权利授予调用方(变更方法的返回数组归调用方、reorder 的 order 数组
+// 连同其中的 Order 对归调用方),但整个测试体系此前从未**行使**过这些权利——
+// 授予了但从未行使 = 未测试的承诺。round5 D1 的回归只改写外层数组(`order.length=0`),
+// 与修复的拷贝深度同构,pair 一层的共享因此存活。规则:调用方权利作为生成器维度
+// 进入组合空间(在 batch 内行使,命中延迟消费窗口),差分 oracle 不变——任何
+// 载荷毒化都表现为派生分叉。新增"调用方权利"类契约条款时,同步扩展本维度。
+/** 深改写一个调用方持有的数组(外层槽位 + 一层嵌套数组的元素),模拟复用/清空 */
+export function clobberCallerOwnedArray(arr: unknown[]) {
+    for (let i = 0; i < arr.length; i++) {
+        const el = arr[i]
+        if (Array.isArray(el)) {
+            for (let j = 0; j < el.length; j++) el[j] = -424242
+        }
+        arr[i] = -424242
+    }
+    arr.length = 0
+}
+
 // ---- 行形态维度(map 行的 mapFn 运行时行为;2026-H3 round4) ----
 // R4-1 教训:"传了 index 参数"≠"读了 index 值"。map 的行按 mapFn **执行期**是否
 // 读取响应式数据分成三种形态,走完全不同的实现路径:
