@@ -25,12 +25,13 @@ type PlainObjectType = {
 export class RxMap<K, V> extends Computed{
     data!: Map<K, V>
     trackClassInstance = true
-    constructor(sourceOrGetter?: EntryType|PlainObjectType|null|GetterType, public applyPatch?: ApplyPatchType, scheduleRecompute?: DirtyCallback, public callbacks? : CallbacksType, public skipIndicator? : SkipIndicator, public forceAtom?: boolean) {
+    // CAUTION 不用参数属性(见 RxList 构造器说明,base 已条件赋值);
+    //  曾有的第 6 参 forceAtom 全仓与下游零消费,死参数已移除。
+    constructor(sourceOrGetter?: EntryType|PlainObjectType|null|GetterType, applyPatch?: ApplyPatchType, scheduleRecompute?: DirtyCallback, callbacks? : CallbacksType, skipIndicator? : SkipIndicator) {
         const getter = typeof sourceOrGetter === 'function' ? sourceOrGetter as GetterType : undefined
         const source = typeof sourceOrGetter === 'function' ? undefined : sourceOrGetter
         // 自己可能是 computed，也可能是最初的 reactive
         super(getter, applyPatch, scheduleRecompute, callbacks, skipIndicator)
-        this.getter = getter
         // 自己是 source
         // CAUTION 架构语义（AGENTS.md A3）：传入 Map 时直接采纳引用（所有权移交），
         //  之后必须通过本实例的方法修改。刻意不做防御性拷贝，明确不修。

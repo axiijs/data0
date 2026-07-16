@@ -365,6 +365,9 @@ export class Notifier {
     if (type === TriggerOpTypes.CLEAR) {
       // collection being cleared
       // trigger all effects for target
+      // CAUTION 库内无生产触发方(RxMap.clear 走逐 key DELETE + METHOD):本分支
+      //  是留给「手动 notifier.trigger 的自定义结构」(LinkedList 式用法)的协议面,
+      //  枚举成员是公开 API,勿当死代码删除(2026-H3 round6 工程面清偿时裁定保留)。
       deps = [...depsMap.values()]
 
     } else {

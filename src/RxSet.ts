@@ -12,13 +12,13 @@ export class RxSet<T> extends Computed {
     data!: Set<T>
     trackClassInstance = true
 
-    constructor(sourceOrGetter?: T[]|null|GetterType, public applyPatch?: ApplyPatchType, scheduleRecompute?: DirtyCallback, public callbacks? : CallbacksType) {
+    // 不用参数属性(见 RxList 构造器说明,base 已条件赋值)
+    constructor(sourceOrGetter?: T[]|null|GetterType, applyPatch?: ApplyPatchType, scheduleRecompute?: DirtyCallback, callbacks? : CallbacksType) {
         const getter = typeof sourceOrGetter === 'function' ? sourceOrGetter : undefined
         const source = typeof sourceOrGetter !== 'function' ? sourceOrGetter : undefined
 
         // 自己可能是 computed，也可能是最初的 reactive
         super(getter, applyPatch, scheduleRecompute, callbacks)
-        this.getter = getter
 
         // 自己是 source
         // CAUTION 架构语义（AGENTS.md A3）：传入 Set 时直接采纳引用（所有权移交），
