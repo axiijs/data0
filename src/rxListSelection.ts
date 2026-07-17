@@ -120,11 +120,23 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
         }
     }
 
+    // CAUTION 按终态对账,不信任 delta 的到达序(2026-H3 round9 F2):非 batch 的
+    //  内联派发中,同步订阅者对同一 atom 的重入写(平衡回写:「1 不可选,自动跳
+    //  到 2」)会让**后订阅**的本结构先收到嵌套写的 info([1→2])、再收到外层写的
+    //  info([null→1])——非因果序。按 [oldValue→false, newValue→true] 盲放 delta
+    //  会把中间值的 indicator 永久卡 true:后续正常写入不再触及该 item,只有
+    //  force recompute 能追平(A1 边界内的"终值错误")。currentValues 的
+    //  raw/data 在 info 到达时恒为终态(值写入先于派发),按终态对账使每条 info
+    //  的应用幂等收敛,与 info 序无关。RxSet 分支走结构通道(恒有 session,
+    //  保序)本无此缺陷,同样改为对账——兄弟实现点一致,不变量「indicator ≡
+    //  currentValues 终态成员关系」在两个模式上构造性成立(判等语义不变:
+    //  atom 分支 SameValueZero(R6-1),RxSet 分支 Set.has 天然 SameValueZero)。
     function updateIndicatorsFromCurrentValueChange(triggerInfo: TriggerInfo) {
         const { oldValue, newValue, method } = triggerInfo
         if(isAtom(currentValues)) {
-            updateIndicators(oldValue as T, false)
-            updateIndicators(newValue as T, true)
+            const current = currentValues.raw
+            updateIndicators(oldValue as T, sameValueZero(oldValue, current))
+            updateIndicators(newValue as T, sameValueZero(newValue, current))
         } else {
             // RxSet，有 add/delete/replace method
             let newItems: T[] = []
@@ -137,10 +149,10 @@ export function createSelectionInner<T>(source: RxList<T>, currentValues: RxSet<
                 [newItems, deletedItems] = triggerInfo.methodResult as [T[], T[]]
             }
             newItems.forEach((item) => {
-                updateIndicators(item, true)
+                updateIndicators(item, currentValues.data.has(item))
             })
             deletedItems.forEach((item) => {
-                updateIndicators(item, false)
+                updateIndicators(item, currentValues.data.has(item))
             })
         }
     }
@@ -365,12 +377,16 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
         }
     }
 
+    // 按终态对账,不信任 delta 的到达序(round9 F2,与 createSelectionInner 的
+    // updateIndicatorsFromCurrentValueChange 同一等价类;判等语义不变:atom 分支
+    // === 与 createNewIndicator 对齐——index 域无 NaN,Set 分支 has 即 SameValueZero)
     function updateIndicatorsFromCurrentValueChange(list: RxList<[T,  Atom<boolean>]>,triggerInfo: TriggerInfo) {
         const { oldValue, newValue, method } = triggerInfo
 
         if(isAtom(currentValues)) {
-            list.data[oldValue as number]?.[1](false)
-            list.data[newValue as number]?.[1](true)
+            const current = currentValues.raw
+            list.data[oldValue as number]?.[1](oldValue === current)
+            list.data[newValue as number]?.[1](newValue === current)
         } else {
             // RxSet，有 add/delete/replace method
             let deleteItems: number[] = []
@@ -386,10 +402,10 @@ export function createIndexKeySelection<T>(source: RxList<T>, currentValues: RxS
 
 
             (deleteItems as number[]).forEach((item) => {
-                list.data[item]?.[1](false)
+                list.data[item]?.[1](currentValues.data.has(item))
             })
             insertItems.forEach((item:number) => {
-                list.data[item]?.[1](true)
+                list.data[item]?.[1](currentValues.data.has(item))
             })
         }
     }

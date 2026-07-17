@@ -486,9 +486,23 @@ export class Computed extends ReactiveEffect {
         const depEffects = notifier.getDepEffects(this.trackClassInstance ? this: this.data)
         if (!depEffects) return
 
+        // 错误隔离与 Notifier.triggerEffects 一致（round9 F1，同一"多订阅者派发"
+        // 语义的第四个实现点）：首个下游抛错不得跳过其余下游的标脏/重跑。
+        let hasError = false
+        let firstError: unknown
         for(const effect of depEffects) {
-            effect.run()
+            try {
+                effect.run()
+            } catch (err) {
+                if (hasError) {
+                    Notifier.reportSuppressedInlineError(err)
+                } else {
+                    hasError = true
+                    firstError = err
+                }
+            }
         }
+        if (hasError) throw firstError
     }
     // CAUTION cleanPromise 惰性化：每轮 dirty 都无条件创建 Promise + 闭包，
     //  而绝大多数 computed 从来没有人 await。改为：进入"未完成的计算周期"时只置
@@ -544,8 +558,23 @@ export class Computed extends ReactiveEffect {
     // 1. 没有 infos 和 immediate 说明是 markDirty，是否启动由自己决定
     // 2. 有 infos 说明是 dep trigger，是否启动由自己决定
     // 3. 没有 infos 但有 immediate 是 onTrack 的强制启动，可能是初始化时。
+    // CAUTION skip 门丢弃 info 后增量状态不可信（2026-H3 round9 F3）：skip 窗口内
+    //  的触发既不重算、不标脏、也不入队 info（skip 的语义 = 完全静默），但 patch
+    //  型 computed 若停留在 PATCH_PHASE，解除 skip 后的下一次触发只会增量重放
+    //  **新** info——窗口内被丢弃的变更在派生数据里永久缺失（静默分叉，只有
+    //  force recompute 能追平；README §3.2 成文前该参数零文档零测试）。与
+    //  handleRecomputeError 的处置同款：回退 FULL_RECOMPUTE_PHASE 并清残留 info，
+    //  解除后的首次触发（任何来源）全量重算追平终态。非 patch 型 computed 本就
+    //  全量重算，零改变；skip 拦截的是触发派发，显式 recompute() 不受拦截
+    //  （这也是 skip 期间强制同步的出口）。
+    private noteTriggerSkipped() {
+        if (this.applyPatch) {
+            if (this._triggerInfos) this._triggerInfos.length = 0
+            this.phase = FULL_RECOMPUTE_PHASE
+        }
+    }
     run(infos?: TriggerInfo[], immediate = false) {
-        if (this.skipIndicator?.skip) return
+        if (this.skipIndicator?.skip) return this.noteTriggerSkipped()
         if (infos && infos.length) {
             // CAUTION 不能 push(...infos)：batch 中积累的 infos 可能超过引擎实参上限
             //  （约 65k，超过直接 RangeError），必须逐个 push（同 spliceMany 的动机）。
@@ -559,14 +588,14 @@ export class Computed extends ReactiveEffect {
     // trigger 热路径入口（见 ReactiveEffect.runFromTrigger 的说明）：
     // info 只在本 computed 真正消费时才构造。
     runFromTrigger(source: any, type: TriggerOpTypes, inputInfo?: InputTriggerInfo) {
-        if (this.skipIndicator?.skip) return
+        if (this.skipIndicator?.skip) return this.noteTriggerSkipped()
         if (this.needsTriggerInfo) {
             this.triggerInfos.push((inputInfo ? {...inputInfo, source, type} : {source, type}) as TriggerInfo)
         }
         this.handleTriggered(false)
     }
     runFromAtomTrigger(source: any, newValue?: unknown, oldValue?: unknown) {
-        if (this.skipIndicator?.skip) return
+        if (this.skipIndicator?.skip) return this.noteTriggerSkipped()
         if (this.needsTriggerInfo) {
             this.triggerInfos.push({source, type: TriggerOpTypes.ATOM, key: 'value', newValue, oldValue} as TriggerInfo)
         }

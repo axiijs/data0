@@ -56,7 +56,9 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - **对象 atom 的浅属性写入会触发**:`obj.x = 1` 经 proxy set 陷阱通知订阅者;`obj.raw.nested.n = 1` 或取出嵌套对象后再改**不会**触发,需 `obj({...})` 整替换(无深 Proxy)。属性**读**转发仅覆盖 get:`in`/`Object.keys`/spread 不转发到值对象;值属性名与元 API 同名(`raw`/`call`)时读取被元 API 遮蔽(写入仍落值对象)。需要自省/同名属性请读 `.raw` 后操作原对象。
 - **atom 的对象特性由创建时初始值的形态决定,不随后续写入迁移**:以原始值/`null`/`undefined` 起手的 atom 是无 Proxy 的轻量形态,之后写入对象(`a(user)`)后整值读写与依赖追踪一切正常,但**属性级读写不可用**——`a.x` 读不到值对象的属性、`a.x = 1` 既不写入值对象也不触发(落在 atom 函数对象自身上)。需要属性级用法时以对象初值创建 atom;以 `null` 起手的"暂无数据"atom 请坚持整值替换。class 实例 atom 的属性**写**会写穿实例并触发,属性**读**不转发(属性读仅对 plain object 承诺)。特征测试见 `__tests__/deepReview2026H3Round3.spec.ts`。
 - **菱形依赖存在 glitch**(AGENTS.md A1):`a→c` 且 `a→b→c` 时,`c` 可能先以"新 a + 旧 b"重算一次,下游可观察到中间值并产生重复重算;**终值保证收敛正确**。对中间态敏感的副作用应自行防抖或读 `.raw` 终值。
-- **同步重算环会抛错**:在同步 computed 重算过程中又触发它自身的依赖变更,会抛出 `detect recompute triggerred in sync recompute`,请将变更移到调度回调中。
+- **订阅者抛错不会阻断同一次派发中的其余订阅者(batch 与非 batch 一致)**:非 batch 的内联派发同样先执行完全部订阅者,第一个错误在派发完成后抛给写入方,其余错误 `console.error` 上报——被跳过的订阅者不会执行也不会标脏,而 Object.is 判等门会拦截同值重写,"再写一次"救不回静默陈旧的兄弟,因此隔离是跨通道承诺。
+- **同步订阅者重入写同一 atom(平衡回写)受支持,但 info 到达序只对"先订阅"的消费者保持因果序**:值与判等立即生效、订阅者不会因自己的写重入自身;而非 batch 的内联派发对**后订阅**(晚于重写者)的 info 消费者交付的是嵌套优先的非因果序(先收到重写、后收到原始写)。库内按 delta 消费 atom info 的结构(selection 家族)按 `currentValues` 终态对账,与序无关;自定义按 delta 消费 atom info 的 applyPatch/onChange 结构应同样以 `.raw` 终态对账,或把重入写放进 `batch`(session 队列保持因果序)。特征钉扎见 `__tests__/deepReview2026H3Round9.spec.ts`。
+- **同步重算环会抛错**:在同步 computed 重算过程中又触发它自身的依赖变更,会抛出 `detect recompute triggerred in sync recompute`,请将变更移到调度回调中(深度 ≥2 的同步重写链——重写者触发另一个仍在运行中的重写者——同样命中该断言)。
 
 ### 3. `batch()` 语义
 
@@ -69,6 +71,12 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 - 默认 `autorun(fn)` 的重跑经 **microtask**(`Promise.resolve().then`)调度,首次执行仍同步。
 - 需要与写入同步一致时使用 `autorun(fn, true)`(立即重跑)。
+
+### 3.2 `skipIndicator`(computed 的跳过门)
+
+- `computed()` 的第 5 参与 `RxMap` 构造器的第 5 参接受 `skipIndicator`(`{skip: boolean}`):`skip === true` 期间该 computed 对一切触发**完全静默**——不重算、不标脏、不入队 info、不派发 `dirty`、不调用调度器。
+- **skip 期间的变更不会造成增量分叉**:patch 型 computed 在 skip 窗口内丢弃过 info 后自动回退全量重算阶段,解除 skip 后的**下一次触发**(任何来源)全量重算追平终态;解除 skip 本身不触发重算(`skipIndicator` 是普通对象,库不观察它的翻转),在下一次触发到来前读到的是 skip 期间的旧值。
+- skip 拦截的是**触发派发**;显式 `recompute(computed, true)` 不受拦截,是 skip 期间强制同步的出口。特征测试见 `__tests__/deepReview2026H3Round9.spec.ts`。
 
 ### 4. RxList 参数契约
 
