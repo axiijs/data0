@@ -186,6 +186,22 @@ export function clobberCallerOwnedArray(arr: unknown[]) {
     arr.length = 0
 }
 
+// ---- 敌意订阅者维度(派发中重入写;2026-H3 round9 F2 教训) ----
+// 「平衡回写」是 handleTriggered 注释点名支持的模式:同步订阅者看到非法值就
+// 同步改写同一 atom(「1 不可选,自动跳到 2」/pending→processing)。非 batch 的
+// 内联派发对**后订阅**的消费者交付非因果序 info(嵌套写先到,README §2 边界),
+// delta 型消费者必须按终态对账才能幂等收敛——该形态此前不在任何生成器的
+// 操作词汇里(既有重入测试全部是单订阅者 × 重算型消费者,构造性自愈)。
+// 用法:先安装 rewriter(订阅顺序在被测消费者**之前**),再创建消费者,
+// 然后驱动写入;返回 stop。rewrite 返回 undefined 表示不改写。
+import {autorun as autorunForRewriter} from '../src/common.js'
+export function installEquilibriumRewriter<T>(source: Atom<T>, rewrite: (v: T) => T | undefined): () => void {
+    return autorunForRewriter(() => {
+        const next = rewrite(source() as T)
+        if (next !== undefined) (source as (v: T) => void)(next)
+    }, true)
+}
+
 // ---- 行形态维度(map 行的 mapFn 运行时行为;2026-H3 round4) ----
 // R4-1 教训:"传了 index 参数"≠"读了 index 值"。map 的行按 mapFn **执行期**是否
 // 读取响应式数据分成三种形态,走完全不同的实现路径:

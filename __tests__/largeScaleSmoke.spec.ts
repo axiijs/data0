@@ -1,4 +1,5 @@
 import {describe, expect, test} from 'vitest'
+import {atom} from '../src/atom.js'
 import {createSelection, RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
@@ -239,6 +240,34 @@ describe('10^5 量级冒烟（正确性，非性能）', () => {
             expect(found.raw).toBe(source.data.findIndex(x => x === N - 1))
         } finally {
             sliced.destroy(); source.destroy()
+        }
+    })
+
+    // CAUTION 事件风暴词汇(2026-H3 round9 教训):本层此前的驱动词汇全是**结构
+    //  操作**(replaceData/splice/reorder),"一次依赖写引发 O(n) 行级重算"的
+    //  风暴形态(改筛选条件 → 全部行的谓词翻转)不在词汇表——filter 的逐行
+    //  toggle 是 locateRowPosition O(n) + splice 搬移 O(n),全行翻转合计 O(n²),
+    //  对 replaceData 词汇完全不可见(filter 的结构 patch 是批量 spliceArray,
+    //  规模层显示绿色)。**已登记的规模债务(未清偿)**:中位实测 n=4k/8k/16k 全行
+    //  toggle = 22.5ms/83.1ms/421.5ms(比值 3.7×/5.1×,超线性);清偿方向 = 有序
+    //  位置结构(Fenwick/order-statistic)或 digest 级 toggle 合并,与 groupBy/
+    //  toSorted 债务(round4 已清偿)同族,需专项性能轮 + ABBA。本用例以温和 N
+    //  (4k,~25ms)守正确性(indicator 风暴 ≡ 全量重算),不做计时断言。
+    test('filter × 响应式谓词全行 toggle 风暴(正确性;O(n²) 债务已登记未清偿)', () => {
+        const threshold = atom(0)
+        const n = 4_000
+        const source = new RxList<number>(range(n))
+        const filtered = source.filter(x => x >= (threshold() as number))
+        try {
+            expect(filtered.data.length).toBe(n)
+            batch(() => { threshold(n) })       // 全行 true→false
+            expect(filtered.data.length).toBe(0)
+            batch(() => { threshold(n / 2) })   // 半数 false→true
+            expectSameArray(filtered.data, source.data.filter(x => x >= n / 2), 'filter after half toggle')
+            threshold(0)                        // 非 batch 通道的全行 toggle
+            expectSameArray(filtered.data, source.data.slice(), 'filter after full re-enable')
+        } finally {
+            filtered.destroy(); source.destroy()
         }
     })
 })

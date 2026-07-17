@@ -81,6 +81,22 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         quote: '同步重算环会抛错',
         assets: ['mutationKillersComputed.spec.ts', '_coreReview16ScheduleRecompute.spec.ts'],
     },
+    // grant 行使空间(R8-2 规则):承诺方向 = 隔离对"其余订阅者"成立;行使维度 =
+    // 通道(内联 primitive atom/object atom/多 dep 去重/recursiveMarkDirty × batch ×
+    // 结构)× 受害者(单/双抛错者的兄弟、console 上报)× recovery probe。
+    // 2026-H3 round9 F1:该承诺此前只在 batch 通道存在(限定词圈住了内联通道的洞)。
+    'C2.6 订阅者错误隔离跨通道一致(非 batch 内联同样不阻断兄弟)': {
+        section: '2.', kind: 'grant',
+        quote: '订阅者抛错不会阻断同一次派发中的其余订阅者(batch 与非 batch 一致)',
+        assets: ['deepReview2026H3Round9.spec.ts', 'knownIssuesReproductions.spec.ts'],
+    },
+    // grant + boundary(R9 F2):平衡回写受支持(grant:值链完成、订阅者不重入自身),
+    // 到达序对后订阅者非因果序是显式契约边界(boundary:delta 消费者按终态对账或用 batch)。
+    'C2.7 重入写受支持,到达序只对先订阅者保因果序(delta 消费者按终态对账)': {
+        section: '2.', kind: 'boundary',
+        quote: 'info 到达序只对"先订阅"的消费者保持因果序',
+        assets: ['deepReview2026H3Round9.spec.ts'],
+    },
     // ── §3 batch ──
     'C3.1 batch 内读 computed 旧值(A2)': {
         section: '3.', kind: 'boundary',
@@ -107,6 +123,25 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         section: '3.1', kind: 'behavior',
         quote: '重跑经 **microtask**',
         assets: ['computed.spec.ts'],
+    },
+    // ── §3.2 skipIndicator ──(2026-H3 round9 F3:此前该公开参数零文档零测试,
+    // 参数级表面落在导出普查/条款账本/算子账本三张网之外;成文 + 参数级普查后入账)
+    'C3.6 skip 期间完全静默': {
+        section: '3.2', kind: 'behavior',
+        quote: '期间该 computed 对一切触发**完全静默**',
+        assets: ['deepReview2026H3Round9.spec.ts'],
+    },
+    // grant 行使空间:承诺 = skip 窗口丢弃 info 不造成增量分叉;行使维度 = 入口
+    // (computed 工厂/RxMap 构造)× 源通道(结构 METHOD/atom ATOM)× batch × 调度器形态。
+    'C3.7 skip 窗口不造成增量分叉(解除后首次触发全量追平)': {
+        section: '3.2', kind: 'grant',
+        quote: 'skip 期间的变更不会造成增量分叉',
+        assets: ['deepReview2026H3Round9.spec.ts', 'knownIssuesReproductions.spec.ts'],
+    },
+    'C3.8 显式 recompute 不受 skip 拦截': {
+        section: '3.2', kind: 'grant',
+        quote: '显式 `recompute(computed, true)` 不受拦截',
+        assets: ['deepReview2026H3Round9.spec.ts'],
     },
     // ── §4 RxList 参数契约 ──
     'C4.1 splice 参数按规范归一化': {
@@ -274,6 +309,41 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
 }
 
 // ---------------------------------------------------------------------------
+// 限定词审计(2026-H3 round9 F1 教训,§3.3「契约限定词纪律」)
+//
+// 「batch 中某个订阅者抛错不会阻断其余订阅者」——限定词"batch 中"恰好圈住了
+// 实现的洞(内联通道无隔离,digest 修复的理由文本逐字适用却只落在 digest)。
+// 契约按实现现状成文时,范围限定词把实现边界固化成契约形状;而逐字锚定的
+// 账本对"诚实的窄承诺"永远不红。规则:登记条款的引文命中限定词 token
+// (收窄承诺范围的措辞)时,必须在本表登记**对侧语义的着落**——对侧行为的
+// 资产、对侧的显式契约外/边界声明,或指向承接对侧的兄弟条款。token 表宁窄
+// 勿噪(不追求捕获一切自然语言限定),按事故形状扩充;新增带限定词的承诺句
+// 时对照本表过账。
+const SCOPE_QUALIFIER_TOKENS = ['batch 中', '只', '仅']
+const QUALIFIER_AUDIT: Record<string, {qualifier: string, counterpart: string}> = {
+    'C1.2 data/.raw 只读视图': {
+        qualifier: '只(读)',
+        counterpart: '对侧 = 直写行为:属契约外(A3 架构语义,architectureSemantics.spec.ts 特征钉扎"绕过方法直改不触发")',
+    },
+    'C2.7 重入写受支持,到达序只对先订阅者保因果序(delta 消费者按终态对账)': {
+        qualifier: '只对先订阅者',
+        counterpart: '对侧 = 后订阅者的嵌套优先序:deepReview2026H3Round9.spec.ts 到达序特征钉扎(两侧都有资产)+ 终态对账/batch 的规避指引成文',
+    },
+    'C3.3 订阅者错误隔离,第一个错误抛给调用方': {
+        qualifier: 'batch 中',
+        counterpart: '对侧 = 非 batch 内联通道:曾无隔离且零资产(round9 F1 的立法事故本尊);现由 C2.6 承诺跨通道一致并资产化(deepReview2026H3Round9.spec.ts)',
+    },
+    'C4.6 applyPatch 协议消费者只读共享广播': {
+        qualifier: '只读',
+        counterpart: '对侧 = 消费者改写共享广播:属契约违约,毒化后果与防御边界由载荷所有权资产钉扎(deepReview2026H3Round5.spec.ts R5-D1 组、deepReview2026H3Round8.spec.ts R8-2/R8-3 组)',
+    },
+    'C5.1 async getter 只追踪首个 await 前': {
+        qualifier: '只追踪 await 前',
+        counterpart: '对侧 = await 后读取不建立依赖:asyncComputed.spec.ts 断言跨 await 读不触发;替代形态(generator getter 逐段追踪)同句成文并有 C5 族资产',
+    },
+}
+
+// ---------------------------------------------------------------------------
 
 describe('契约条款账本 conformance', () => {
     test('引文漂移检测:每条登记条款的引文必须逐字存在于 README(改条款必须同步账本)', () => {
@@ -292,6 +362,22 @@ describe('契约条款账本 conformance', () => {
             }
         }
         expect(missing, missing.join('\n')).toEqual([])
+    })
+
+    test('限定词审计:引文含范围限定词的条款必须登记对侧语义的着落', () => {
+        const violations: string[] = []
+        for (const [id, clause] of Object.entries(CONTRACT_CLAUSES)) {
+            const hit = SCOPE_QUALIFIER_TOKENS.find(token => clause.quote.includes(token))
+            if (hit && !QUALIFIER_AUDIT[id]) {
+                violations.push(`${id}: 引文含限定词「${hit}」但未登记对侧语义 → "${clause.quote}"`)
+            }
+        }
+        expect(violations, violations.join('\n')).toEqual([])
+        // 审计表自身不得腐化:登记键必须是真实条款,counterpart 必须给出实质内容
+        for (const [id, entry] of Object.entries(QUALIFIER_AUDIT)) {
+            expect(CONTRACT_CLAUSES[id], `QUALIFIER_AUDIT 登记了不存在的条款:${id}`).toBeTruthy()
+            expect(entry.counterpart.length, `${id} 的 counterpart 为空`).toBeGreaterThan(10)
+        }
     })
 
     test('小节全覆盖:「语义契约」章的每个 ### 小节必须至少有一条登记条款', () => {

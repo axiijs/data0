@@ -448,11 +448,24 @@ export class Notifier {
       }
       const scopes = ReactiveEffect.activeScopes
       const activeEffect = scopes.length ? scopes[scopes.length - 1] : undefined
+      // 错误隔离与 triggerEffects 一致（round9 F1，说明见该方法）
+      let hasError = false
+      let firstError: unknown
       for (const effect of dedupedEffects) {
         if (effect !== activeEffect) {
-          this.triggerEffect(effect, source, type, inputInfo, eventInfo)
+          try {
+            this.triggerEffect(effect, source, type, inputInfo, eventInfo)
+          } catch (err) {
+            if (hasError) {
+              Notifier.reportSuppressedInlineError(err)
+            } else {
+              hasError = true
+              firstError = err
+            }
+          }
         }
       }
+      if (hasError) throw firstError
     }
   }
   // primitive atom 写入的特化路径：newValue/oldValue 以标量传递，
@@ -483,12 +496,26 @@ export class Notifier {
     }
     if (dep.overflow === undefined) return
     // CAUTION 快照稳定化：effect 执行中可能增删订阅（对 native Set 展开，比 generator 快）
+    // 错误隔离与 triggerEffects 一致（round9 F1，说明见该方法）；single 快路径
+    // 无兄弟订阅者可保护，异常直接透传，保持零开销。
     const effects = [...dep.overflow]
+    let hasError = false
+    let firstError: unknown
     for (const effect of effects) {
       if (effect !== activeEffect) {
-        this.triggerAtomEffect(effect, source, newValue, oldValue, eventInfo)
+        try {
+          this.triggerAtomEffect(effect, source, newValue, oldValue, eventInfo)
+        } catch (err) {
+          if (hasError) {
+            Notifier.reportSuppressedInlineError(err)
+          } else {
+            hasError = true
+            firstError = err
+          }
+        }
       }
     }
+    if (hasError) throw firstError
   }
   triggerAtomEffect(
       effect: ReactiveEffect,
@@ -527,6 +554,19 @@ export class Notifier {
     }
     return result
   }
+  // CAUTION 内联派发的错误隔离（2026-H3 round9 F1，与 digestEffectSession 同一
+  //  语义的兄弟实现点）：首个订阅者抛错不得跳过其余订阅者——被跳过的订阅者
+  //  既不执行也不标脏（status 停留 CLEAN），读到的是静默的陈旧值，且 Object.is
+  //  判等门会拦截同值重写（无法靠"再写一次"救回，只有写入不同值或 force
+  //  recompute 能追平）。digest 修复时的这段理由逐字适用于内联循环，却只落在了
+  //  digest（"修复者沿被攻击的轴泛化"的又一实例）。现在四个多订阅者派发循环
+  //  （triggerEffects / trigger 的去重循环 / triggerPrimitiveAtomValue 的 overflow
+  //  循环 / Computed.recursiveMarkDirty）统一：全部订阅者执行完后把第一个错误
+  //  抛给写入方，其余错误 console.error 上报。README §2 已成文。
+  /** @internal 内联派发循环的共享错误收集器（见上方 CAUTION） */
+  static reportSuppressedInlineError(err: unknown) {
+    console.error('[data0] suppressed additional subscriber error in inline dispatch (the first error is propagating to the writer):', err)
+  }
   // CAUTION 架构语义（AGENTS.md「架构决策与已知语义边界」A1）：传播是急切推模式，
   //  按订阅顺序同步执行，无拓扑排序、无读时拉取。菱形依赖（a→c 且 a→b→c）下，
   //  先订阅的下游会以"新 a + 旧 b"先算一遍（可观察的中间值 + 重复重算），终值必然
@@ -550,13 +590,25 @@ export class Notifier {
     // CAUTION 快照稳定化：effect 执行过程中可能向 dep 增删订阅，
     //  不能直接在 live Set 上迭代（新增的订阅会被本轮误触发）。
     const effects = [...(dep as unknown as Iterable<ReactiveEffect>)]
+    let hasError = false
+    let firstError: unknown
     for (const effect of effects) {
       if (effect !== activeEffect) {
         // CAUTION 特别注意这里，因为我们现在支持了 lazy recompute，所以可能在读的时候才重算。
         //  重算过程中可能会再次触发 trigger，因为像 atomComputed 这种是在重算的时候更新 atom 值的。
-        this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
+        try {
+          this.triggerEffect(effect, source, type, inputInfo, debuggerEventExtraInfo)
+        } catch (err) {
+          if (hasError) {
+            Notifier.reportSuppressedInlineError(err)
+          } else {
+            hasError = true
+            firstError = err
+          }
+        }
       }
     }
+    if (hasError) throw firstError
   }
   triggerEffect(
       effect: ReactiveEffect,

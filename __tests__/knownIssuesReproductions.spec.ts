@@ -6,7 +6,8 @@ import {describe, expect, test, vi} from 'vitest'
 import {AsyncRxSlice} from '../src/AsyncRxSlice.js'
 import {atom} from '../src/atom.js'
 import {autorun} from '../src/common.js'
-import {computed, destroyComputed} from '../src/computed.js'
+import {computed, Computed, destroyComputed} from '../src/computed.js'
+import {TrackOpTypes, TriggerOpTypes} from '../src/operations.js'
 import {batch, notifier} from '../src/notify.js'
 import {createSelection, RxList} from '../src/RxList.js'
 import {RxSet} from '../src/RxSet.js'
@@ -520,6 +521,117 @@ describe('known RxTime semantic issues', () => {
             expect(sawTrue).toBe(true)
         } finally {
             vi.useRealTimers()
+        }
+    })
+})
+
+describe('known inline-dispatch channel issues (2026-H3 round9, fixed)', () => {
+    // 方法 25(派发通道敌意差分)动态复现,已修复。攻击轴:同一「多订阅者 ×
+    // 敌意场景(错误注入/派发中重入写)」在三条派发通道下执行——
+    //   ① 非 batch atom 写的内联通道(triggerPrimitiveAtomValue/triggerEffects 循环);
+    //   ② batch 的 session digest 通道;
+    //   ③ Rx 结构变更方法的结构通道(dispatchStructuralThen/sendTriggerInfos,恒有 session)。
+    // ②③ 对两个敌意场景都有防线(逐 effect try/catch;重入写 info 追加到队尾保持
+    // 因果序),① 曾双双缺失——同一语义多个入口保护深度不一致(R7 兄弟实现点
+    // 纪律、R8-8「一 loud 一 silent」的同族形态)。
+
+    // 缺陷形态 1(已修复 = 内联四循环补 digest 同款隔离):首订阅者抛错曾跳过
+    // 剩余订阅者(既不执行也不标脏,status 停留 CLEAN,静默陈旧;幂等重写被
+    // Object.is 判等门拦截,无法救回)。现在与 digest 语义一致:全部订阅者执行完
+    // 后第一个错误抛给写入方,其余 console.error 上报(README §2 已成文)。
+    // 等价类横扫(四个派发循环 × 受害者枚举)见 deepReview2026H3Round9.spec.ts。
+    test('inline atom dispatch: sibling subscribers still run when the first subscriber throws', () => {
+        const a = atom(0)
+        let boomOnce = true
+        const c1 = computed(() => {
+            const v = a() as number
+            if (v === 1 && boomOnce) { boomOnce = false; throw new Error('subscriber boom') }
+            return v
+        })
+        const c2 = computed(() => (a() as number) * 2)
+        try {
+            expect(() => a(1)).toThrow('subscriber boom')
+            // 修复前:c2.raw 停留 0(静默陈旧),且 a(1) 幂等重写被判等门拦截无法救回
+            expect(c2.raw).toBe(2)
+        } finally {
+            destroyComputed(c1)
+            destroyComputed(c2)
+        }
+    })
+
+    // 缺陷形态 2(已修复 = selection 两模式按终态对账):派发中重入写(handleTriggered
+    // 注释点名支持的「平衡状态」回写)下,内联通道对**后订阅**的消费者交付非因果序
+    // info(嵌套写的 [1→2] 先于外层写的 [null→1] 到达)。delta 型消费者按
+    // [oldValue→false, newValue→true] 盲放曾把中间值 indicator 永久卡 true(后续
+    // 写入不再触及该 item,只有 force recompute 能追平;A1 边界内的"终值错误")。
+    // 修复:selection 家族按 currentValues 终态(raw/data.has)对账,幂等收敛、与
+    // info 序无关;内联到达序本身仍非因果序(README §2 成文为契约边界,自定义
+    // delta 消费者应同样按终态对账或改用 batch)。等价类横扫(两模式 × 三通道 ×
+    // 订阅顺序)见 deepReview2026H3Round9.spec.ts。
+    test('inline reentrant atom write: selection indicators converge to the full-recompute state', () => {
+        const list = new RxList<number>([0, 1, 2])
+        const cur = atom<number | null>(null)
+        // 先订阅的平衡回写:1 不可选,自动跳到 2(与 handleTriggered 注释的
+        // pending→processing 模式同形)
+        const stop = autorun(() => {
+            if (cur() === 1) cur(2)
+        }, true)
+        const selection = createSelection(list, cur)
+        try {
+            cur(1)
+            expect(cur.raw).toBe(2)
+            // 全量重算语义:只有 item 2 选中(修复前实测 [false, true, true],
+            // 且 cur(0)/cur(null) 等后续写入永远修不掉 item 1 的 true)
+            expect(selection.data.map(([, ind]) => ind.raw)).toEqual([false, false, true])
+        } finally {
+            stop()
+            selection.destroy()
+            list.destroy()
+        }
+    })
+})
+
+describe('known skipIndicator semantic gaps (2026-H3 round9, fixed)', () => {
+    // 静态确认 + 动态复现,已修复。skipIndicator 是 computed() 的公开第 5 参
+    // (axii 自己的 LightBindingEffect 只在本地消费同名概念,并不传给 data0),
+    // 修复前:零 README 文档、零测试、coreSurfaceInventory 零登记(账本按导出面
+    // 普查,参数级表面漏网)。
+    // 缺陷行为:run/runFromTrigger/runFromAtomTrigger 在 skip 窗口内直接 return
+    // ——info 被丢弃且不标脏。patch 型 computed 解除 skip 后的下一次触发只增量
+    // 重放**新** info,窗口内的变更永久缺失(增量 ≠ 全量重算,静默分叉)。
+    // 修复:skip 门丢弃 info 时回退 FULL_RECOMPUTE_PHASE(与 handleRecomputeError
+    // 同款),解除后的首次触发全量重算追平终态;README §3.2 成文,参数级普查入
+    // coreSurfaceInventory。等价类横扫见 deepReview2026H3Round9.spec.ts。
+    test('patch computed catches up with mutations dropped during a skip window', () => {
+        const source = new RxList<number>([1, 2, 3])
+        const skip = {skip: false}
+        const mirror = computed<number[]>(
+            function computation(this: Computed) {
+                ;(this as any).manualTrack(source, TrackOpTypes.METHOD, TriggerOpTypes.METHOD)
+                return source.data.slice()
+            },
+            function applyPatch(this: Computed, data: any, infos: any[]) {
+                const arr = (data.raw as number[]).slice()
+                for (const info of infos) {
+                    if (info.method !== 'splice') return false
+                    arr.splice(info.argv[0] as number, (info.methodResult as unknown[]).length, ...info.argv.slice(2))
+                }
+                data(arr)
+            },
+            true,
+            undefined,
+            skip,
+        )
+        try {
+            expect(mirror.raw).toEqual([1, 2, 3])
+            skip.skip = true
+            source.push(4) // skip 窗口内的变更:info 被 run() 丢弃(phase 回退全量)
+            skip.skip = false
+            source.push(5) // 解除后的首次触发:全量重算追平(修复前只重放本条 → [1,2,3,5])
+            expect(mirror.raw).toEqual([1, 2, 3, 4, 5])
+        } finally {
+            destroyComputed(mirror)
+            source.destroy()
         }
     })
 })
