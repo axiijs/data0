@@ -143,6 +143,16 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         quote: '显式 `recompute(computed, true)` 不受拦截',
         assets: ['deepReview2026H3Round9.spec.ts'],
     },
+    'C3.9 一次重算拥有它开始时为它排队的全部变更(内联入口为已知缺口)': {
+        section: '3.', kind: 'behavior',
+        quote: '**一次重算拥有它开始时为它排队的全部变更**',
+        assets: ['auditCore.spec.ts'],
+    },
+    'C3.10 同步自定义调度器重入时不嵌套执行': {
+        section: '3.1', kind: 'behavior',
+        quote: '**同步的自定义调度器在 computed 自己运行期间被调用时不嵌套执行**',
+        assets: ['auditCore.spec.ts'],
+    },
     // ── §4 RxList 参数契约 ──
     'C4.1 splice 参数按规范归一化': {
         section: '4.', kind: 'behavior',
@@ -207,6 +217,21 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         quote: '`at(index)` 支持负索引',
         assets: ['rxList.spec.ts', 'mutationKillersRxList.spec.ts'],
     },
+    'C4.12 RxMap/RxSet 透传原始参数(-0),内部消费者自行归一化': {
+        section: '4.', kind: 'behavior',
+        quote: '`RxMap`/`RxSet` 同样透传原始参数',
+        assets: ['collectionsReviewFixes.spec.ts', 'entryPointSemanticsInventory.spec.ts'],
+    },
+    'C4.13 sortSelf 的 undefined 规则与 Array#sort 一致': {
+        section: '4.', kind: 'behavior',
+        quote: '`sortSelf(compare)` 与 `Array#sort` 一致',
+        assets: ['auditListFixes.spec.ts'],
+    },
+    'C4.14 map 的 beforePatch/afterPatch 成对': {
+        section: '4.', kind: 'behavior',
+        quote: '`map` 的 `beforePatch(info)`/`afterPatch(infos)` 成对',
+        assets: ['auditListFixes.spec.ts'],
+    },
     // ── §5 async 契约 ──
     'C5.1 async getter 只追踪首个 await 前': {
         section: '5.', kind: 'boundary',
@@ -242,6 +267,11 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         section: '5.', kind: 'grant',
         quote: 'async 收尾阶段(向订阅者派发/回退全量重算)发生的错误同样 `console.error` 兜底',
         assets: ['deepReview2026H3Round7.spec.ts'],
+    },
+    'C5.8 被放弃的 generator 以 return() 关闭,finally 照常执行': {
+        section: '5.', kind: 'behavior',
+        quote: '**被放弃的 generator 以 `return()` 关闭**',
+        assets: ['auditCore.spec.ts'],
     },
     // ── §6 生命周期 ──
     'C6.1 谁创建谁销毁': {
@@ -286,11 +316,6 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
     },
     // 行使空间 = 触发清理的入口(父重算/嵌套重算/行重算/显式与延迟销毁)× 清理形态 × 正在执行的 effect 形态,
     // 外加「清理里的追踪读取 ≡ .raw 读取」差分 fuzz;对侧(清理触发/创建的 effect 照常追踪)同文件钉扎。
-    'C6.11 清理抛错,销毁照常做完': {
-        section: '6.', kind: 'behavior',
-        quote: '**清理抛错,销毁照常做完**',
-        assets: ['throwingTeardown.spec.ts'],
-    },
     'C6.9 清理不建立依赖': {
         section: '6.', kind: 'grant',
         quote: '**清理不建立依赖**',
@@ -301,11 +326,46 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
         quote: '子 effect 的清理里创建的响应式对象不会被父 effect 收集',
         assets: ['teardownTracking.spec.ts'],
     },
+    'C6.11 清理抛错,销毁照常做完': {
+        section: '6.', kind: 'behavior',
+        quote: '**清理抛错,销毁照常做完**',
+        assets: ['throwingTeardown.spec.ts'],
+    },
+    'C6.12 失败的重算保留依赖(有界),依赖变化时自动重试;同步首轮不留订阅': {
+        section: '6.', kind: 'behavior',
+        quote: '**失败的重算保留依赖,依赖变化时自动重试**',
+        assets: ['auditCore.spec.ts'],
+    },
+    'C6.13 已销毁的 computed 对触发完全静默': {
+        section: '6.', kind: 'behavior',
+        quote: '**已销毁的 computed 对触发完全静默**',
+        assets: ['auditCore.spec.ts'],
+    },
+    'C6.14 被使用方销毁的惰性 meta 下次读取时重建': {
+        section: '6.', kind: 'behavior',
+        quote: '**被使用方销毁的惰性 meta 会在下次读取时重建**',
+        assets: ['auditCollectionsFixes.spec.ts'],
+    },
+    'C6.15 map 的行清理:多行离场时全部执行,第一个错误抛出': {
+        section: '6.', kind: 'behavior',
+        quote: '`map` 的行清理同一规则',
+        assets: ['auditListFixes.spec.ts'],
+    },
+    'C6.16 map 的 options.onCleanup 每个映射值离场恰好一次': {
+        section: '6.', kind: 'grant',
+        quote: '`map` 的 `options.onCleanup` 在每个映射值离开列表时恰好调用一次',
+        assets: ['auditListFixes.spec.ts', 'teardownTracking.spec.ts'],
+    },
     // ── 支持矩阵章 ──
     'CM.1 增量格子双向可执行(零回退/必回退)': {
         section: '矩阵', kind: 'behavior',
         quote: '矩阵中声明"增量"的格子必须有差分验证',
         assets: ['incrementalityWitness.spec.ts', 'broadOperatorsFuzz.spec.ts'],
+    },
+    'CM.3 RxMap.values()/entries() 按结构变更重放;indexBy/toMap 暂时重复 key 回退全量': {
+        section: '矩阵', kind: 'behavior',
+        quote: '`RxMap.values()`/`entries()` 直接按 Map 的结构变更(set/delete)的因果序重放',
+        assets: ['auditCollectionsFixes.spec.ts', 'auditCollectionsFuzz.spec.ts'],
     },
     'CM.2 回退是正确性措施,结果不变': {
         section: '矩阵', kind: 'behavior',

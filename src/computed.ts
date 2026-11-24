@@ -9,7 +9,7 @@ import {
     setRetainedReactiveEffectSource,
     trackRetainedReactiveEffectCreated
 } from "./retainedDiagnostics";
-import {restoreEffectDeps} from "./dep.js";
+import {restoreEffectDeps, type Dep} from "./dep.js";
 
 export const computedToInternal = new WeakMap<any, Computed>()
 
@@ -75,7 +75,21 @@ export function setComputedRetainedDiagnosticSource(computedItem: ComputedData, 
     if (internal) setRetainedReactiveEffectSource(internal, source)
 }
 
-const queuedRecomputes = new WeakSet<Computed>()
+// CAUTION 已销毁的 computed 换上这个共享的"永久跳过"门（见 Computed.destroyResources）
+const DESTROYED_SKIP: SkipIndicator = Object.freeze({skip: true})
+
+// CAUTION WeakMap 而不是 WeakSet：记下排队时交给调度器的那个 recompute。去重只保留第一次
+//  排队的任务，但之后若来的是「强制重算」（同步重算中又被触发，见 handleTriggered），必须
+//  把排队的函数升级成它——否则它被去重静默吞掉，而排队的普通 recompute 执行时 status 已是
+//  CLEAN、直接返回，重算期间到达的那次变更永久丢失（陈旧到下一次无关触发为止）。
+const queuedRecomputes = new WeakMap<Computed, (force?: boolean) => void>()
+
+// CAUTION 「session 里排在某个 computed 名下、已被一次重算提前接管」的 info 数组（见
+//  Computed.takeSessionInfos）。按数组身份登记而不是在实例上挂标记：effect 仍留在
+//  notifier.sessionQueue 里（从队列中摘除是 O(队列长度)），digest 轮到它时把同一个数组
+//  传给 run——数组仍然是空的就说明接管之后没有新的触发，这次排队的 run 无事可做。
+//  WeakSet 不额外持有数组，digest 丢弃它之后随之回收。
+const takenSessionInfos = new WeakSet<TriggerInfo[]>()
 
 // 一层深的数组拷贝:外层数组换新,数组型元素也换新。仅用于内层是**协议容器**
 // 的形状(RxSet.replace 的 [newItems,deletedItems]、RxMap replace/clear 的 entry 对)。
@@ -156,7 +170,8 @@ export function copyTriggerInfoPayload(info: TriggerInfo): TriggerInfo {
 //    先出队还保证执行期间的新触发能重新入队，而不是被去重静默吞掉。
 // 2. 异常必须捕获并上报（而不是变成 microtask 的 uncaught exception 崩掉进程）。
 //    computed 已经由 handleRecomputeError 复位为 DIRTY，下次触发可以重试。
-function runScheduledRecompute(this: Computed, recompute: (force?: boolean) => void) {
+function runScheduledRecompute(this: Computed) {
+    const recompute = queuedRecomputes.get(this)!
     queuedRecomputes.delete(this)
     try {
         recompute()
@@ -165,19 +180,31 @@ function runScheduledRecompute(this: Computed, recompute: (force?: boolean) => v
     }
 }
 
+// 内置调度器的去重入队：返回 true 表示需要真正排一个任务（见 queuedRecomputes 的说明）。
+function queueScheduledRecompute(computed: Computed, recompute: (force?: boolean) => void): boolean {
+    const queued = queuedRecomputes.get(computed)
+    if (queued === undefined) {
+        queuedRecomputes.set(computed, recompute)
+        return true
+    }
+    // 已在排队：只做「普通 → 强制」的升级，强制不降级
+    if (queued !== recompute && recompute === computed._boundForcedRecompute) {
+        queuedRecomputes.set(computed, recompute)
+    }
+    return false
+}
+
 // 如果是 async 的，用 queueMicrotask 来调度。
 // 如果不是 async 的，用 markDirty 而不是直接 recompute
 export function scheduleNextMicroTask(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
-    if (queuedRecomputes.has(this)) return
-    queuedRecomputes.add(this)
-    queueMicrotask(() => runScheduledRecompute.call(this, recompute))
+    if (!queueScheduledRecompute(this, recompute)) return
+    queueMicrotask(() => runScheduledRecompute.call(this))
 }
 
 
 export function scheduleNextTick(this: Computed, recompute: (force?: boolean) => void, markDirty: () => any) {
-    if (queuedRecomputes.has(this)) return
-    queuedRecomputes.add(this)
-    nextTick(() => runScheduledRecompute.call(this, recompute))
+    if (!queueScheduledRecompute(this, recompute)) return
+    nextTick(() => runScheduledRecompute.call(this))
 }
 
 export const STATUS_DIRTY = -1
@@ -405,6 +432,8 @@ export class Computed extends ReactiveEffect {
         return getterResult
     }
     callAsyncGetter(): any {
+        // 本轮的代次（runEffect 刚写入），用于收尾时判断自己是否已被同步段里重入的新一轮取代
+        const runEffectId = this.runtEffectId
         const getterContext = this.createGetterContext()
         // CAUTION 每实例告警一次(2026-H3 round8 R8-9):这不是"每次调用都在犯"的
         //  误用警告,而是关于 getter **声明形态**的一次性事实提示——曾无条件放在
@@ -427,7 +456,14 @@ export class Computed extends ReactiveEffect {
             return this.getter!.call(this, getterContext!)
         } finally {
             notifier.resetTracking()
-            this.completeTracking(true)
+            // CAUTION 只有仍是"当前一轮"才做依赖定稿（cleanup + 重放 asyncTracks）。
+            //  同步段里的写入可以经由别的同步订阅者（autorun(…, true)、onChange 的 handler）
+            //  回头改到本 computed 的依赖：此刻栈顶不是自己，触发不被抑制，handleTriggered 对
+            //  重算中的 async computed 立即嵌套启动新一轮。新一轮与本轮共用 _asyncTracks：
+            //  它清空列表、追踪、定稿、再清空；随后本轮（已过期）若照常定稿，cleanup 会摘掉
+            //  包括胜出一轮在内的全部订阅，而重放的列表是空的——computed 值是对的，
+            //  却不再订阅任何东西，从此永久陈旧。过期一轮只出栈，依赖集合归新一轮所有。
+            this.completeTracking(this.runtEffectId === runEffectId)
         }
     }
     callGeneratorGetter(id:number) {
@@ -436,14 +472,18 @@ export class Computed extends ReactiveEffect {
         return this.runGenerator(
             this.getter!.call(this, getterContext!),
             (isFirst) => {
-                if (runEffectId !== this.runtEffectId) return false
+                // CAUTION 销毁后同样不再续跑：destroy 不改 runtEffectId，后续段若照常入栈，
+                //  段里创建的子 computed 会被收集到已销毁的父亲名下（不会再有人销毁它们），
+                //  读取也会在收尾前把已销毁的 effect 订阅回各个 dep。
+                if (runEffectId !== this.runtEffectId || !this.active) return false
 
                 this.prepareTracking(isFirst)
                 this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
             },
             (isLast) => {
                 notifier.resetTracking()
-                this.completeTracking(isLast)
+                // 最后一段里被嵌套重入的新一轮取代时同样不定稿（说明见 callAsyncGetter）
+                this.completeTracking(isLast && runEffectId === this.runtEffectId)
             }
         )
     }
@@ -496,7 +536,12 @@ export class Computed extends ReactiveEffect {
         // CAUTION notifier.getDepEffects 给的是去重的 Effect, 不然这里会触发多次无意义的 run
         // 旧实现还会把双向引用记进 dirtyFromDeps/markedDirtyEffects 两个 Set：
         // 它们从无任何读取方，却对已销毁的 effect 保持强引用（纯泄漏），已移除。
-        const depEffects = notifier.getDepEffects(this.trackClassInstance ? this: this.data)
+        // CAUTION autorun/once/onChange 是没有 data 的 Computed（没有下游可言）：调度器照样会
+        //  拿到 markDirty，调用它必须是 no-op——曾把 undefined 交给 getDepEffects，
+        //  在读 primitive atom dep 的 symbol 属性时 TypeError，抛给触发写入的调用方。
+        const target = this.trackClassInstance ? this: this.data
+        if (target === undefined || target === null) return
+        const depEffects = notifier.getDepEffects(target)
         if (!depEffects) return
 
         // 错误隔离与 Notifier.triggerEffects 一致（round9 F1，同一"多订阅者派发"
@@ -595,6 +640,14 @@ export class Computed extends ReactiveEffect {
             for (let i = 0; i < infos.length; i++) {
                 triggerInfos.push(infos[i])
             }
+        } else if (infos !== undefined && !immediate && this._status !== STATUS_DIRTY && takenSessionInfos.has(infos)) {
+            // CAUTION digest 轮到本 effect，但它排队的 info 已经被一次重算接管（全量重算作废了
+            //  它们 / patch 已经重放过它们），之后也没有新的触发：不能再跑一遍——那会是一次
+            //  空 patch（onChange 的 handler 收到空数组、调度器被白调一次）。
+            //  接管它们的那次重算若抛错了（status 回到 DIRTY、phase 已回退全量），这次排队的
+            //  run 照常落入下面的 handleTriggered 重试，batch 退出时仍然追平终态。
+            //  创建时的 run([], true) 与 markDirty 的 run() 不经过这里（immediate / 无 infos）。
+            return
         }
         this.handleTriggered(immediate)
     }
@@ -650,7 +703,7 @@ export class Computed extends ReactiveEffect {
             //  例如在 autorun/once 里面可能会既依赖 computed, 产生了 computed 变化，用户自己系统通过这种方式达到一个平衡状态。
             //   例如 不断将一个 pending list 中的数据取出来变成 processing。
             //   这时候的第一次 run 会变成 clean，所以 schedule 的 recompute 一定要是 forceRecompute 才能继续执行。
-            const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? () => this.recomputeInternal(true) : this.boundRecompute
+            const recompute = (this._status > STATUS_DIRTY && !this.isAsync) ? this.boundForcedRecompute : this.boundRecompute
             if (this.scheduleNeedsInfos) {
                 // 自定义调度器是用户代码:载荷发防御副本(见 copyTriggerInfoPayload)
                 this.scheduleRecompute!(recompute, this.boundRecursiveMarkDirty, (this._triggerInfos ?? []).map(copyTriggerInfoPayload))
@@ -701,6 +754,8 @@ export class Computed extends ReactiveEffect {
     // 用 console.error 兜底上报，避免错误被完全静默吞掉。
     handleRecomputeError(err: any, willPropagate = false) {
         this.inPatch = false
+        // 抛错的这一轮若登记过强制重算（见 forcedRecompute）一并作废：状态回到 DIRTY，下次触发重试
+        this._rerunAfterRun = false
         // CAUTION patch 轮次抛错后增量状态不可信：该轮 triggerInfos 已被消费
         //  （runSimplePatch 的 finally / runAsyncPatch 的轮首快照），且 applyPatch
         //  可能已部分应用。若 phase 停留在 PATCH_PHASE，下次触发只会增量重放
@@ -723,9 +778,34 @@ export class Computed extends ReactiveEffect {
             notifier.createEffectSession()
         }
 
-        this.replaceData(result)
-        this.setStatus(STATUS_CLEAN)
-        this.setUpdatedAt(Date.now())
+        // CAUTION 写入窗口也是用户代码窗口，必须落在统一错误恢复之内（AGENTS「重算生命周期内
+        //  一切用户代码窗口必须处于 handleRecomputeError 覆盖内」）：replaceData 会解包 getter
+        //  返回的 atom（atom.lazy 的 raw 就是执行用户 getter）、会向订阅者派发 trigger 事件。
+        //  这里抛错若不处理：上面创建的 session 永远不被消化——sessionDepth 停在 1，此后**全局**
+        //  所有 trigger 只入队不执行（之后的 batch 退出也只把深度减回 1），整个响应式系统静默
+        //  冻结；本 computed 的 status 也停在 RECOMPUTING。处置与 getter 抛错一致：
+        //  先把 session 消化掉（已经入队的订阅者不受牵连；它们的错误让位于这里的原始错误，
+        //  与 batch 体抛错时的规则相同），再复位为 DIRTY，把错误抛给调用方。
+        try {
+            this.replaceData(result)
+            this.setStatus(STATUS_CLEAN)
+            this.setUpdatedAt(Date.now())
+        } catch (err) {
+            if (!this.preventEffectSession) {
+                try {
+                    notifier.digestEffectSession()
+                } catch (digestErr) {
+                    console.error('[data0] suppressed subscriber error in recompute digest (writing the result itself threw; propagating that error):', digestErr)
+                }
+            }
+            // 与 getter 抛错同一规则（见 fullRecompute）：同步首轮的错误抛给创建者，创建者拿不到句柄，
+            //  不能留下订阅——否则之后每次写依赖都会重跑这个没人能销毁的 computed，并把错误抛给写入方。
+            if (!this.isAsync && this._updatedAtTime === undefined) restoreEffectDeps(this)
+            this.handleRecomputeError(err, true)
+            throw err
+        }
+        // 成功：失败期间保存的「上一次成功的依赖」作废（只在确实保存过时写，不给每个实例加自有属性）
+        if (this._depsAtLastSuccess !== undefined) this._depsAtLastSuccess = undefined
 
         if (this.applyPatch) {
             this.phase = PATCH_PHASE
@@ -751,11 +831,33 @@ export class Computed extends ReactiveEffect {
         // 只能证明结果正确,无法区分增量与静默回退(mutation 审计暴露的检出盲区)。
         this.dispatch('fullRecompute')
         const recomputeId = ++this.recomputeId
-        // 失败重算必须恢复“上一次成功”的完整依赖集合。prepareTracking 可能在
+        // 失败重算必须保住“上一次成功”的完整依赖集合，并且留下失败这一轮已经读到的依赖
+        // （见 restoreEffectDeps 的 keepCollected）。prepareTracking 可能在
         // getter 第一次读取前就清掉旧 deps，或在抛错前只收集了一部分新 deps。
-        const previousDeps = this.deps.length ? this.deps.slice() : undefined
+        // CAUTION 有界：连续失败时，本轮开始时的 deps 已经包含上一次失败留下的依赖；以它为基础
+        //  就是逐轮累积的并集（失败期间读过的每个 key 都留下订阅，写这些早已无关的 key 也会
+        //  触发重试、把错误抛给写入方）。连续失败期间一律以「上一次成功的依赖」为基础：
+        //  保留的始终是「上一次成功 ∪ 当前这一轮读到的」。
+        const previousDeps = this._depsAtLastSuccess !== undefined
+            ? this._depsAtLastSuccess.slice()
+            : (this.deps.length ? this.deps.slice() : undefined)
         this.inPatch = false
-        // 每次 full recompute 清空所有的 triggerInfos，这样才能使 patchable recompute 不错乱。
+        // CAUTION 一条规则：全量重算一旦开始，此前为本 computed 排队的一切都不得再叠加到它的
+        //  结果上——getter 读到的已经是包含这些变更的源状态，再应用一次就是重复应用。
+        //  「排队的一切」有四处，缺一处就是一个静默分叉：
+        //  1. _triggerInfos：非 session 触发积累、等调度器的 info（下面清空，历来如此）；
+        //  2. notifier session 里记在本 effect 名下的 _sessionInfos：batch 内
+        //     `source.push(4); recompute(derived, true)`，或同一次 digest 里排在前面的订阅者
+        //     强制重算了后面的兄弟——digest 轮到它时把这些 info 当增量重放（[2, 4, 4]）。
+        //     先接管进 _triggerInfos（见 takeSessionInfos），随后一并清空；
+        //  3. 在途的 async patch 轮次：recomputeId 已推进，runAsyncPatch/runGeneratorPatch 的
+        //     循环与 generator 的逐段续跑凭它退出（async function 形态的 applyPatch 在自己的
+        //     await 之后继续执行的那段是用户代码，库拦不住，README §5 的 destroy 条款同理）；
+        //  4. phase：全量重算在途时（async getter）到达的触发必须重启全量，而不是在旧数据上
+        //     开一轮 patch——那一轮会推进 recomputeId、把在途的全量结果整个丢弃，强制重算
+        //     （或 patch 返回 false 的全量回退）被静默取消。finishFullRecompute 再置回 PATCH。
+        if (this._inSession) this.takeSessionInfos()
+        this.phase = FULL_RECOMPUTE_PHASE
         if (this._triggerInfos) this._triggerInfos.length = 0
 
         // CAUTION prepareRecompute 里跑的是用户钩子（onRecompute/onCleanup 回调、
@@ -783,7 +885,10 @@ export class Computed extends ReactiveEffect {
                 this.finishFullRecompute(result)
             }, (err: any) => {
                 if (this.recomputeId !== recomputeId) return
-                restoreEffectDeps(this, previousDeps)
+                // async computed 一定已经交到创建者手里（computed() 同步返回），首轮失败也保留
+                // 这一轮读到的依赖：否则它没有任何依赖，输入改好之后也永远不会重试。
+                if (this._depsAtLastSuccess === undefined) this._depsAtLastSuccess = previousDeps ? previousDeps.slice() : []
+                restoreEffectDeps(this, previousDeps, true)
                 this.handleRecomputeError(err)
             }).catch((finishErr: any) => {
                 // CAUTION finish 阶段（订阅者派发/clean 回调）的异常在 async 收尾没有
@@ -803,12 +908,22 @@ export class Computed extends ReactiveEffect {
             //  completeTracking 已 flush）后 recomputeId 已推进——此时绝不能
             //  restoreEffectDeps（会把已销毁 effect 重新订阅成僵尸），也不该再写状态。
             if (this.recomputeId === recomputeId) {
-                restoreEffectDeps(this, previousDeps)
+                // CAUTION 同步首轮（还没有成功过一次，_updatedAtTime 未写）抛错时不保留本轮依赖：
+                //  异常直接抛给创建者，computed()/autorun()/new RxList(getter) 都拿不到句柄，
+                //  留着订阅就是一个没人能销毁、还会在依赖变化时重跑的僵尸。成功过之后才取并集。
+                const keepCollected = this._updatedAtTime !== undefined
+                if (keepCollected && this._depsAtLastSuccess === undefined) this._depsAtLastSuccess = previousDeps ? previousDeps.slice() : []
+                restoreEffectDeps(this, previousDeps, keepCollected)
                 this.handleRecomputeError(err, true)
             }
             throw err
         }
         if (this.recomputeId !== recomputeId) return
+        // 这一轮执行期间登记了强制重算（见 forcedRecompute）：本轮结果已经过期，不发布，直接重来。
+        if (this._rerunAfterRun) {
+            this._rerunAfterRun = false
+            return this.fullRecompute()
+        }
         this.finishFullRecompute(result)
     }
     finishPatchRecompute(patchResult: any): any {
@@ -843,6 +958,13 @@ export class Computed extends ReactiveEffect {
         this.inPatch = true
         // patch 也使用 recomputeId 是因为要判断是否被强制 fullRecompute 打断
         const recomputeId = ++this.recomputeId
+        // CAUTION 增量重放的前提是「info 序列 ≡ 派生现状到源现状之间的全部变更」。patch 在
+        //  session 之内被提前启动时（自定义调度器恰好在 batch 里 flush、batch 内显式
+        //  recompute、markDirty），本 effect 名下还有 info 排在 session 里：源已经是含这些变更
+        //  的终态，只重放更早的 _triggerInfos 就是拿终态去解释操作时位置（map 的行取到错位的
+        //  index atom）。先把它们按到达序接到 _triggerInfos 之后，作为多 info 一并重放；
+        //  digest 轮到本 effect 时不再重复执行（见 run 里的 takenSessionInfos 分支）。
+        if (this._inSession) this.takeSessionInfos()
         // (曾在此派发 'recomputeDeps' 事件:全仓与下游均无监听者,死事件已移除;
         //  patch 轮的可观察事件是 prepareRecompute 里的 'recompute'/'cleanup'。)
 
@@ -889,7 +1011,30 @@ export class Computed extends ReactiveEffect {
             throw err
         }
         if (recomputeId !== this.recomputeId) return
+        // 同 fullRecompute：patch 执行期间登记了强制重算，按「无法增量」处理（清空残留 info、回退全量）。
+        if (this._rerunAfterRun) {
+            this._rerunAfterRun = false
+            patchResult = false
+        }
         return this.finishPatchRecompute(patchResult)
+    }
+    /**
+     * @internal
+     * 重算开始时接管 notifier session 里记在本 effect 名下的 info：按到达序接到 _triggerInfos
+     * 之后（全量重算随后整体作废，patch 一并重放），并把原数组清空、登记为已接管。effect 仍在
+     * sessionQueue 里：之后同一 session 的新触发照常 push 进这个数组、在原队列位置被 digest
+     * 送达；没有新触发时 digest 的那次 run 是 no-op（见 run）。
+     * 不消费 info 的 effect（needsTriggerInfo 为 false）没有 _sessionInfos，这里什么都不做。
+     */
+    private takeSessionInfos() {
+        const infos = this._sessionInfos
+        if (infos === undefined || infos.length === 0) return
+        const triggerInfos = this.triggerInfos
+        for (let i = 0; i < infos.length; i++) {
+            triggerInfos.push(infos[i])
+        }
+        infos.length = 0
+        takenSessionInfos.add(infos)
     }
     _savedTriggerInfos?: Parameters<Notifier["trigger"]>[]
     get savedTriggerInfos(): Parameters<Notifier["trigger"]>[] {
@@ -921,6 +1066,39 @@ export class Computed extends ReactiveEffect {
     _boundRecompute?: (forceRecompute?: boolean) => void
     get boundRecompute() {
         return this._boundRecompute ?? (this._boundRecompute = (forceRecompute?: boolean) => this.recomputeInternal(forceRecompute))
+    }
+    // 同步重算中又被触发时交给调度器的强制重算（见 handleTriggered）。惰性 bound：身份稳定，
+    // 也省掉原来每次这样的触发都新建一个闭包。
+    /** @internal */
+    _boundForcedRecompute?: () => void
+    /** @internal */
+    get boundForcedRecompute() {
+        return this._boundForcedRecompute ?? (this._boundForcedRecompute = () => this.forcedRecompute())
+    }
+    // CAUTION 调度器可以是同步的（`recompute => recompute()`，或带前沿调用的节流器）：它在
+    //  handleTriggered 里就地回调，而本 computed 的这一轮同步 run 还在栈上。就地嵌套重算
+    //  会出两种错：
+    //  1. marker 模式下，嵌套一轮的 finalizeDepMarkers 把它没再读的 dep 移出 deps，外层那一位
+    //     的 w 标记却还留在这些 dep 上——外层收尾时已经遍历不到它们，标记永久残留，之后同一
+    //     深度第一次读这个 dep 的**无关 effect** 被 wasTracked 误判为已订阅而静默漏订阅
+    //     （ReactiveEffect.destroy 的 CAUTION 记载的同一缺陷类）；
+    //  2. patch 型 computed 的外层 applyPatch 在嵌套的全量重算之后继续把剩下的 info 叠加上去。
+    //  处置与延迟调度器的效果对齐：这一轮先跑完，再强制重算一次——只登记、不嵌套，由外层
+    //  run 返回后的检查点兑现（fullRecompute / patchRecompute 的同步收尾）。
+    //  async patch 的同步段同样在栈上，但那里的新触发已经排进 _triggerInfos、由 patch 循环的
+    //  下一轮消化，不需要也不应该再强制全量。
+    /** @internal */
+    declare _rerunAfterRun: boolean
+    // 连续失败期间「上一次成功时的依赖」（见 fullRecompute 的有界并集）；没有在失败中时为 undefined。
+    /** @internal */
+    declare _depsAtLastSuccess: Dep[] | undefined
+    /** @internal */
+    forcedRecompute() {
+        if (ReactiveEffect.activeScopes.includes(this)) {
+            if (!(this.isPatchAsync && this.inPatch)) this._rerunAfterRun = true
+            return
+        }
+        this.recomputeInternal(true)
     }
     // 内部触发路径（handleTriggered/调度器）用的重算：不经过 cleanPromise 的创建性 getter。
     // CAUTION 内部路径不能创建 cleanPromise：内部调用方从不 await，无谓地创建会让
@@ -987,7 +1165,11 @@ export class Computed extends ReactiveEffect {
         // CAUTION 每轮循环（以及每个 await 恢复点）都要检查 active：destroy 不会中止
         //  已挂起的 applyPatch，但必须阻止其结果被继续应用/续跑（否则已销毁实例的
         //  data 会被在途 patch 复活改写）。
-        while(this.active && this.triggerInfos.length) {
+        // CAUTION 同时检查轮次：强制全量重算（或 patch 回退的全量）推进了 recomputeId 之后，
+        //  本循环已被取代。继续 while 的话，它会把全量之后新到的 info 抢走、与新一轮 patch
+        //  并发应用（patch 轮次不再串行），而它自己的收尾早已因 recomputeId 不符被丢弃。
+        const round = this.recomputeId
+        while(this.active && this.recomputeId === round && this.triggerInfos.length) {
             const waitingTriggerInfos = [...this.triggerInfos]
             this.triggerInfos.length = 0
             let patchPromise
@@ -1015,9 +1197,10 @@ export class Computed extends ReactiveEffect {
     }
     async runGeneratorPatch() {
         let patchResult
+        // active / 轮次检查与 runAsyncPatch 相同：destroy 或被全量重算取代后不再续跑
+        const round = this.recomputeId
 
-        // active 检查与 runAsyncPatch 相同：destroy 后不再续跑
-        while(this.active && this.triggerInfos.length) {
+        while(this.active && this.recomputeId === round && this.triggerInfos.length) {
             const waitingTriggerInfos = [...this.triggerInfos]
             this.triggerInfos.length =0
             const generator = (this.applyPatch! as GeneratorApplyPatchType<any>).call(this, this.data, waitingTriggerInfos)
@@ -1026,6 +1209,13 @@ export class Computed extends ReactiveEffect {
             try {
                 patchResult = await this.runGenerator(generator,
                     (isFirst) => {
+                        // CAUTION generator 的每一段都由库驱动，恢复点必须自己把关（与 generator
+                        //  getter 的 runtEffectId 检查同款）：
+                        //  - 已销毁：再入栈的话，这一段里的 manualTrack 会把已销毁的 computed
+                        //    重新订阅回去、创建的子 effect 挂到一个不会再销毁它们的父亲上（泄漏）；
+                        //  - 已被全量重算取代：剩下的段会把过期的 info 叠加到全量结果上（[10, 20, 20]）。
+                        //  返回 false 让 runGenerator 就地停下（此时尚未入栈，不需要 afterRun）。
+                        if (!this.active || this.recomputeId !== round) return false
                         this.prepareTracking(false, true)
                         this.pauseAutoTrack()
                     },
@@ -1037,6 +1227,11 @@ export class Computed extends ReactiveEffect {
             } finally {
                 this.asyncStatus!(false)
             }
+            // CAUTION 与 runAsyncPatch 的 break 同一语义(兄弟实现点曾不一致):显式 false 表示
+            //  这一轮无法增量,必须原样交给 finishPatchRecompute 回退全量重算。不 break 的话,
+            //  挂起期间排队的 info 会被下一轮继续增量应用,循环结束时 patchResult 是最后一轮的
+            //  返回值——false 被吞掉,返回 false 那一轮的变更在派生数据里永久缺失。
+            if (patchResult === false) break
         }
 
         return patchResult
@@ -1081,11 +1276,32 @@ export class Computed extends ReactiveEffect {
         //  （recomputeId 比对）失效；配合 runAsyncPatch/runGeneratorPatch 的 active
         //  检查与 Rx 结构变更方法的 active 守卫，destroy 之后在途 patch 不再改写数据。
         this.recomputeId++
-        this.lastCleanupFn?.()
+        // CAUTION 销毁后对一切触发完全静默，复用 skipIndicator 这道既有的门（run /
+        //  runFromTrigger / runFromAtomTrigger 的第一行），触发热路径不为此多付一次判断。
+        //  销毁时本 effect 可能还排在 notifier 的 session 队列里（batch 内先写依赖再销毁），
+        //  或在同一次内联派发的快照里排在销毁它的兄弟之后：run 照样会被调用。没有这道门，
+        //  已销毁的 computed 会被标脏、派发 dirty、调用调度器，并把 _cleanExpected 置回 true——
+        //  此后读 cleanPromise / recompute() 得到一个永远不会 settle 的 promise。
+        this.skipIndicator = DESTROYED_SKIP
+        // CAUTION 用户清理抛错不能跳过本钩子余下的步骤（「销毁必须做完」，README §6）：
+        //  静态销毁核心在本钩子抛错后会把通用步骤补完（摘订阅、断父链、销毁子 effect、派发
+        //  destroy），但钩子自己没做完的部分它无从知道。这里曾是顺序执行——清理一抛错，
+        //  settleCleanPromise 就被跳过，而在途的那一轮计算已被上面的 recomputeId++ 作废、
+        //  不会再有人 settle：await cleanPromise 的调用方永久挂起。
+        //  本钩子里会抛错的用户代码只有这一处，try/finally 即可：错误照常抛给调用方（由静态
+        //  核心按「第一个错误抛出、其后的上报」汇总），余下的步骤照做。
+        //  先复位再调用（与 prepareRecompute 同款）：清理只执行一次。
+        const cleanup = this.lastCleanupFn
         delete this.lastCleanupFn
-        // 计算尚未完成就被销毁时，解除所有 await cleanPromise 的等待方
-        this.settleCleanPromise()
-        super.destroyResources()
+        try {
+            cleanup?.()
+        } finally {
+            // 计算尚未完成就被销毁时，解除所有 await cleanPromise 的等待方
+            this.settleCleanPromise()
+            // 失败期间保存的依赖快照不再有用，别让已销毁的 computed 继续持有这些 dep
+            if (this._depsAtLastSuccess !== undefined) this._depsAtLastSuccess = undefined
+            super.destroyResources()
+        }
     }
     destroyEffect(effect: ReactiveEffect) {
         // 因为可能是 computed，destroy 和 ReactiveEffect 不一样，所以要调用它自己身的
@@ -1098,6 +1314,8 @@ Computed.prototype.scheduleNeedsInfos = false
 Computed.prototype._cleanExpected = false
 Computed.prototype.preventEffectSession = false
 Computed.prototype._asyncGetterWarned = false
+Computed.prototype._rerunAfterRun = false
+Computed.prototype._depsAtLastSuccess = undefined
 
 /**
  * @category Basic

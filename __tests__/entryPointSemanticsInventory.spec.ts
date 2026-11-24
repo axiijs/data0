@@ -20,13 +20,21 @@
  *                       set(i, sameItem) 强制重建行,单方面加门属协议变更,须与 axii/axle 同步)
  *   structural          结构变更(增删/换序/清空):判等无意义,已由差分 fuzz 族覆盖
  *   wholesaleReplace    整体替换:destroyed no-op + methodResult 协议形状(consumerContractReplay)
+ *
+ * 正交轴「key 载荷透传 × 内部消费者归一化」(-0,见文件末):RxMap/RxSet 每个带 key/成员参数的
+ * 变更入口,载荷(argv / key)透传调用方原值(AGENTS「argv 原始参数契约不得改写,内部消费者
+ * 独立归一化」),而按载荷重放的内部消费者(keys/values/entries/toList)与全量重算在 Object.is
+ * 下一致。曾只在 set/delete 写入口改写 -0、漏掉 replace——同一事故形状,故机械过账。
  */
 import {describe, expect, test} from 'vitest'
 import {atom} from '../src/atom.js'
 import {RxList} from '../src/RxList.js'
 import {RxMap} from '../src/RxMap.js'
 import {RxSet} from '../src/RxSet.js'
-import {autorun} from '../src/common.js'
+import {autorun, onChange} from '../src/common.js'
+import {Computed} from '../src/computed.js'
+import {ITERATE_KEY} from '../src/notify.js'
+import {TrackOpTypes} from '../src/operations.js'
 import {MUTATIONS} from './surfaceClassification.js'
 
 // ---- 语义分组(账本本体) ----
@@ -196,4 +204,86 @@ describe('equalityExempt 豁免的特征钉扎(变更即协议决策,失败先�
         expect(ekcCount).toBe(2)
         stop(); mapped.destroy(); list.destroy()
     })
+})
+
+// ---- key 载荷透传 × 内部消费者归一化(-0) ----
+// 每个 RxMap/RxSet 变更入口要么有探针,要么显式豁免(无 key 参数)。探针断言两件事:
+//   payloadRaw  载荷里是调用方传入的原值(-0 原样;replace 的 argv 是调用方的容器本身)
+//   derivedOk   按载荷重放的内部消费者 ≡ 全量重算(Object.is 逐元素,含顺序)
+type KeyProbe = {entry: string, run: () => {payloadRaw: boolean, derivedOk: boolean}}
+const sameSeq = (a: readonly unknown[], b: readonly unknown[]) => a.length === b.length && a.every((x, i) => Object.is(x, b[i]))
+const captureIterate = (target: object) => {
+    const infos: any[] = []
+    const c = new Computed(function (this: Computed) { this.manualTrack(target, TrackOpTypes.ITERATE, ITERATE_KEY) },
+        function (_d: unknown, triggerInfos: any[]) { infos.push(...triggerInfos) })
+    c.run([], true)
+    return {infos, stop: () => c.destroy()}
+}
+const mapDerivedOk = (m: RxMap<any, any>, keys: RxList<any>, values: RxList<any>, entries: RxList<[any, any]>) =>
+    sameSeq(keys.data, [...m.data.keys()]) && sameSeq(values.data, [...m.data.values()])
+    && sameSeq(entries.data.map(e => e[0]), [...m.data.keys()])
+const mapProbe = (entry: string, initial: [any, any][], write: (m: RxMap<any, any>) => void, payloadRaw: (methodInfos: any[], keyInfos: any[]) => boolean): KeyProbe => ({
+    entry,
+    run: () => {
+        const m = new RxMap<any, any>(initial)
+        const keys = m.keys(), values = m.values(), entries = m.entries()
+        const methodInfos: any[] = []
+        const stopMethod = onChange(m, (infos: any[]) => { methodInfos.push(...infos) })
+        const keyLevel = captureIterate(m)
+        write(m)
+        stopMethod(); keyLevel.stop()
+        const result = {payloadRaw: payloadRaw(methodInfos, keyLevel.infos), derivedOk: mapDerivedOk(m, keys, values, entries)}
+        m.destroy()
+        return result
+    },
+})
+const setProbe = (entry: string, initial: any[], write: (s: RxSet<any>) => unknown, payloadRaw: (methodInfos: any[], written: unknown) => boolean): KeyProbe => ({
+    entry,
+    run: () => {
+        const s = new RxSet<any>(initial)
+        const list = s.toList()
+        const methodInfos: any[] = []
+        const stop = onChange(s, (infos: any[]) => { methodInfos.push(...infos) })
+        const written = write(s)
+        stop()
+        const result = {payloadRaw: payloadRaw(methodInfos, written), derivedOk: sameSeq(list.data, [...s.data])}
+        list.destroy(); s.destroy()
+        return result
+    },
+})
+const isMinusZero = (x: unknown) => Object.is(x, -0)
+const KEY_PROBES: KeyProbe[] = [
+    mapProbe('RxMap.set', [[1, 'w']], m => m.set(-0, 'v'), method => method.length === 1 && isMinusZero(method[0].argv[0])),
+    mapProbe('RxMap.delete', [[0, 'v'], [1, 'w']], m => m.delete(-0), method => method.length === 1 && isMinusZero(method[0].argv[0])),
+    mapProbe('RxMap.replace', [[1, 'w']], m => m.replace([[-0, 'v']]), (_m, keyLevel) => keyLevel.some(i => i.type === 'add' && isMinusZero(i.key))),
+    mapProbe('RxMap.replaceData', [[1, 'w']], m => m.replaceData([[-0, 'v']]), (_m, keyLevel) => keyLevel.some(i => i.type === 'add' && isMinusZero(i.key))),
+    setProbe('RxSet.add', [1], s => s.add(-0), method => method.length === 1 && isMinusZero(method[0].argv[0])),
+    setProbe('RxSet.delete', [0, 1], s => s.delete(-0), method => method.length === 1 && isMinusZero(method[0].argv[0])),
+    // replace 的 argv 是调用方传入的容器本身(采纳/读取都不改写它);成员由 Set 去重归一化
+    setProbe('RxSet.replace', [1], s => { const arr = [-0, 2]; s.replace(arr); return arr }, (method, arr) => method.length === 1 && method[0].argv[0] === arr),
+    setProbe('RxSet.replaceData', [1], s => { const arr = [-0, 2]; s.replaceData(arr); return arr }, (method, arr) => method.length === 1 && method[0].argv[0] === arr),
+]
+// 无 key/成员参数的入口
+const KEY_EXEMPT: Record<string, string> = {
+    'RxMap.clear': '无 key 参数',
+    'RxSet.clear': '无成员参数(委托 replace([]))',
+}
+
+describe('key 载荷透传 × 内部消费者归一化(-0)', () => {
+    test('RxMap/RxSet 的每个变更入口都有 -0 探针或显式豁免', () => {
+        const probed = new Set(KEY_PROBES.map(p => p.entry))
+        const missing: string[] = []
+        for (const cls of ['RxMap', 'RxSet']) {
+            for (const m of MUTATIONS[cls]) {
+                const entry = `${cls}.${m}`
+                if (!probed.has(entry) && !KEY_EXEMPT[entry]) missing.push(entry)
+            }
+        }
+        expect(missing, `以下入口缺 -0 载荷探针:\n${missing.join('\n')}`).toEqual([])
+    })
+    for (const probe of KEY_PROBES) {
+        test(`${probe.entry}(-0):载荷透传原值,内部消费者 ≡ 全量重算`, () => {
+            expect(probe.run(), probe.entry).toEqual({payloadRaw: true, derivedOk: true})
+        })
+    }
 })

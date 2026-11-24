@@ -132,12 +132,16 @@ export function atom(initValue: AtomInitialType, interceptor? : AtomInterceptor<
         }
     })
 
-    if (name) {
-        setDebugName(finalUpdater, name)
-    }
-
     def(finalUpdater, ReactiveFlags.IS_ATOM, true)
     const finalProxy = new Proxy(finalUpdater, finalHandler) as Atom<typeof initValue>
+
+    // CAUTION 调试名登记在**对外的身份**（返回的 proxy）上：名字表是按对象身份查的
+    //  WeakMap，曾登记在内部的 finalUpdater 上——外部永远拿不到这个函数，对象形态
+    //  atom 的 getDebugName(atom) 恒为 undefined（primitive 形态返回的就是 updater
+    //  本身，所以一直是好的；两种形态必须一致）。
+    if (name) {
+        setDebugName(finalProxy, name)
+    }
     return finalProxy
 }
 

@@ -5,6 +5,7 @@ import {
     Computed,
     destroyComputed,
     DirtyCallback,
+    getComputedInternal,
     GetterType,
     setComputedRetainedDiagnosticSource,
     STATUS_CLEAN
@@ -15,7 +16,7 @@ import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js"
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, toProtocolPayload, warn} from "./util.js";
 import {reconstructDigestStates} from "./digestReplay.js";
-import {isolateTeardown, ReactiveEffect} from "./reactiveEffect.js";
+import {isolateTeardown, ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
 // selection 家族(2026-H3 round6 拆分):实现在 rxListSelection.ts,类方法委托
@@ -72,6 +73,20 @@ class MapItemDependencyProbe extends ReactiveEffect {
     hasCaptures() {
         return this.deps.length > 0 || this.hasChildren()
     }
+}
+
+// CAUTION map 的行清理错误收集（与 ReactiveEffect 销毁路径同一规则：清理抛错，其余清理
+//  照常做完）：一次变更可能让多行同时离场（destroy / 全量重建 / splice 删多行），
+//  每行又有三段用户清理（行 effect 的销毁、context.onCleanup 注册的清理、
+//  options.onCleanup）。任何一段抛错都不能让排在后面的清理收不到调用——那是它们
+//  最后一次机会，被跳过的资源永久泄漏。全部做完后把**第一个**错误抛给调用方，
+//  其余错误经 reportTeardownError 上报。哨兵值而不是 {failed, first} 对象：
+//  无错误的常态路径零分配。
+const NO_TEARDOWN_ERROR: unique symbol = Symbol('no teardown error')
+function keepFirstTeardownError(first: unknown, error: unknown): unknown {
+    if (first === NO_TEARDOWN_ERROR) return error
+    reportTeardownError(error)
+    return first
 }
 
 // 无依赖行共享同一个 frozen 空 frame，长列表少一次每行的空数组分配；
@@ -145,6 +160,10 @@ function normalizeIndexKey(key: unknown): unknown {
 const TOSORTED_BULK_MIN = 64
 const TOSORTED_BULK_RATIO = 4
 const TOSORTED_BULK_CAP = 4096
+
+// toSet 批量删除阈值：单次 splice 删除项达到该数量时改走单遍路径（理由与标定见
+// toSet applyPatch 内注释）。
+const TOSET_BULK_MIN = 128
 
 // SameValueZero(NaN 等于自身):与 Map 组键语义一致,用于 dev 稳定性比对与
 // selection atom 单选分支的判等(R6-1)。
@@ -355,6 +374,13 @@ export class RxList<T> extends Computed {
             warn('mutating a destroyed RxList is a no-op')
             return []
         }
+        // CAUTION 自别名守卫：items 恰为本列表自己的 data（`list.spliceArray(n, 0, list.data)`
+        //  把列表接到自己后面——data 是只读视图，把它当入参读取是契约内用法）。
+        //  doSplice 先原地改 data、再从 items 展开协议载荷 argv：别名下展开到的是
+        //  **变更之后**的整个列表，派生结构收到的"插入项"比真实插入多（源 [1,2,1,2]、
+        //  map 派生 6 行），大批量路径（spliceMany 的 copyWithin 手动搬移）还会边读边
+        //  覆盖、连 data 本身都写坏。别名时先取快照；非别名零开销（一次指针比较）。
+        if (items === this.data) items = items.slice()
         this.pauseAutoTrack()
         // CAUTION try/finally：trigger/digest 会同步执行订阅者，订阅者抛错时必须
         //  复位追踪状态，否则 trackStack 每次异常泄漏一个槽位、顶层 shouldTrack
@@ -646,12 +672,40 @@ export class RxList<T> extends Computed {
         // pairsOwned:pair 由本方法自建,未暴露给调用方
         return this.reorder(newOrder, createReorderPatchInfo('swap', newOrder, { start, newStart, limit }), true)
     }
+    // CAUTION undefined 元素与 Array#sort 对齐（undefined 是 RxList 的合法元素值）：
+    //  平台从不把 undefined 交给 comparator，一律排到尾部（其后才是稀疏洞）。这里排的
+    //  是下标数组（元素恒为 number），不显式分流的话 undefined 会被原样喂给用户
+    //  comparator——数值型 `(a, b) => a - b` 返回 NaN（视作相等），列表原样不动、
+    //  排完仍是乱序；按字段比较的 comparator 直接 TypeError 抛给调用方；同一份数据
+    //  的 toSorted(compare)（全量走原生 sort）与 sortSelf(compare) 结果分叉。
+    //  分流后：有定义的元素按 compare 稳定排序，显式 undefined 按源序排其后，洞位
+    //  再其后（reorder 的搬移仍会把洞物化成显式 undefined，属既有的洞物化语义）。
+    //  稠密且无 undefined 的列表（契约内的常态）走的比较序列与分流前逐次相同，
+    //  也不多分配。
     sortSelf(compare: (a: T, b:T)=> number) {
-        const sortedOldIndexes = new Array<number>(this.data.length)
-        for (let index = 0; index < this.data.length; index++) {
-            sortedOldIndexes[index] = index
+        const data = this.data
+        const length = data.length
+        const sortedOldIndexes = new Array<number>(length)
+        let definedCount = 0
+        let undefinedIndexes: number[] | undefined
+        let holeIndexes: number[] | undefined
+        for (let index = 0; index < length; index++) {
+            if (data[index] !== undefined) {
+                sortedOldIndexes[definedCount++] = index
+            } else if (Object.prototype.hasOwnProperty.call(data, index)) {
+                (undefinedIndexes ?? (undefinedIndexes = [])).push(index)
+            } else {
+                (holeIndexes ?? (holeIndexes = [])).push(index)
+            }
         }
-        sortedOldIndexes.sort((a, b) => compare(this.data[a]!, this.data[b]!))
+        if (definedCount !== length) sortedOldIndexes.length = definedCount
+        sortedOldIndexes.sort((a, b) => compare(data[a]!, data[b]!))
+        if (undefinedIndexes !== undefined) {
+            for (let i = 0; i < undefinedIndexes.length; i++) sortedOldIndexes.push(undefinedIndexes[i]!)
+        }
+        if (holeIndexes !== undefined) {
+            for (let i = 0; i < holeIndexes.length; i++) sortedOldIndexes.push(holeIndexes[i]!)
+        }
 
         const newOrder = new Array<Order>(sortedOldIndexes.length)
         for (let newIndex = 0; newIndex < sortedOldIndexes.length; newIndex++) {
@@ -835,6 +889,11 @@ export class RxList<T> extends Computed {
         // 规范下标字符串归一化(与 set 对称):at("2") 必须与 set(2) 的触发 key
         // 落在同一个 dep 上,否则订阅永久漏触发(见 normalizeIndexKey)
         index = normalizeIndexKey(index) as number
+        // CAUTION 非整数下标（1.5、NaN）**不**按 Array.prototype.at 取整：key 与 set 对称地
+        //  原样当作属性名（README §4：set 的非整数 key 等同普通数组赋值、key 原样透传）。
+        //  set(1.5, v) 写的是属性 "1.5" 并触发 key 1.5，at(1.5) 读同一个属性、订阅同一个
+        //  key——读写对称、订阅会被触发。取整会让 at(1.5) 改读第 1 行，与 set(1.5) 写入的
+        //  位置分叉（曾在审查修复中误改，已回退并由回归测试钉住）。
         // 与 Array.prototype.at 一致：支持负索引（从末尾回数）。
         // CAUTION 负索引的结果依赖 length，不能建 index dep（元素本身没变时对应
         //  index 不会触发 SET），track ITERATE_KEY——所有结构变更（splice/reorder/set）
@@ -935,10 +994,158 @@ export class RxList<T> extends Computed {
         // 探测一行：mapFn 恰好执行一次；捕获到依赖/子 effect 时升级为常驻的行级
         // Computed（探测期间建立的订阅原样转移），无依赖行零对象分配。
         // 返回 [mapFn 返回值, 行级 effect frame]。
+        // CAUTION index atom 的越界守卫（缺陷类：操作时位置 × 重放时终态）：传入的
+        //  index 是"该条 info 操作时"的行位置，source.atomIndexes 却按**终态** source
+        //  对齐。重放并未处在终态时（多 info 重放中途才首次出现响应式行；延迟调度的
+        //  patch 落后于 source），操作时位置可能 ≥ 终态长度——旧实现直接
+        //  ensureAtomIndex(index) 把 source.atomIndexes 撑到比 source.data 还长：重放
+        //  随后回退全量重算，但被撑长的尾部无人回收，dev 构建下此后 source 的每次
+        //  结构变更都抛 'atomIndexes longer than data'（batch 内"插入响应式行 + 截短
+        //  列表"即可触发，fuzz 动态复现），prod 构建则是常驻的幽灵 atom。
+        //  不变量（构造性）：map 的 patch **绝不**撑长 source.atomIndexes——越界时
+        //  只置位 indexAtomOutOfRange，本轮 patch 结尾据此回退全量重算（按终态重建
+        //  全部行）；返回的游离 atom 只为让 mapFn 的 index 参数在回退前可调用，
+        //  需要 index 定位的行级 Computed 在越界时保持惰性（不持有任何 index atom，
+        //  getter 空转），因此不存在"活着却拿着未登记 index"的行。
+        let indexAtomOutOfRange = false
         function indexAtomFor(index: number): Atom<number> {
+            if (index >= source.data.length) {
+                indexAtomOutOfRange = true
+                return atom(index)
+            }
             // useIndex 或行级依赖升级后都会需要可靠的 index atom；越界 set 造成的
             // 稀疏洞不能把 undefined 传给用户 mapFn。
             return source.ensureAtomIndex(index)
+        }
+
+        // CAUTION 多行离场的统一清理出口（destroy / 全量重建 / splice 删除）：三段用户清理
+        //  逐行逐段隔离错误，全部执行完才把第一个错误抛出（规则见
+        //  keepFirstTeardownError）。调用方必须**先完成自己的记账**（槽位/frame 数组
+        //  的摘除与对齐）再调用：这里抛出的错误会中止调用方，不能再留下半截记账。
+        //  forEach 而不是下标循环：保持对稀疏洞的既有处理（跳洞，不以 undefined 调用
+        //  用户清理）；frame 的 ?. 兜住 reorder 把洞物化成的显式 undefined。
+        function teardownRows(
+            owner: RxList<U>,
+            frames: (ReactiveEffect[] | undefined)[] | undefined,
+            slots: (MapCleanupSlot | undefined)[] | undefined,
+            values: U[] | undefined,
+        ) {
+            let first: unknown = NO_TEARDOWN_ERROR
+            frames?.forEach((frame) => {
+                frame?.forEach((effect) => {
+                    try {
+                        owner.destroyEffect(effect)
+                    } catch (error) {
+                        first = keepFirstTeardownError(first, error)
+                    }
+                })
+            })
+            slots?.forEach((slot) => {
+                const fn = slot?.fn
+                if (fn === undefined) return
+                try {
+                    fn()
+                } catch (error) {
+                    first = keepFirstTeardownError(first, error)
+                }
+            })
+            if (values !== undefined && options?.onCleanup) {
+                values.forEach((value) => {
+                    try {
+                        options.onCleanup!(value)
+                    } catch (error) {
+                        first = keepFirstTeardownError(first, error)
+                    }
+                })
+            }
+            if (first !== NO_TEARDOWN_ERROR) throw first
+        }
+
+        // CAUTION 行级重算写回新值的唯一出口：options.onCleanup 的契约是"映射值离场时
+        //  销毁它"——splice 删除、set 替换、全量重建、整体销毁四个出口都会调用，
+        //  唯独行级重算用新值顶替旧值时曾把 list.set 返回的旧值直接丢弃（同名 API 的
+        //  兄弟实现点，R8-5 只补了 context.onCleanup）：mapFn 每轮创建的非响应式资源
+        //  （DOM 节点、订阅句柄）随依赖变化逐轮泄漏，destroy 也只清理最后一轮的值。
+        //  - 判等门（Object.is）：mapFn 返回同一个值（按 item 缓存的对象）时旧值并未
+        //    离场，此刻销毁它等于销毁仍在列表里的行。
+        //  - 与行级 context cleanup 同款隔离：它跑在行 effect 自己的 getter 里，读取
+        //    不得建立依赖（README「清理不建立依赖」）。
+        //  - 旧值在 set **之前**从 list.data 取，清理放在 set 之后、无论 set 是否抛错都执行：
+        //    set 会在自己的 session 里同步 digest 下游订阅者，订阅者抛错时 set 已写入、旧值
+        //    已离场——清理若排在 set 的正常返回之后就被跳过，旧值永久泄漏（destroy 也不会
+        //    再清理它）。两段都抛错时按 keepFirstTeardownError：先抛 set 的错误，清理的上报。
+        //  - 不能拿 set 的返回值当旧值：已销毁实例的 set 是返回 `undefined as T` 的 no-op，
+        //    undefined 又是合法的映射值——行在自己的重算里销毁了整个 map（清理或 mapFn 里
+        //    destroy）时，旧实现会以 undefined 调用 options.onCleanup（用户回调解引用即
+        //    TypeError，抛给写依赖的人）。已销毁时直接返回：旧值已由销毁清理过。
+        //  map 级函数而不是逐行闭包：响应式行不为它多付一个闭包。
+        function replaceRowValue(list: RxList<U>, rowIndex: number, nextValue: U) {
+            if (!list.active) return
+            if (options?.onCleanup === undefined) {
+                list.set(rowIndex, nextValue)
+                return
+            }
+            const previousValue = list.data[rowIndex]
+            let first: unknown = NO_TEARDOWN_ERROR
+            try {
+                list.set(rowIndex, nextValue)
+            } catch (error) {
+                first = error
+            }
+            if (!Object.is(previousValue, nextValue)) {
+                const isolated = isolateTeardown()
+                try {
+                    options.onCleanup(previousValue)
+                } catch (error) {
+                    first = keepFirstTeardownError(first, error)
+                } finally {
+                    if (isolated) notifier.resetTracking()
+                }
+            }
+            if (first !== NO_TEARDOWN_ERROR) throw first
+        }
+
+        // CAUTION 待重放窗口内的行定位（规模债务：共享依赖 × 待重放结构 info）：行级重算
+        //  发现本列表还有未重放的结构 info 时，要按行 effect 的身份找到该行的当前
+        //  （pre-patch）位置。逐行 findIndex 在「窗口内很多行重算」时是 O(n²)——
+        //  `batch(() => { sharedAtom(x); source.push(y) })` 让全部 n 行都走到这里（4 万行
+        //  实测秒级）；延迟调度的 map 在 info 待重放期间的每次行级重算同理。
+        //  而「窗口内只有一行重算」（batch 里改一行的字段再追加一行，最常见的形态）用表
+        //  反而慢一个量级：建表是 n 次 Map 插入，线性查找只到该行为止（4 万行实测 ~16 倍）。
+        //  所以按窗口内的定位次数分档：第一次线性查找（与旧实现逐次相同），第二次起建
+        //  "行 effect → 位置"表，之后 O(1)。一窗口总代价 ≤ 一次线性 + 一次建表。
+        //  自校验而不是靠失效点：命中后必须在 frame 数组的该位置上真的找到这个 effect
+        //  才采信，否则重建——frame 数组在窗口内本来不变，但 patch 进行中由 mapFn /
+        //  清理里的写入内联触发的行级重算会跨过 frame 的搬移，校验让任何漏掉的失效点
+        //  都只是多一次重建而不是写错行。patch / 全量重算的入口与出口、销毁时复位
+        //  （resetRowLocator），表与计数不跨窗口常驻。
+        let pendingRowPositions: Map<ReactiveEffect, number> | undefined
+        let rowLocatedOnceInWindow = false
+        function resetRowLocator() {
+            pendingRowPositions = undefined
+            rowLocatedOnceInWindow = false
+        }
+        function locateRowFrame(list: RxList<U>, row: ReactiveEffect): number {
+            const frames = list._effectFramesArray
+            if (frames === undefined) return -1
+            if (pendingRowPositions !== undefined) {
+                const cached = pendingRowPositions.get(row)
+                if (cached !== undefined) {
+                    const frame = frames[cached]
+                    if (frame !== undefined && frame.indexOf(row) !== -1) return cached
+                }
+            } else if (!rowLocatedOnceInWindow) {
+                rowLocatedOnceInWindow = true
+                // 稀疏行：越界 set 的洞 / reorder 物化出的显式 undefined
+                return frames.findIndex(frame => frame !== undefined && frame.indexOf(row) !== -1)
+            }
+            const positions = pendingRowPositions = new Map<ReactiveEffect, number>()
+            for (let i = 0; i < frames.length; i++) {
+                const frame = frames[i]
+                if (frame === undefined) continue
+                for (let j = 0; j < frame.length; j++) positions.set(frame[j]!, i)
+            }
+            return positions.get(row) ?? -1
         }
 
         function runItemAndCollectEffect(list: RxList<U>, item: T, index: number, mapContext: MapContext | undefined, slot?: MapCleanupSlot): [U, ReactiveEffect[]] {
@@ -954,7 +1161,9 @@ export class RxList<T> extends Computed {
                     source.addAtomIndexesDep()
                     addedAtomIndexesDep = true
                 }
-                newItemIndex = indexAtomFor(index)
+                const indexAtom = indexAtomFor(index)
+                // 越界（见 indexAtomFor）：不交给行级 Computed，该行惰性存活到本轮回退
+                if (!indexAtomOutOfRange) newItemIndex = indexAtom
             }
             // CAUTION 行级重算前先执行上一轮注册的 cleanup(2026-H3 round8 R8-5):
             //  context.onCleanup 在 Computed 侧的语义是"每轮重算前执行一次"
@@ -989,7 +1198,7 @@ export class RxList<T> extends Computed {
                         (list._inSession && list._sessionInfos !== undefined && list._sessionInfos.length > 0)
                     if (!hasPendingStructuralInfos) {
                         runRowCleanup?.()
-                        list.set(finalIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
+                        replaceRowValue(list, finalIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
                     } else {
                         // 行是否仍存活：终态 atomIndexes 里该位置的 atom 必须是自己
                         // （身份比较）。不是自己说明本行已被待重放的结构操作移除，
@@ -997,11 +1206,10 @@ export class RxList<T> extends Computed {
                         if (source.atomIndexes?.[finalIndex] !== newItemIndex) return
                         // 按行 effect frame 的身份定位行的当前（pre-patch）位置：
                         // 新值写在旧位置上，随后的结构重放会把它随行搬到终态位置。
-                        const frames = list._effectFramesArray
-                        const currentIndex = frames ? frames.findIndex(frame => frame !== undefined && frame.indexOf(rowComputed) !== -1) : -1
+                        const currentIndex = locateRowFrame(list, rowComputed)
                         if (currentIndex !== -1) {
                             runRowCleanup?.()
-                            list.set(currentIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
+                            replaceRowValue(list, currentIndex, mapFn(source.data[finalIndex], newItemIndex, mapContext!))
                         }
                     }
                 }
@@ -1016,6 +1224,10 @@ export class RxList<T> extends Computed {
         // 执行旧行的 cleanup（行级 effect 由 destroyChildren 统一销毁，但 cleanup
         // 槽位与 options.onCleanup 归本结构管理）。
         let hasComputedOnce = false
+        // this.data 里的映射值是否还"欠"一次 options.onCleanup。全量重建的清理段抛错后
+        // 旧值已全部清理过，但 this.data 要等下一次成功的重算才换成新值——期间的重试
+        // 重建与 destroy 不得对同一批旧值再清理一遍。
+        let mappedValuesAwaitCleanup = false
 
         return new RxList(
             function computation(this: RxList<U>) {
@@ -1023,16 +1235,27 @@ export class RxList<T> extends Computed {
                 this.manualTrack(source, TrackOpTypes.EXPLICIT_KEY_CHANGE, TriggerOpTypes.EXPLICIT_KEY_CHANGE);
                 if (hasComputedOnce) {
                     // 重建 = 所有旧行被替换：逐行执行 cleanup（与 splice 删除行的语义一致）
-                    cleanupSlots?.forEach((slot) => { slot?.fn?.() })
-                    if (options?.onCleanup) {
-                        this.data.forEach((item) => options.onCleanup!(item))
-                    }
+                    // CAUTION 先交接记账、再执行用户清理（清理抛错时每个都照常执行，第一个
+                    //  错误在全部执行完后抛出，见 teardownRows）：旧实现在清理循环里直接
+                    //  抛出——排在后面的行永远收不到清理，而且槽位数组原样留着，之后每次
+                    //  重试重建都把已清理过的行再清理一遍、再在同一行抛错，派生列表从此
+                    //  无法恢复（违反 README「用户回调抛错不冻结状态机」）。交接之后旧行的
+                    //  清理恰好执行一次，抛错后的下一次触发按终态正常重建。
+                    const oldSlots = cleanupSlots
+                    const oldValues = mappedValuesAwaitCleanup ? this.data : undefined
+                    cleanupSlots = undefined
+                    mappedValuesAwaitCleanup = false
                     // 旧行级 effect 已由 prepareTracking 的 destroyChildren 销毁，
                     // 记账数组必须清空重建，否则新列表更短时尾部残留悬垂 frame。
                     this.effectFramesArray!.length = 0
+                    teardownRows(this, undefined, oldSlots, oldValues)
                 }
                 hasComputedOnce = true
                 cleanupSlots = useContext ? [] : undefined
+                // 全量重算按终态建行，下标恒在界内；复位上一轮 patch 回退时留下的越界标记，
+                // 否则重建出的行会被当成"越界行"而保持惰性（永久失去响应）。
+                indexAtomOutOfRange = false
+                resetRowLocator()
 
                 const result: U[] = []
                 const sourceData = source.data
@@ -1063,6 +1286,7 @@ export class RxList<T> extends Computed {
                     }
                 }
 
+                mappedValuesAwaitCleanup = true
                 return result
             },
             function applyMapArrayPatch(this: RxList<U>, _data, triggerInfos) {
@@ -1072,8 +1296,11 @@ export class RxList<T> extends Computed {
                 //  按操作时位置去取终态 atom 会拿到相邻行的 atom（行从此追踪错误位置）。
                 //  数据本身的重放（值来自 argv/newValue，位置对本列表顺序重放）不受影响，
                 //  因此只有真正使用 index atom 的 map 需要回退全量重算。
+                // 待重放窗口到此结束（见 locateRowFrame）
+                resetRowLocator()
                 if (triggerInfos.length > 1 && addedAtomIndexesDep) return false
                 const hadIndexAtomsAtPatchStart = addedAtomIndexesDep
+                indexAtomOutOfRange = false
 
                 for (const triggerInfo of triggerInfos) {
 
@@ -1121,28 +1348,19 @@ export class RxList<T> extends Computed {
                         })
                         const deletedItems = this.spliceArray(spliceStart, spliceDeleteCount, newItems)
                         const deletedFrames = spliceMany(this.effectFramesArray!, spliceStart, spliceDeleteCount, effectFrames)
-                        deletedFrames.forEach((frame) => {
-                            // CAUTION 稀疏行安全：越界 set（契约内透传）会让行记账产生洞，
-                            //  reorder 的搬移又会把洞物化成显式 undefined（forEach 不再跳过）。
-                            //  删除区间覆盖这类行时 frame 可能为 undefined。
-                            frame?.forEach((effect) => {
-                                this.destroyEffect(effect)
-                            })
-                        })
-                        // 更新槽位数组并执行被删除行的 cleanup
-                        if (useContext && cleanupSlots) {
-                            // CAUTION 这里要把删除的行的 cleanup 都执行一遍
-                            //  如果能从 return value 中进行销毁，应该使用 options.onCleanup 来注册一个统一的销毁函数，这样能提升性能。
-                            const deletedSlots = spliceMany(cleanupSlots, spliceStart, spliceDeleteCount, newSlots)
-                            deletedSlots.forEach((slot) => {
-                                slot?.fn?.()
-                            })
-                        }
-                        // 统一的销毁函数
-                        if(options?.onCleanup) {
-                            deletedItems.forEach((item) => {
-                                options.onCleanup!(item)
-                            })
+                        // CAUTION 槽位数组先与行对齐，再执行任何用户清理：旧实现把槽位的
+                        //  摘除放在行 effect 销毁之后，销毁抛错时槽位数组比行多出被删行，
+                        //  之后的重建会把清理执行到错误的行上。
+                        const deletedSlots = useContext && cleanupSlots
+                            ? spliceMany(cleanupSlots, spliceStart, spliceDeleteCount, newSlots)
+                            : undefined
+                        // 被删除行的三段清理：行 effect 销毁（稀疏行的 frame 可能为 undefined：
+                        // 越界 set 让行记账产生洞，reorder 的搬移又会把洞物化成显式 undefined）、
+                        // context.onCleanup 注册的清理、options.onCleanup（统一的销毁函数；
+                        // 能从 return value 销毁副作用时用它，省去逐行槽位）。
+                        // 纯插入（最热的 push 形态）没有离场的行，不进清理出口。
+                        if (deletedItems.length > 0) {
+                            teardownRows(this, deletedFrames, deletedSlots, deletedItems)
                         }
                     } else if(method === 'reorder') {
                         // 数据、行 effect frame 和 cleanup 槽位必须按同一组 old→new
@@ -1191,25 +1409,57 @@ export class RxList<T> extends Computed {
                             useContext ? cleanupSlots![index] : undefined,
                         )
                         this.set(index, newItem)
-                        this.effectFramesArray![index]?.forEach((effect) => {
-                            this.destroyEffect(effect)
-                        })
+                        // 先换上新行的 frame，再清理旧行（同 splice：记账先于用户清理）。
+                        // 旧行的三段清理各自隔离错误，全部执行完才抛出第一个
+                        // （规则见 keepFirstTeardownError；单行不走 teardownRows，省去包装数组）。
+                        const oldFrame = this.effectFramesArray![index]
                         this.effectFramesArray![index] = newFrame
-
-                        if (oldSlot?.fn) {
-                            oldSlot.fn()
+                        let firstError: unknown = NO_TEARDOWN_ERROR
+                        if (oldFrame !== undefined) {
+                            for (let i = 0; i < oldFrame.length; i++) {
+                                try {
+                                    this.destroyEffect(oldFrame[i]!)
+                                } catch (error) {
+                                    firstError = keepFirstTeardownError(firstError, error)
+                                }
+                            }
                         }
-                        if(options?.onCleanup) {
-                            options.onCleanup(oldItem)
+                        const oldCleanup = oldSlot?.fn
+                        if (oldCleanup !== undefined) {
+                            try {
+                                oldCleanup()
+                            } catch (error) {
+                                firstError = keepFirstTeardownError(firstError, error)
+                            }
                         }
-
+                        if (options?.onCleanup) {
+                            try {
+                                options.onCleanup(oldItem)
+                            } catch (error) {
+                                firstError = keepFirstTeardownError(firstError, error)
+                            }
+                        }
+                        if (firstError !== NO_TEARDOWN_ERROR) throw firstError
                     }
                 }
                 // CAUTION 见函数开头的位置契约说明：若本轮重放中途第一次出现了
                 //  需要 index atom 的行（addedAtomIndexesDep 由 false 变 true），
                 //  这些行按操作时位置取的终态 atom 同样不可信，整体回退全量重算
                 //  （full recompute 会先清理本轮已建的行再重建）。
-                if (triggerInfos.length > 1 && !hadIndexAtomsAtPatchStart && addedAtomIndexesDep) return false
+                //  操作时位置越出了终态 source（indexAtomOutOfRange，见 indexAtomFor）同理：
+                //  重放不在终态上，本轮建的行不可信，同样整体回退。
+                // CAUTION beforePatch / afterPatch 成对：走到这里时每条 info 都已调用过
+                //  beforePatch 并应用到本列表，回退前同样要调用 afterPatch。旧实现直接
+                //  return false——钩子的使用方在 beforePatch 里开的括号（暂存差量、挂起
+                //  渲染）永远等不到 afterPatch 来合上，紧随其后的全量重算又不经过这对钩子。
+                //  函数开头的回退（一条 info 都没重放）两个钩子都不调用，同样成对；
+                //  抛错中止的 patch 不在此列，由随后的全量重算（fullRecompute 事件）兜底。
+                if ((triggerInfos.length > 1 && !hadIndexAtomsAtPatchStart && addedAtomIndexesDep) || indexAtomOutOfRange) {
+                    options?.afterPatch?.(triggerInfos)
+                    return false
+                }
+                // patch 进行中内联触发的行级重算可能又建了一张表（见 locateRowFrame）
+                resetRowLocator()
                 options?.afterPatch?.(triggerInfos)
                 if (__DEV__) {
                     // dev 不变量：行级记账结构必须与数据严格等长对齐。
@@ -1225,19 +1475,19 @@ export class RxList<T> extends Computed {
                 onDestroy(this: RxList<U>)  {
                     itemProbe?.destroy()
                     itemProbe = undefined
+                    resetRowLocator()
                     if (addedAtomIndexesDep) {
                         source.removeAtomIndexesDep()
                     }
-                    if (cleanupSlots) {
-                        cleanupSlots.forEach((slot) => {
-                            slot?.fn?.()
-                        })
-                    }
-                    if(options?.onCleanup) {
-                        this.data.forEach((item) => {
-                            options.onCleanup!(item)
-                        })
-                    }
+                    // 整体销毁：所有行的 context cleanup 与 options.onCleanup 各执行一次，
+                    // 某一行抛错不影响其余行（见 teardownRows；行 effect 由
+                    // destroyResources 销毁）。交接后再执行：destroy 幂等，但清理里的
+                    // 重入不应再看到这些槽位。
+                    const slots = cleanupSlots
+                    const values = mappedValuesAwaitCleanup ? this.data : undefined
+                    cleanupSlots = undefined
+                    mappedValuesAwaitCleanup = false
+                    teardownRows(this, undefined, slots, values)
                 }
             },
         )
@@ -1527,11 +1777,47 @@ export class RxList<T> extends Computed {
 
         // 行在 filtered 中的位置：以 indicator atom 身份定位到行，位置 = 前缀中
         // raw 为 true 的行数。toggle 发生在 patch 之外，mapList 与 filtered 一致。
+        // CAUTION 定位游标（规模债务：共享谓词依赖 × 逐行定位）：谓词读同一个 atom
+        //  （搜索词、阈值）是 filter 最典型的响应式用法，它一变所有行的 indicator 依次
+        //  重算；每个翻转的行都从第 0 行扫到自己，一次翻转 n 行是 O(n²) 次 indicator
+        //  读取（4 万行实测秒级）。游标记住"上一次定位到的行"和它之前的匹配行数：
+        //  订阅序 = 建行序，通常就是行序，下一个翻转的行多半紧跟在上一行后面——先在
+        //  游标后的一小段窗口里找，命中就是 O(间距)，一轮按行序的翻转整体 O(n)。
+        //  窗口内找不到就回到从头扫描（与旧实现逐次相同），所以行序被打乱
+        //  （sortSelf 之后订阅序 ≠ 行序）时单次定位至多比旧实现多读一个窗口，
+        //  不会更慢一个量级；窗口不设成"扫到表尾再回绕"是实测的取舍：乱序下那样
+        //  每次定位随机落点、缓存不友好，比从头扫描慢 10%~15%。
+        //  游标不变量：cursorPos 恒等于 [0, cursorRow) 内 raw 为 true 的行数。
+        //  - indicator 只在翻转时改写，且翻转必先定位（游标停在该行上，改的是游标
+        //    所在行自己，不在前缀里）——前提是 indicator 紧跟定位提交，见 toggle 处
+        //    的 CAUTION；派发中嵌套的翻转各自先定位，同理成立。
+        //  - 行的增删/重排只发生在 mapList 的 patch 与全量重算里：beforePatch /
+        //    afterPatch / fullRecompute 一律作废游标。
+        const LOCATE_WINDOW = 64
+        let cursorRow = -1
+        let cursorPos = 0
         const locateRowPosition = (self: Atom<boolean>) => {
             const rows = mapList.data
+            const length = rows.length
+            if (cursorRow >= 0 && cursorRow < length) {
+                let pos = cursorPos
+                const windowEnd = Math.min(length, cursorRow + LOCATE_WINDOW)
+                for (let i = cursorRow; i < windowEnd; i++) {
+                    if (rows[i] === self) {
+                        cursorRow = i
+                        cursorPos = pos
+                        return pos
+                    }
+                    if (rows[i]?.raw) pos++
+                }
+            }
             let pos = 0
-            for (let i = 0; i < rows.length; i++) {
-                if (rows[i] === self) return pos
+            for (let i = 0; i < length; i++) {
+                if (rows[i] === self) {
+                    cursorRow = i
+                    cursorPos = pos
+                    return pos
+                }
                 if (rows[i]?.raw) pos++
             }
             return -1
@@ -1574,6 +1860,17 @@ export class RxList<T> extends Computed {
                     }
                 } else if (matched !== lastValue.raw) {
                     const pos = locateRowPosition(lastValue as Atom<boolean>)
+                    // CAUTION indicator 必须先于 filtered 的变更提交（不变量「filtered ≡ indicator
+                    //  为 true 的行」在**派发时刻**就要成立）：getter 的返回值要等本函数返回后
+                    //  才写入 indicator，而下面的 filtered.splice 会同步派发给订阅者——订阅者
+                    //  在派发中改写另一行的谓词依赖或直接改 source 时，那一行的定位 /
+                    //  beforePatch 的前缀计数读到的还是本行的旧 indicator，与已经变更的
+                    //  filtered 差一行：后开的行插到本行前面（乱序）、后关的行删不掉（残留）、
+                    //  source 的删除删错行，且只有全量重算能追平。这里直接写入 indicator
+                    //  （它没有订阅者，写入不触发任何东西；返回后的 replaceData 同值写入
+                    //  是 Object.is no-op）。派发中订阅者抛错时 indicator 与 filtered 也因此
+                    //  保持一致，而不是 filtered 已变、indicator 停在旧值。
+                    ;(lastValue as Atom<boolean>)(matched)
                     if (pos !== -1) {
                         if (matched) {
                             filtered.splice(pos, 0, item)
@@ -1593,6 +1890,8 @@ export class RxList<T> extends Computed {
         }, {
             ignoreIndex: true,
             beforePatch(info) {
+                // 行即将增删/重排：定位游标作废（见 locateRowPosition）
+                cursorRow = -1
                 // 应用上一条 info 计算出的差量（此刻 mapList 已应用上一条，
                 // filtered 补齐后两者重新一致，才能为本条计算前缀）
                 flushPending()
@@ -1608,11 +1907,27 @@ export class RxList<T> extends Computed {
                     let removeStart = 0
                     let removeCount = 0
                     const bound = Math.min(start + deletedCount, rows.length)
-                    // rows[i]?.raw：越界 set（契约内透传）会让行数组出现洞/显式 undefined
-                    for (let i = 0; i < bound; i++) {
-                        if (rows[i]?.raw) {
-                            if (i < start) removeStart++
-                            else removeCount++
+                    if (bound === rows.length) {
+                        // CAUTION 尾部快路径（规模债务：前缀扫描 × 逐条尾部变更）：受影响区间
+                        //  直达行尾时（push / pop / 尾部替换与截断——逐条追加是最常见的
+                        //  建表方式）不需要数前缀：此刻 flushPending 已让 filtered 与 mapList
+                        //  一致，"为 true 的行数"就是 filtered 的长度，前缀匹配数 = 总数 −
+                        //  后缀匹配数。旧实现无差别扫描 [0, bound)，一次 push 是 O(n) 次
+                        //  indicator 读取，逐条追加 n 行是 O(n²)（8 万行上追加 2000 行实测
+                        //  秒级，同样的 map 是毫秒级）；现在只扫被删除的后缀 [start, bound)。
+                        //  Math.max 兜底：filtered 被契约外直改时不产生负起点（负 start 会
+                        //  被 splice 归一化成"从尾部回退"）。
+                        for (let i = start; i < bound; i++) {
+                            if (rows[i]?.raw) removeCount++
+                        }
+                        removeStart = Math.max(filtered.data.length - removeCount, 0)
+                    } else {
+                        // rows[i]?.raw：越界 set（契约内透传）会让行数组出现洞/显式 undefined
+                        for (let i = 0; i < bound; i++) {
+                            if (rows[i]?.raw) {
+                                if (i < start) removeStart++
+                                else removeCount++
+                            }
                         }
                     }
                     pending = {removeStart, removeCount, inserts: []}
@@ -1628,6 +1943,7 @@ export class RxList<T> extends Computed {
                 }
             },
             afterPatch() {
+                cursorRow = -1
                 flushPending()
                 if (rebuildAfterPatch) {
                     rebuildFromIndicators()
@@ -1639,6 +1955,7 @@ export class RxList<T> extends Computed {
             // 只在重建(非首次构建)时需要:首次构建 filtered 本来就是空的,复位幂等
             pending = null
             rebuildAfterPatch = false
+            cursorRow = -1
             if (filtered.data.length) filtered.splice(0, Infinity)
         })
         initialBuildDone = true
@@ -1900,31 +2217,41 @@ export class RxList<T> extends Computed {
                 return map
             },
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
-                triggerInfos.forEach((triggerInfo) => {
+                // CAUTION 多 info 重放 × 重复 key 断言（守卫对称性 R8-4 的 batch 面）：一次 digest
+                //  重放多条 info 时，"先插入同 key 新行、再删除旧行"（batch 内以 insert + remove
+                //  移动一行 / 先推新版本再淘汰旧版本 / 两次 set 互换 key）会在重放中途短暂撞 key，
+                //  而终态 source 的 key 是唯一的——全量 computation 不会断言。此时断言等于把
+                //  不可观察的中间态当成违约：异常抛给 batch 调用方，派生 Map 停在旧值直到下一次
+                //  源变更（README §3「batch 退出后 ≡ 终态全量重算」）。撞 key 且 info 不止一条时
+                //  回退全量重算：终态确有重复 key 时由 computation 以同一条消息断言；单 info
+                //  （非 batch）下重复 key 就是可观察的违约，保持当场断言。
+                const multi = triggerInfos.length > 1
+                for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
-                        deleteItems.forEach((item) => {
-                            if (item == null) return // 稀疏洞/null 行:无 entry 可删
+                        for (const item of deleteItems) {
+                            if (item == null) continue // 稀疏洞/null 行:无 entry 可删
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
                             this.delete(indexKey)
-                        })
+                        }
                         const newItemsInArgs = argv!.slice(2)
-                        newItemsInArgs.forEach((item) => {
+                        for (const item of newItemsInArgs) {
                             // CAUTION 与全量 computation 的 null/undefined 行跳过语义对称：
                             //  插入侧漏守卫时 push(null) 的属性读直接 TypeError 抛给
                             //  变更调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
-                            if (item == null) return
+                            if (item == null) continue
                             const indexKey = typeof inputIndexKey === 'function' ? inputIndexKey(item) : item[inputIndexKey]
 
+                            if (multi && this.data.has(indexKey)) return false
                             assert(!this.data.has(indexKey), 'indexBy key is already exist')
                             this.set(indexKey, item)
-                        })
+                        }
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
-                        if (!isDenseIndexKey(key)) return
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry;
                         // null 旧行与全量语义一致地视为"无 entry")
                         if (oldValue != null) {
@@ -1938,12 +2265,13 @@ export class RxList<T> extends Computed {
                             //  splice 插入侧都 assert 重复 key,EKC 插入侧曾缺——set() 撞已有
                             //  key 静默覆盖 entry,派生 Map 与全量重算永久分叉(全量侧会抛)。
                             //  凡全量侧 assert 的关系不变量,patch 每个插入入口必须同 assert。
+                            if (multi && this.data.has(newKey)) return false
                             assert(!this.data.has(newKey), 'indexBy key is already exist')
                             this.set(newKey, newValue as T)
                         }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
-                })
+                }
             }
         )
     }
@@ -1971,7 +2299,9 @@ export class RxList<T> extends Computed {
                 return map
             },
             function applyPatch(this: RxMap<any, T>, _data, triggerInfos) {
-                triggerInfos.forEach((triggerInfo) => {
+                // 多 info 重放中途撞 key 回退全量重算（理由见 indexBy 的同款说明）
+                const multi = triggerInfos.length > 1
+                for (const triggerInfo of triggerInfos) {
                     const { method , argv  ,key, oldValue, newValue, methodResult, type} = triggerInfo
                     assert(method === 'splice' || key !== undefined, 'trigger info has no method and key')
 
@@ -1982,19 +2312,20 @@ export class RxList<T> extends Computed {
                             this.delete(entry[0])
                         })
                         const newItemsInArgs = argv!.slice(2) as ([any, any] | undefined)[]
-                        newItemsInArgs.forEach((entry) => {
+                        for (const entry of newItemsInArgs) {
                             // CAUTION 与全量 computation 的 undefined 行跳过语义对称：
                             //  插入侧直接解构时 push(undefined) 当场 TypeError 抛给变更
                             //  调用方（2026-H3 round4 动态复现，与删除侧守卫同一等价类）。
-                            if (entry === undefined) return
+                            if (entry === undefined) continue
                             // 守卫对称性(R8-4,与 indexBy 同族):全量侧 assert 重复 key,
                             // 插入入口曾静默覆盖(entry 撞 key 后派生 Map 与全量分叉)
+                            if (multi && this.data.has(entry[0])) return false
                             assert(!this.data.has(entry[0]), 'toMap key is already exist')
                             this.set(entry[0], entry[1])
-                        })
+                        }
                     } else if (type === TriggerOpTypes.EXPLICIT_KEY_CHANGE) {
                         // 非稠密 key:数组属性赋值,无元素变化(幽灵 EKC 等价类,忽略 ≡ 全量)
-                        if (!isDenseIndexKey(key)) return
+                        if (!isDenseIndexKey(key)) continue
                         // explicit key change(OOB set 的 oldValue 为 undefined:无旧 entry)
                         if (oldValue !== undefined) {
                             this.delete((oldValue as [any, any])[0])
@@ -2003,12 +2334,13 @@ export class RxList<T> extends Computed {
                         if (newValue !== undefined) {
                             const [newKey, newItem] = newValue as [any, any]
                             // 守卫对称性(R8-4):EKC 插入入口与全量/splice 侧同 assert
+                            if (multi && this.data.has(newKey)) return false
                             assert(!this.data.has(newKey), 'toMap key is already exist')
                             this.set(newKey, newItem)
                         }
                     }
                     // 还有可能是 reorder, reorder 对 map 来说没有影响。
-                })
+                }
             }
         )
     }
@@ -2027,9 +2359,34 @@ export class RxList<T> extends Computed {
 
                     if (method === 'splice') {
                         const deleteItems = methodResult as T[] || []
-                        deleteItems.forEach((item) => {
-                            if (!base.data.includes(item)) this.delete(item)
-                        })
+                        if (deleteItems.length < TOSET_BULK_MIN) {
+                            deleteItems.forEach((item) => {
+                                if (!base.data.includes(item)) this.delete(item)
+                            })
+                        } else {
+                            // CAUTION 批量删除走单遍路径（规模债务，与 groupBy/toSorted 的批量清偿
+                            //  同族）：逐项 includes 是每个删除项扫一遍源——k 项 × O(n) 源长，
+                            //  replaceData(n 行新数据)/大段 splice 是 O(n²)（n=4 万实测 ~380ms，
+                            //  而全量重算 new Set 只要 ~1ms；10 万行级走秒）。改为：先把删除项
+                            //  放进一个 Set，扫一遍源，仍在源里出现的（重复值的其他实例）从中
+                            //  划掉，剩下的才是真正消失的成员——O(k + n)。Set#has/delete 与
+                            //  Array#includes 同为 SameValueZero（NaN 可命中、0/-0 合并；稀疏洞
+                            //  两边都读作 undefined），删除顺序仍是删除项的首现顺序。
+                            //  阈值标定（n=4 万对象行实测）：一次未命中的 includes ≈ 9µs（每元素
+                            //  ~0.2ns），单遍路径 ≈ 0.85ms（每元素一次哈希查找 ~20ns），交叉点
+                            //  在 ~100 项（字符串行的 includes 更慢，交叉点更低）。阈值取 128：
+                            //  小于阈值保持原路径——单删/小段 splice 是最热形态，对它们一步不改
+                            //  （不会变慢）；达到阈值后单遍不慢于逐项扫描（源很短时两条路径都在
+                            //  微秒级，无从区分）。
+                            const gone = new Set<T>(deleteItems)
+                            const data = base.data
+                            for (let i = 0; i < data.length && gone.size > 0; i++) {
+                                gone.delete(data[i])
+                            }
+                            gone.forEach((item) => {
+                                this.delete(item)
+                            })
+                        }
                         const newItemsInArgs = argv!.slice(2)
                         newItemsInArgs.forEach((item) => {
                             this.add(item)
@@ -2050,8 +2407,14 @@ export class RxList<T> extends Computed {
     //  length computed 曾是主要的固定开销之一。惰性创建以 createDetached 包裹，
     //  解决旧注释里"在 autorun/computed 中读会被当作 children 误销毁"的问题。
     declare _length?: Atom<number>
+    // length 的内部 Computed：判活用（atom 本身不带 active），与 _length 同时赋值
+    /** @internal */
+    declare _lengthEffect?: Computed
     get length(): Atom<number> {
-        if (this._length) return this._length
+        // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：length 是
+        //  全体使用方共享的单例，使用方 destroyComputed(list.length) 之后，宿主还活着就重建
+        //  （否则所有读者永久读到旧长度）；宿主已销毁则继续返回同一个已销毁快照（幂等）。
+        if (this._length && (this._lengthEffect!.active || !this.active)) return this._length
         const length = ReactiveEffect.createDetached(() => {
             const source = this
             const created = computed(
@@ -2067,6 +2430,7 @@ export class RxList<T> extends Computed {
             return created
         })
         this._length = length
+        this._lengthEffect = getComputedInternal(length)!
         // CAUTION 已销毁结构的 meta 首读（2026-H3 round7）：destroyResources 只能清理
         //  当时已存在的 meta，销毁后首读会重建一个**活的** computed 订阅已销毁的
         //  source——值是正确快照（销毁后变更皆 no-op），但 effect 常驻泄漏且逃过
@@ -2090,17 +2454,48 @@ export class RxList<T> extends Computed {
      * destroyChildren、destroyComputed 三个入口都恰好执行一次。
      */
     destroyResources() {
+        // CAUTION 本钩子里每一步都可能执行用户清理（行级 effect 的子 effect / context.onCleanup、
+        //  惰性 meta 的监听者、基类钩子里本结构自己的 context.onCleanup），任何一步抛错都不能
+        //  让后面的步骤被跳过（「销毁必须做完」，README §6）：曾是顺序执行，第一行的清理一抛错，
+        //  其余行的行级 effect 就不再销毁，基类钩子（lastCleanupFn、cleanPromise 的 settle）
+        //  也整个跳过。规则与静态销毁核心一致：全部做完，第一个错误抛给调用方，其后的错误走
+        //  reportTeardownError。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
+        }
         // CAUTION 用 _length 判断：length 是惰性 getter，直接访问会先创建再销毁
-        if (this._length) destroyComputed(this._length)
+        if (this._length) {
+            try {
+                destroyComputed(this._length)
+            } catch (error) {
+                record(error)
+            }
+        }
         this._effectFramesArray?.forEach((frames) => {
           // 稀疏行安全：越界 set + reorder 会在记账数组中留下显式 undefined 项
           frames?.forEach((frame) => {
-            this.destroyEffect(frame)
+            try {
+              this.destroyEffect(frame)
+            } catch (error) {
+              record(error)
+            }
           })
         })
         this._indexKeyDeps?.clear()
         this.atomIndexes = undefined
-        super.destroyResources()
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 
     createSelection(currentValues: RxSet<T|number>|Atom<T|null|number>, autoResetValue?: boolean) {

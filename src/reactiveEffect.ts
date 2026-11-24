@@ -48,9 +48,28 @@ export function isolateTeardown(): boolean {
     return true
 }
 
-// 销毁收尾中、第一个错误之后再出现的错误：第一个错误会抛给调用方，这些只能上报。
-function reportTeardownError(error: unknown) {
+/**
+ * @internal
+ * 销毁收尾中、第一个错误之后再出现的错误：第一个错误会抛给调用方，这些只能上报。
+ * 子类的 destroyResources 钩子（Computed / RxList）沿用同一规则，所以导出给它们用。
+ */
+export function reportTeardownError(error: unknown) {
     console.error('[data0] uncaught error in teardown:', error)
+}
+
+// 被销毁或被取代的 generator（getter 或 applyPatch）不再续跑：库停在它挂起的 yield 处。
+// 它自己的 finally 是它的清理代码（释放锁、关闭连接……），照 JS 放弃迭代器的约定用 return()
+// 关闭它：yield 之后的函数体不再执行，finally 照常执行。finally 是清理代码：读取不追踪，
+// 抛错没有同步调用方，只上报。
+function closeAbandonedGenerator(generator: Generator<any, any, any>) {
+    const isolated = isolateTeardown()
+    try {
+        generator.return(undefined)
+    } catch (error) {
+        reportTeardownError(error)
+    } finally {
+        if (isolated) notifier.resetTracking()
+    }
 }
 
 // CAUTION 子 effect 的 destroy() 覆写在走到静态核心之前抛错：它仍是 active、仍订阅着依赖、
@@ -98,7 +117,15 @@ export class ReactiveEffect extends ManualCleanup {
         //  "销毁已生效"：flush 先于本段同步栈之后的一切外部代码执行。
         //  回归钉在 __tests__/verifiedReviewFixes.spec.ts 的 destroy-inside-run 组。
         if (ReactiveEffect.activeScopes.includes(effect)) {
-            effect._pendingDestroy = 1 | (fromParent ? 2 : 0) | (ignoreChildren ? 4 : 0)
+            // CAUTION 累加而不是覆盖：执行期间可能被销毁不止一次，两个参数位一旦置上都不可撤回。
+            //  - fromParent：父 effect 重算时 destroyChildren 已经把本 effect 从它的 children 里
+            //    放掉、并建好了下一代 children；之后再来一次普通的 destroy()（旧 child 的句柄被
+            //    多停了一次、child 在自己的执行里自停）若把这一位冲掉，flush 就按 false 重放——
+            //    拿上一代的 index 在新一代数组上 swap-pop，把新一代的兄弟挤出 children，
+            //    它从此不随父亲重算 / 销毁（正是上面 _pendingDestroy 说明里要避免的事）。
+            //  - ignoreChildren：某个调用方声明了"children 由我接管"，后来的普通 destroy()
+            //    不能再替它把这些 children 销毁掉。
+            effect._pendingDestroy |= 1 | (fromParent ? 2 : 0) | (ignoreChildren ? 4 : 0)
             return
         }
 
@@ -499,6 +526,13 @@ export class ReactiveEffect extends ManualCleanup {
 
         } else {
             if (isLast) {
+                // CAUTION 活跃 effect 的 cleanup 不摘空 dep（见 cleanup：紧接着会 re-track 同一批 key）。
+                //  async 收尾正是"先全退订、再重放本轮读到的"——上一轮读过、本轮不再读的 keyed dep
+                //  若就此变空，没有人再回收它：按移动的 key 读（`map.get(key())`、`list.at(i())`）的
+                //  长活 async computed 每换一个 key 就在长活 source 的 depsMap 里留下一个空 Dep
+                //  （AGENTS「长活 source 上的订阅记账必须有界」）。重放之后把仍为空的摘掉；
+                //  已销毁时 cleanup 自己已经摘过。只在 async 轮次收尾走一次，不在同步热路径上。
+                const settled = this.active && this.deps.length ? this.deps.slice() : undefined
                 this.cleanup()
                 if (this._asyncTracks) {
                     // CAUTION destroy 后不得重放:挂起的 async/generator getter 完成时
@@ -510,6 +544,11 @@ export class ReactiveEffect extends ManualCleanup {
                         this._asyncTracks.forEach(track => track())
                     }
                     this._asyncTracks.length = 0
+                }
+                if (settled !== undefined) {
+                    for (let i = 0; i < settled.length; i++) {
+                        pruneEmptyDepFromHost(settled[i])
+                    }
                 }
             }
 
@@ -684,7 +723,10 @@ export class ReactiveEffect extends ManualCleanup {
             // CAUTION beforeRun 中如果要返回 false，一定要在所有操作之前，不然后面的 afterRun 执行不到，可能会导致一些内部状态无法重置。
             const implicitContinue = beforeRun(isFirst)
             isFirst = false
-            if(implicitContinue === false) break
+            if(implicitContinue === false) {
+                closeAbandonedGenerator(generator)
+                break
+            }
 
             let value: any
             let done: boolean | undefined

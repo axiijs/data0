@@ -5,7 +5,8 @@
  *   入口 1 — 父 effect 重算:prepareTracking 先把父 effect 压栈,再销毁上一轮的子 effect;
  *   入口 2 — 重算钩子:computed 在别的 effect 执行中被重算,自己上一轮的清理跑在外层帧里;
  *   入口 3 — 显式销毁:在 effect 执行中调用 stop()/destroy()/destroyComputed(),含栈内销毁的延迟执行;
- *   入口 4 — map 行重算:行级 context.onCleanup 在行 effect 自己的 getter 里执行。
+ *   入口 4 — map 行重算:行级 context.onCleanup(重算前)与 options.onCleanup(被替换的旧值,写入后)
+ *           都在行 effect 自己的 getter 里执行。
  * 泄漏的后果不只是多跑一次:清理里读、挂载时写同一个 atom 就是无限重算;patch 型结构
  * 被订阅到无关 atom 上,之后的写入会向 applyPatch 交付协议外的 info。
  *
@@ -606,6 +607,67 @@ describe('entry 4: re-running a map row', () => {
         expect(() => dep(1)).toThrow('row cleanup')
         expect(notifier.trackStack.length).toBe(0)
         expect(notifier.shouldTrack).toBe(true)
+        // 恢复探针:下一次写入照常重算该行
+        shouldThrow = false
+        dep(2)
+        expect(mapped.data).toEqual([3])
+        mapped.destroy()
+        source.destroy()
+    })
+
+    // options.onCleanup 收到行级重算替换掉的旧值:同一个 getter 帧,同一条隔离规则
+    test('the options.onCleanup of the value a row re-run replaced does not subscribe the row', () => {
+        const dep = atom(0)
+        const read = atom(0)
+        let runs = 0
+        const released: number[] = []
+        const source = new RxList([1, 2])
+        const mapped = source.map(item => { runs++; return item + dep() }, {
+            onCleanup: value => { released.push(value); read() },
+        })
+        dep(1)
+        expect(released).toEqual([1, 2])
+        expect(runs).toBe(4)
+        expect(subscribers(read)).toEqual([])
+        read(1)
+        expect(runs).toBe(4)
+        dep(2)
+        expect(runs).toBe(6)
+        expect(mapped.data).toEqual([3, 4])
+        mapped.destroy()
+        source.destroy()
+    })
+
+    test('the same for options.onCleanup when the row re-runs before a pending structural patch', () => {
+        const dep = atom(0)
+        const read = atom(0)
+        const released: number[] = []
+        const source = new RxList([1, 2])
+        const mapped = source.map(item => item + dep(), {
+            onCleanup: value => { released.push(value); read() },
+        })
+        batch(() => {
+            dep(1)
+            source.splice(0, 0, 0)
+        })
+        expect(released).toEqual([1, 2])
+        expect(subscribers(read)).toEqual([])
+        expect(mapped.data).toEqual([1, 2, 3])
+        mapped.destroy()
+        source.destroy()
+    })
+
+    test('tracking is restored when options.onCleanup throws on a row re-run', () => {
+        const dep = atom(0)
+        const source = new RxList([1])
+        let shouldThrow = true
+        const mapped = source.map(item => item + dep(), {
+            onCleanup: () => { if (shouldThrow) throw new Error('option cleanup') },
+        })
+        expect(() => dep(1)).toThrow('option cleanup')
+        expect(notifier.trackStack.length).toBe(0)
+        expect(notifier.shouldTrack).toBe(true)
+        expect(mapped.data).toEqual([2])               // the new value was written before the cleanup ran
         // 恢复探针:下一次写入照常重算该行
         shouldThrow = false
         dep(2)

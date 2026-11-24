@@ -196,21 +196,46 @@ export const finalizeDepMarkers = (effect: ReactiveEffect) => {
 }
 
 /**
- * Restore the exact dependency set that existed before a failed recompute.
+ * Restore the dependency set after a failed recompute.
  *
  * A getter may throw after prepareTracking has either marked or removed the old
  * deps and after it has partially collected new deps. Error recovery must retain
  * the last successful dependency graph: otherwise a throw before the first read
  * permanently unsubscribes the effect and no later source write can retry it.
  *
+ * CAUTION keepCollected decides what happens to the deps the failing run collected
+ *  itself (the ones that are not in previousDeps):
+ *  - true (a failed getter run of a computed that somebody holds): keep them, the
+ *    result is `previous ∪ collected`. The run failed while reading exactly these
+ *    values, so a write to one of them is the most likely thing to make a retry
+ *    succeed. Dropping them (the rule until 2.16) left the computed dirty AND deaf:
+ *    `c = mode() === 'a' ? 1 : mustBePositive(b())` failed once on `b`, was no
+ *    longer subscribed to `b`, and kept its stale value after `b` was fixed; an
+ *    async computed whose FIRST run rejected had no deps at all and never ran again.
+ *    Keeping a superset is safe: every extra trigger only causes a full recompute
+ *    (handleRecomputeError has reset the phase), and the next successful run
+ *    replaces the whole set as usual (markers / full cleanup / async replay).
+ *  - false (the default): restore exactly previousDeps. Two callers need this:
+ *    a sync FIRST run that throws to its creator — computed()/autorun()/new RxList(fn)
+ *    throw, so nobody holds a handle that could destroy a still-subscribed effect —
+ *    and prepareTracking's undo after a throwing child cleanup, where anything
+ *    collected meanwhile would be a teardown read, which never belongs to the effect.
+ *
  * This runs only on the error path, so the temporary Set has no hot-path cost.
  */
-export const restoreEffectDeps = (effect: ReactiveEffect, previousDeps?: Dep[]) => {
+export const restoreEffectDeps = (effect: ReactiveEffect, previousDeps?: Dep[], keepCollected = false) => {
   const previous = previousDeps ?? []
   const previousSet = new Set(previous)
 
   for (const dep of effect.deps) {
-    if (!previousSet.has(dep) && dep.delete(effect)) {
+    if (previousSet.has(dep)) continue
+    if (keepCollected) {
+      // still subscribed: adopt it (once, should the failing run have listed it twice)
+      if (dep.has(effect)) {
+        previousSet.add(dep)
+        previous.push(dep)
+      }
+    } else if (dep.delete(effect)) {
       trackRetainedDepEffectRemoved(dep)
       pruneEmptyDepFromHost(dep)
     }

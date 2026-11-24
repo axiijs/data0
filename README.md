@@ -66,11 +66,13 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - 因此 **batch 内"先写依赖、再读该依赖的 computed"读到的是进入 batch 前的旧值**(AGENTS.md A2),batch 退出后恢复一致。需要读写一致时在 batch 外读,或使用 `autorun`(见下;其默认调度下重跑在 microtask,同步场景请传 `true`)。
 - **batch 退出后,所有派生结构必须等于从终态 source 全量重算的结果**(A1/A2 的"仍属缺陷"边界)。一次 digest 重放多条变更(batch 多操作、自定义延迟调度器积累)时,部分算子会自动回退全量重算以保证该不变量(见支持矩阵脚注),下游只应依赖结果一致性,不应依赖"必然增量"。
 - batch 中某个订阅者抛错不会阻断其余订阅者;第一个错误在 digest 完成后抛给 batch 调用方。**batch 体自身抛错时体异常优先**:digest 仍照常执行(排队的订阅者不受牵连),期间的订阅者错误降级为 `console.error` 上报,调用方收到的是自己代码的原始异常(不会被订阅者错误静默替换)。
+- **一次重算拥有它开始时为它排队的全部变更**:batch 内(或同一次 digest 中排在前面的订阅者)对某个 computed 显式 `recompute(c, true)`、或冲刷它的自定义调度器后,digest 不会把这批已排队的变更再交给它的 `applyPatch`/`onChange`/读取 infos 的调度器——全量重算读到的源状态已经包含它们(不消费 infos 的普通 computed 可能在 digest 里再全量重算一次,结果不变)。**已知缺口**:不在 batch 里写 atom 时变更还在内联派发途中,先订阅的订阅者强制重算一个按 delta 消费 atom info 的 patch computed,这条变更仍会再交付一次(`__tests__/auditCore.spec.ts` R-X5);这类自定义 applyPatch 应以 `.raw` 终态对账,或把写入放进 `batch`。
 
 ### 3.1 `autorun` 调度
 
 - 默认 `autorun(fn)` 的重跑经 **microtask**(`Promise.resolve().then`)调度,首次执行仍同步。
 - 需要与写入同步一致时使用 `autorun(fn, true)`(立即重跑)。
+- **同步的自定义调度器在 computed 自己运行期间被调用时不嵌套执行**:computed 的 `scheduleRecompute` 若同步调用 `recompute`,而这个 computed 此刻正在自己的 getter/applyPatch 里(重入),本轮先跑完、随后再强制重算一次;调度器调用方紧接着读到的是本轮的值。
 
 ### 3.2 `skipIndicator`(computed 的跳过门)
 
@@ -82,7 +84,9 @@ doubled.destroy(); evens.destroy(); list.destroy()
 
 - `splice(start, deleteCount, ...items)` 的参数按 `Array.prototype.splice` 规范归一化(ToIntegerOrInfinity:NaN→0、小数截断、负数从尾部回退、越界 clamp、`-0`→`+0`)。
 - **`toSorted(compare)` 的 comparator 必须对元素值域构成一致全序**(与 `Array#sort` 的 consistent-comparator 要求相同)。`NaN` 元素 × 裸数值 comparator(`(a,b)=>a-b` 返回 NaN)违反一致性,属契约外;需要含 `NaN` 的列表请用 NaN 归一化的 comparator。同理,列表可能**驻留** `undefined` 元素(含稀疏洞被 reorder 物化)时,comparator 必须与 `Array#sort` 的强制规则一致地把 `undefined` 排到末尾(引擎从不为 undefined 调用 comparator、一律排尾;把 undefined 排前的 comparator 与全量语义必然分叉,属契约外)——**变更本身**涉及 undefined 时仍自动回退全量,无须 comparator 处理。元素身份(增量删除定位)按 `Object.is`(`NaN` 可定位,`0`/`-0` 可区分);等值 tie 组内存在可区分成员时增量删除自动回退全量重算。
+- `sortSelf(compare)` 与 `Array#sort` 一致:`undefined` 元素从不交给 comparator,一律排在末尾(显式 `undefined` 按原顺序,稀疏洞再其后、经 reorder 物化为显式 `undefined`);把 `undefined` 排前的 comparator 对 `sortSelf` 不生效(与 `toSorted` 的同名规则一致)。
 - **`triggerInfo.argv` 透传用户原始参数**(不归一化)。这是 axii/axle 依赖的协议;消费 argv 的派生结构必须自行归一化(内部实现均已如此)。
+- `RxMap`/`RxSet` 同样透传原始参数:`set(-0, v)`/`delete(-0)`/`add(-0)` 的 argv 与 key 级 info 的 `key` 是调用方传入的 `-0`(`replace` 的 argv 是调用方传入的容器本身),容器按原生 Map/Set 语义存为 `+0`。库内按载荷重放的派生结构(`keys()`/`values()`/`entries()`/`toList()`)自行归一化,与全量重算一致地持有 `+0`;自定义消费者需要与容器一致时请按 SameValueZero 归一化。
 - **变更方法返回的数组归调用方所有**(与原生 `Array#splice` 预期一致):`splice`/`clear` 的删除项、`RxSet.replace` 的 `[newItems, deletedItems]` 返回后可自由改写——协议载荷持有独立副本,batch/async applyPatch 等延迟消费不受影响(`reorder` 传入的 order 数组**连同其中的 `[from, to]` 对**同理,调用后仍归调用方,可复用/改写——协议载荷深拷到 Order 对一层)。观察出口(`onChange` 的 handler、自定义调度器的 infos 参数)收到的也是载荷副本,可自由处置——副本深度按协议形状对齐:`reorder` 的 Order 对与 `reorderInfo` 一并独立(改写自己的副本不会毒化兄弟订阅者),`splice` 删除项/插入项、`RxMap.set` 的旧值等**用户值保持引用身份**(按身份记账的观察方可直接匹配)。**直接实现 `applyPatch` 的协议消费者拿到的是共享广播,`triggerInfo.argv`/`methodResult` 只读**(逐 patch 拷贝会落在热路径上,该边界靠本契约约束)。
 - **谓词回调按真值语义消费**(与 `Array#filter` 平台惯例一致):`filter`/`find`/`findIndex`/`some`/`every` 的回调返回 number/string 等 truthy/falsy 非布尔值是契约内用法——TS 签名的 `boolean` 只是类型层约定,运行时按真值处理(`filter` 在存储点布尔化;返回值形态族差分见 `__tests__/deepReview2026H3Round8.spec.ts`)。
 - **`reorder` 的 pairs 必须构成子集置换**(from/to 集合相等、各自无重复、均为界内整数);`swap` 的两个区间不得重叠(重叠语义自相矛盾,两种构建都拒绝并抛错)。dev 构建对公开 `reorder` 校验置换性并抛错,prod 构建不校验(契约外输入的行为未定义);`sortSelf`/`reposition`/`swap` 内部生成的 pairs 构造性合法,不付校验成本。
@@ -90,6 +94,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - **`EXPLICIT_KEY_CHANGE` 必须消费 `info.newValue`(以及需要时的 `methodResult` 旧值),不要回读 `source.data[key]`**。batch/延迟调度下一次 digest 可能同时含 EKC 与结构操作;重放时 `source.data` 已是终态,按终态下标读出会与操作时位置错位,导致宿主镜像与源分叉。data0 自身的 map/filter 等增量路径已按协议字段消费。
 - `set(index, value)` 的契约是**替换已存在的稠密行**。**规范下标字符串会归一化为 number**(平台规范:`data["2"] = v` 就是写第 2 行——`set("2", v)`/`at("2")` 与 `set(2, v)`/`at(2)` 完全等价,dev 构建告警提示改传 number);越界/负数/非整数/非规范字符串("02"/"2.5")/≥ 2^32-1 的 key 属于契约外用法:行为等同普通数组赋值(可能产生稀疏数组、`length` computed 不更新;≥ 2^32-1 的正整数不是数组下标,`length` 完全不变),key 原样透传给下游。若列表已有 `atomIndexes`(`map` 使用了 index 参数),越界 set 会为写入位分配 index atom,派生 `map(index)` 不再因此崩溃;稀疏洞位仍按数组语义保留。
 - `at(index)` 支持负索引;对具体 index 的读取建立细粒度依赖,收缩(如 `pop`)会通知被裁剪的 index。
+- `map` 的 `beforePatch(info)`/`afterPatch(infos)` 成对:一轮增量重放对每条 info 调用 `beforePatch`,结束时调用一次 `afterPatch`——包括重放后才发现无法增量、随即回退全量重算的轮次(之后的全量重算不经过这对钩子,见 `fullRecompute` 事件);一条 info 都没重放就回退的轮次两个钩子都不调用;用户代码抛错中止的轮次不调用 `afterPatch`,由随后的全量重算兜底。
 
 ### 5. async 契约
 
@@ -98,6 +103,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - async/generator 形态检测基于原生构造器(`AsyncFunction`/`GeneratorFunction`):**构建工具把 async 降级转译(target < ES2017)后无法检测**,会被当作"返回 Promise 的同步 getter"。data0 面向现代 ES 目标,请勿把 getter 转译到 ES2017 以下。
 - **async applyPatch 同样只在同步段建立追踪**;挂起期间到达的源变更会排队,由后续 patch 轮次消化,不丢失。
 - **destroy 取消在途 async patch**:destroy 后已挂起的 applyPatch 恢复执行时,其结果不再被应用,对已销毁实例的写入是 no-op(见 §6)。
+- **被放弃的 generator 以 `return()` 关闭**:generator getter/applyPatch 被销毁、或被新一轮重算取代时,库不再续跑它挂起之后的段;在它挂起的 `yield` 结束时以 `generator.return()` 关闭——`yield` 之后的函数体不执行,`finally` 照常执行。`finally` 按清理代码处置:其中的读取不建立依赖,抛错没有同步调用方,走 `console.error` 上报。挂起的 promise 永不结束时 `finally` 也不会执行。async getter 的 patch 型 computed 在全量重算在途时收到的触发会重启全量重算(不在旧数据上开增量轮次),强制重算与回退全量不会被静默取消。
 - async 错误经 `cleanPromise` reject 与 `error` 事件派发;两者都无人监听时 `console.error` 兜底,不产生 unhandled rejection。**async 收尾阶段(向订阅者派发/回退全量重算)发生的错误同样 `console.error` 兜底**——该错误属于下游订阅者或回退重算,本 computed 的数据与状态已完成写入,`cleanPromise` 照常 settle(await 方不会因下游错误而挂起)。
 
 ### 6. 生命周期
@@ -105,11 +111,16 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - **谁创建,谁销毁**:派生结构不随 source 自动销毁,需调用 `.destroy()`(或 `destroyComputed`)。派生结构销毁时负责清理自己创建的行级 effect 与惰性 meta(`length`/`keys`/`size` 等)。
 - **destroy 对源模式与计算模式一视同仁**:`new RxList(arr)` 这类无 getter 的源结构同样派发 `destroy` 事件、清理 children 与惰性 meta。destroy 幂等,重复调用安全。
 - **destroy 后结构只读**:已销毁实例的变更方法(`splice`/`set`/`add`/`replace` 等)一律 no-op(dev 构建打印警告),数据保持销毁当刻的快照;destroy 也会取消在途 async patch 的后续应用。销毁的派生结构从此不再接收 source 的任何更新。销毁后读取惰性 meta(`length`/`keys`/`size` 等)返回快照值,且不会留下常驻的活 effect。
+- **已销毁的 computed 对触发完全静默**:不标脏、不派发 `dirty`、不调用调度器;`recompute()` 返回 `undefined`(不会返回一个永不结束的 promise);销毁时在途计算的 `cleanPromise` 照常结束,清理抛错时也一样。
+- **被使用方销毁的惰性 meta 会在下次读取时重建**:`keys()`/`values()`/`entries()`/`size`、`RxSet.size`、`RxList.length` 是宿主按需创建、全体读者共享的单例,由宿主销毁。使用方若对它调用了 `destroy()`/`destroyComputed`,宿主仍存活时下一次读取返回新的活实例(旧实例保持已销毁的快照,持有旧引用的读者不会恢复);宿主已销毁时继续返回同一个已销毁快照。
 - **用户回调抛错不冻结状态机**:`onRecompute`/`onCleanup`/`context.onCleanup` 注册的清理在重算生命周期内抛错时,与 getter 抛错同一处置——错误同步抛给触发变更的调用方(async 路径 `console.error` 兜底),computed 复位为脏,后续任何触发都会全量重算追平终态,不会停留在"永久陈旧/每次写入抛误导性断言"的卡死状态。父 effect 重算时上一轮子 effect 的清理抛错同理:作用域栈与追踪状态完整复原,父 effect 保留上一轮的依赖,上一轮的子 effect 全部照常销毁;async getter 与 generator getter 一样经 `cleanPromise` reject 与 `console.error` 兜底。
+- **失败的重算保留依赖,依赖变化时自动重试**:重算抛错(同步或 async)后保留「上一次成功时的依赖 ∪ 失败这一轮已读到的依赖」——连续失败期间始终以上一次成功为基础,记账有界;其中任一依赖变化即重算重试,同步路径上重试的错误抛给那一次的写入方(与订阅者错误同一通道)。例外:**同步首轮**抛错(`computed()`/`autorun()`/`new RxList(getter)` 直接把错误抛给创建者,创建者拿不到句柄)不保留任何订阅,首轮写结果时抛错(如 getter 返回的 `atom.lazy` 抛错)同理;async computed 已交到创建者手里,首轮失败也保留依赖。
 - 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理(包括其 `context.onCleanup` 注册的清理与惰性 meta);不希望被收集时用 `ReactiveEffect.createDetached`。
 - **清理抛错,销毁照常做完**:销毁过程中用户清理(`context.onCleanup` 注册的清理、`destroy()` 覆写与 `destroyResources`、`destroy` 监听者)抛错时,该 effect 的订阅照常摘除、子 effect 照常销毁、`destroy` 事件照常派发(其中一个监听者抛错,其余监听者照常收到),排在它后面的兄弟 effect 也照常销毁;第一个错误抛给调用方,收尾中再出现的错误走 `console.error`。不会留下「已失活、却还订阅着依赖、子 effect 还活着」的半销毁对象。
+- `map` 的行清理同一规则:一次变更有多行离场时(destroy、全量重建、删多行的 splice、`set` 替换),每行的行级 effect 销毁、`context.onCleanup` 与 `options.onCleanup` 全部执行,任一抛错不影响其余;第一个错误抛给触发变更的调用方,其余以 `console.error` 上报。重建时清理抛错后,下一次触发按终态正常重建,已清理过的旧值不会再被清理一次。
 - **清理不建立依赖**:清理代码(`context.onCleanup` 注册的清理、`map` 的行级清理、`onCleanup`/`onRecompute`/`onDestroy` 回调与 `destroy` 监听者)里的读取不会让恰好正在执行的 effect 订阅,无论清理由父 effect 重算、嵌套重算、行级重算还是 effect 执行中的显式销毁触发。`destroy()` 覆写里的代码在经父 effect 重算或 `destroyComputed` 销毁时同样被隔离;直接调用被覆写的 `x.destroy()` 时,覆写自己的代码先于 data0 执行,不在此列(清理应放在 `destroyResources`)。清理里的写入照常触发订阅者,清理触发或创建的 effect 照常追踪自己的依赖。父 effect 重算销毁上一轮子 effect 时,**子 effect 的清理里创建的响应式对象不会被父 effect 收集**,由创建者销毁。
 - `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次;`map` 回退全量重算时,旧行的 cleanup 同样各执行一次。行含响应式依赖而发生**行级重算**时,重算前先执行上一轮注册的清理(与 computed 的 `context.onCleanup`"每轮重算前执行"语义一致)——每轮注册恰好执行一次,行删除时执行的是最后一轮的注册。
+- `map` 的 `options.onCleanup` 在每个映射值离开列表时恰好调用一次:splice 删除、`set` 替换、行级重算替换、全量重建与整体销毁。行级重算时,`mapFn` 返回与旧值 `Object.is` 相同的值视为未离场、不调用;它在新值写入之后执行,其中的读取不建立依赖;写入时下游订阅者抛错不影响旧值的清理(订阅者的错误抛给写入方)。
 
 ## 派生结构 × 源操作支持矩阵
 
@@ -132,7 +143,7 @@ doubled.destroy(); evens.destroy(); list.destroy()
 | `RxSet.difference/intersection/symmetricDifference/union` | add/delete/replace 均增量(`replace` 的 `newItems` 按 Set 语义去重) | — | — |
 | `RxSet.toList` | add/delete 增量(序 ≡ Set 插入序);`replace` → 重算(迭代序随新容器,含存活成员的相对顺序) | — | — |
 
-**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度),越界 `set` 使源段长度跳变时单变更也回退(防跨段错位),同一源占多个操作数位置(如 `a.concat(a)`)时恒回退(一条变更对应多个段,按段位置的增量无法同时表达);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)、或**单次批量变更超过阈值**(插入数+删除数 > 64 且「> 派生长度/4 或 > 4096」——排序列表的批量逐项增量是 O(k×m),超过实测交叉点后全量重算更快且下游代价相同)时回退。回退是正确性措施,结果不变,只损失该次增量性。`groupBy` 的批量 splice 走单遍分桶增量(每组至多一次删除 + 一次插入 splice,幸存组引用稳定),不回退。**RxSet(含派生 RxSet)按内容语义承诺,内部迭代序不属承诺面**;需要稳定可观察顺序时经 `toList` 物化为有序 RxList(其行序恒 ≡ 源 Set 当前迭代序,见上表)。
+**多变更重放脚注**:矩阵格子描述"一次 digest 恰一条变更"的行为。一次 digest 积累多条变更(batch 多操作、自定义延迟调度器)时,triggerInfo 的操作时位置与重放时的终态 source 可能不一致。`groupBy`、`slice`、`findIndex`(及其派生 find/some/every)、`reduce`/`reduceToAtom`(纯尾插序列,判定与 index 都按操作时长度)经 **digest 重放内核**(`src/digestReplay.ts`,从终态逆向还原每条变更操作时的源状态快照)在多变更下保持增量;快照不可重建时自动回退全量重算——触发条件:`set` 的旧值为 `undefined`(合法 undefined 元素与越界扩长在协议内不可区分)、非稠密下标的 `set`、未知方法。`map` 在行使用 index atom(`mapFn(item, index)`)或行含响应式依赖时多变更回退;`concat` 多变更回退(多源 offset 依赖各源操作时长度),越界 `set` 使源段长度跳变时单变更也回退(防跨段错位),同一源占多个操作数位置(如 `a.concat(a)`)时恒回退(一条变更对应多个段,按段位置的增量无法同时表达);`toSorted` 在插入元素与既有元素等值(tie)、变更涉及 `undefined` 元素值、增量删除的 tie 组内存在 `Object.is` 可区分成员(如 `0` 与 `-0`)、或**单次批量变更超过阈值**(插入数+删除数 > 64 且「> 派生长度/4 或 > 4096」——排序列表的批量逐项增量是 O(k×m),超过实测交叉点后全量重算更快且下游代价相同)时回退。回退是正确性措施,结果不变,只损失该次增量性。`groupBy` 的批量 splice 走单遍分桶增量(每组至多一次删除 + 一次插入 splice,幸存组引用稳定),不回退。`RxMap.values()`/`entries()` 直接按 Map 的结构变更(set/delete)的因果序重放,不经 `keys()`、不为每个 key 建订阅;删除 key 时下游只收到一条 `splice`(删除项是被删的真实值),不会先收到 `set(index, undefined)`;`clear`/`replace` 回退全量重算。`indexBy`/`toMap` 在多条变更重放中途出现暂时的重复 key(batch 内先插入同 key 的新行再删除旧行、两次 `set` 互换 key)时回退全量重算,终态 key 唯一的 batch 不会抛错;终态确有重复 key 时仍抛 `indexBy key is already exist`/`toMap key is already exist`(单条变更时当场抛),dev 与 prod 一致;回退时派生 Map 的下游先收到已应用的部分变更,再收到一次 `replace`。**RxSet(含派生 RxSet)按内容语义承诺,内部迭代序不属承诺面**;需要稳定可观察顺序时经 `toList` 物化为有序 RxList(其行序恒 ≡ 源 Set 当前迭代序,见上表)。
 
 矩阵行为由固定 seed 的差分 fuzz(`__tests__/broadOperatorsFuzz.spec.ts` 覆盖 map/filter/toSorted/slice/concat/toSet/groupBy/findIndex/length/RxSet 运算(含 toList)/RxMap 派生,`__tests__/duplicateValuesFuzz.spec.ts` 覆盖重复值域,`__tests__/batchReplayFuzz.spec.ts` 覆盖 batch 多操作重放与 toSorted 等值 tie,`__tests__/deepReview2026H2Findings.spec.ts` 覆盖 selection 家族的重复 item 域与 toSorted 的 undefined 元素值域)与各专项 spec 共同钉住。**新增派生结构或新增源操作时,必须同步补全本矩阵与对应差分测试;矩阵中声明"增量"的格子必须有差分验证。**
 

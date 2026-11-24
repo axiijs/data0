@@ -329,11 +329,22 @@ export class Notifier {
       // CAUTION 即使是 async 的模式，也应该变 run 边 track 新的。
       //  这样不管是因为老的 dep 变化，还是新  track 到一半的 dep 变化，都会触发 recompute。
       //  这才是合理的，因为不管哪种都说明 dirty。
-      dep.add(activeEffect!)
-      trackRetainedDepEffectAdded(dep)
-      activeEffect!.addDep(dep)
-      // 如果是 async 的任务，那么在最后 complete 的时候应该应该用新的 dep 完全替换旧的 dep
-      if (activeEffect.isAsync) {
+      if (!activeEffect.isAsync) {
+        dep.add(activeEffect!)
+        trackRetainedDepEffectAdded(dep)
+        activeEffect!.addDep(dep)
+      } else {
+        // CAUTION async 每次读取都走到这里（shouldTrack 恒为 true），但订阅只该登记一次：
+        //  dep 是集合，重复 add 本来就是 no-op，而 retained 诊断的计数与 effect.deps 曾按
+        //  「每次读取」累加——同一轮把一个 atom 读两次，销毁时只减一次，诊断永久多报一个
+        //  活跃订阅（误报泄漏），deps 也按读取次数膨胀。已订阅时（上一轮留下的，或本轮
+        //  读过）只补排下面的重放：收尾的 cleanup 会先全退订，本轮读过的必须靠重放订回来。
+        if (!dep.has(activeEffect!)) {
+          dep.add(activeEffect!)
+          trackRetainedDepEffectAdded(dep)
+          activeEffect!.addDep(dep)
+        }
+        // 如果是 async 的任务，那么在最后 complete 的时候应该应该用新的 dep 完全替换旧的 dep
         activeEffect.queueAsyncTrack(() => {
           if(!dep.has(activeEffect!)) {
             dep.add(activeEffect!)

@@ -1,8 +1,8 @@
-import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, GetterType} from "./computed.js";
+import {ApplyPatchType, CallbacksType, computed, Computed, destroyComputed, DirtyCallback, getComputedInternal, GetterType} from "./computed.js";
 import {Atom} from "./atom.js";
 import {ITERATE_KEY, notifier, TriggerInfo} from "./notify.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {ReactiveEffect, reportTeardownError} from "./reactiveEffect.js";
 import {toProtocolPayload, warn} from "./util.js";
 import {RxList} from "./RxList";
 /**
@@ -77,6 +77,9 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
+        // CAUTION 载荷透传调用方的原始成员（含 -0）：triggerInfo/argv 是外部协议，不在写入口
+        //  改写（AGENTS「内部消费者应独立归一化」）。原生 Set 存的是 +0，按 argv 重放出成员
+        //  序列的内部消费者（toList）自行归一化。
         if (!this.data.has(value)) {
             this.data.add(value)
             this.trigger(this, TriggerOpTypes.ADD, { key: value, newValue: value})
@@ -93,6 +96,7 @@ export class RxSet<T> extends Computed {
             warn('mutating a destroyed RxSet is a no-op')
             return this
         }
+        // 载荷透传原始成员（理由见 add）
         if (this.data.has(value)) {
             this.data.delete(value)
             this.trigger(this, TriggerOpTypes.DELETE, { key: value, argv: [value]})
@@ -359,7 +363,10 @@ export class RxSet<T> extends Computed {
                     }
 
                     newItems.forEach(x => {
-                        this.push(x)
+                        // CAUTION 载荷是调用方的原始成员（-0 原样透传），列表里放 Set 实际存的
+                        //  +0：否则增量结果持有 -0、全量重算 [...set] 持有 +0，在 Object.is 下分叉
+                        //  （README §3/§4）。删除侧的 SameValueZero 查找对 ±0 天然成立。
+                        this.push((x as unknown) === 0 ? 0 as unknown as T : x)
                     })
 
                     deletedItems.forEach(x => {
@@ -378,8 +385,13 @@ export class RxSet<T> extends Computed {
     }
     // CAUTION size 惰性创建（createDetached 说明见 RxMap 的同名注释）
     declare _size?: Atom<number>
+    // size 的内部 Computed：判活用（atom 本身不带 active），与 _size 同时赋值
+    /** @internal */
+    declare _sizeEffect?: Computed
     get size(): Atom<number> {
-        if (this._size) return this._size
+        // CAUTION 缓存只在它还活着时复用（规则与理由见 RxMap.keys 的同款说明）：使用方
+        //  destroyComputed(set.size) 之后，宿主还活着就重建，否则所有读者永久读到旧 size。
+        if (this._size && (this._sizeEffect!.active || !this.active)) return this._size
         this._size = ReactiveEffect.createDetached(() => {
             const source = this
             return computed(
@@ -392,6 +404,7 @@ export class RxSet<T> extends Computed {
                 }
             )
         })
+        this._sizeEffect = getComputedInternal(this._size)!
         // 已销毁结构的 meta 首读:快照值保留,立即随葬(等价类说明见 RxList.length)
         if (!this.active) destroyComputed(this._size)
         return this._size
@@ -402,8 +415,32 @@ export class RxSet<T> extends Computed {
      */
     destroyResources() {
         // 只销毁真正创建过的 size（getter 惰性，直接访问会先创建再销毁）
-        if (this._size) destroyComputed(this._size)
-        super.destroyResources()
+        // CAUTION size 的销毁会执行用户代码（它的 destroy 监听者），抛错不能跳过基类钩子
+        //  （本结构自己的 context.onCleanup、cleanPromise 的 settle）：「销毁必须做完」，
+        //  第一个错误抛给调用方，其后的走 reportTeardownError（同 RxList/RxMap.destroyResources）。
+        let failed = false
+        let first: unknown
+        const record = (error: unknown) => {
+            if (failed) {
+                reportTeardownError(error)
+            } else {
+                failed = true
+                first = error
+            }
+        }
+        if (this._size) {
+            try {
+                destroyComputed(this._size)
+            } catch (error) {
+                record(error)
+            }
+        }
+        try {
+            super.destroyResources()
+        } catch (error) {
+            record(error)
+        }
+        if (failed) throw first
     }
 }
 

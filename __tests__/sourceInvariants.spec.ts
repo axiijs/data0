@@ -193,6 +193,50 @@ describe('源码不变量：用户钩子窗口必须在错误恢复保护内(R7-
 })
 
 /**
+ * R7-3 的同一等价类，写结果的窗口（「不变量升格」登记项）：computed.ts 里把重算结果写进数据的调用
+ * （`this.replaceData(`，finishFullRecompute）会解包 getter 返回的 atom（atom.lazy 的 raw 就是用户
+ * getter）、向订阅者派发——它也是用户代码窗口。裸调用时抛错会让 finishFullRecompute 创建的 effect
+ * session 永不消化（全局冻结）、status 停在 RECOMPUTING。形状与 prepareRecompute 相同：前一行非空
+ * 实代码必须是 `try {`（catch 里先消化 session，再走 handleRecomputeError）。
+ */
+function findUnguardedResultWrite(content: string): string[] {
+    const lines = content.split('\n')
+    const violations: string[] = []
+    lines.forEach((line, i) => {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('//') || trimmed.startsWith('*')) return
+        if (!trimmed.startsWith('this.replaceData(')) return
+        let j = i - 1
+        while (j >= 0) {
+            const prev = lines[j].trim()
+            if (prev !== '' && !prev.startsWith('//') && !prev.startsWith('*') && !prev.startsWith('/*')) break
+            j--
+        }
+        if ((j >= 0 ? lines[j].trim() : '') !== 'try {') {
+            violations.push(`computed.ts:${i + 1}: 写结果的调用未被 try 直接包裹: ${trimmed}`)
+        }
+    })
+    return violations
+}
+
+describe('源码不变量：写结果的窗口必须在错误恢复保护内(R7-3 同类)', () => {
+    test('computed.ts 中每个 this.replaceData( 调用点必须被 try 直接包裹', () => {
+        const computedSrc = srcFiles().find(f => f.name === 'computed.ts')!
+        const violations = findUnguardedResultWrite(computedSrc.content)
+        expect(violations, violations.join('\n')).toEqual([])
+        // 可达性自检：确实存在被审计的调用点
+        const callSites = computedSrc.content.split('\n').filter(l => l.trim().startsWith('this.replaceData('))
+        expect(callSites.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test('扫描器自检：能检出裸调用、能放过 try 包裹与注释', () => {
+        expect(findUnguardedResultWrite(['        try {', '            this.replaceData(result)'].join('\n'))).toEqual([])
+        expect(findUnguardedResultWrite(['        notifier.createEffectSession()', '        this.replaceData(result)'].join('\n')).length).toBe(1)
+        expect(findUnguardedResultWrite('            // this.replaceData(data)')).toEqual([])
+    })
+})
+
+/**
  * 清理隔离的静态执法（「不变量升格」登记项）：`isolateTeardown()` 返回 true 时追踪已被暂停，
  * 调用方必须在 finally 里 `notifier.resetTracking()`。漏掉恢复（或恢复不在 finally 里、被用户
  * 清理的抛错跳过）会让之后整段执行都不追踪依赖——effect 静默失聪，且只在少数路径上有栈深断言。
