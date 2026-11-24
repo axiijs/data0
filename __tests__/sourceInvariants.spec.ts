@@ -191,3 +191,107 @@ describe('源码不变量：用户钩子窗口必须在错误恢复保护内(R7-
         expect(findUnguardedPrepareRecompute(guardedWithComment)).toEqual([])
     })
 })
+
+/**
+ * 清理隔离的静态执法（「不变量升格」登记项）：`isolateTeardown()` 返回 true 时追踪已被暂停，
+ * 调用方必须在 finally 里 `notifier.resetTracking()`。漏掉恢复（或恢复不在 finally 里、被用户
+ * 清理的抛错跳过）会让之后整段执行都不追踪依赖——effect 静默失聪，且只在少数路径上有栈深断言。
+ * 本审计强制形状：调用之后（中间只允许字面量初始化的 let/const）紧跟 `try {`，与它同缩进配对的
+ * `} finally {` 的第一行就是 `if (isolated) notifier.resetTracking()`。
+ */
+const ISOLATE_CALL_RE = /^\s*const isolated = isolateTeardown\(\)\s*$/
+const LITERAL_DECL_RE = /^\s*(?:let|const)\s+\w+\s*=\s*(?:\d+|true|false|undefined)\s*$/
+
+function findUnrestoredIsolation(content: string, file: string): string[] {
+    const lines = content.split('\n')
+    const violations: string[] = []
+    lines.forEach((line, i) => {
+        if (!line.includes('isolateTeardown()')) return
+        const trimmed = line.trim()
+        if (trimmed.startsWith('//') || trimmed.startsWith('*')) return
+        // 定义处不是调用点
+        if (/function isolateTeardown\(/.test(trimmed)) return
+        if (!ISOLATE_CALL_RE.test(line)) {
+            violations.push(`${file}:${i + 1}: isolateTeardown() 的返回值必须赋给 const isolated: ${trimmed}`)
+            return
+        }
+        let j = i + 1
+        while (j < lines.length && LITERAL_DECL_RE.test(lines[j])) j++
+        const tryLine = lines[j] ?? ''
+        if (!/^\s*try\s*\{\s*$/.test(tryLine)) {
+            violations.push(`${file}:${i + 1}: isolateTeardown() 之后没有紧跟 try {`)
+            return
+        }
+        const indent = tryLine.match(/^\s*/)![0]
+        for (let k = j + 1; k < lines.length; k++) {
+            if (!lines[k].startsWith(indent + '}')) continue
+            const closing = lines[k].trim()
+            if (closing.startsWith('} catch')) continue
+            if (closing === '} finally {' && /^\s*if \(isolated\) notifier\.resetTracking\(\)\s*$/.test(lines[k + 1] ?? '')) return
+            violations.push(`${file}:${i + 1}: 与 isolateTeardown() 配对的 try 没有以 \`if (isolated) notifier.resetTracking()\` 开头的 finally`)
+            return
+        }
+        violations.push(`${file}:${i + 1}: 找不到与 isolateTeardown() 配对的 try 的结尾`)
+    })
+    return violations
+}
+
+describe('源码不变量：清理隔离必须在 finally 里恢复追踪', () => {
+    test('src 内每个 isolateTeardown() 调用点都由 try/finally 恢复', () => {
+        const files = srcFiles()
+        const violations = files.flatMap(f => findUnrestoredIsolation(f.content, f.name))
+        expect(violations, violations.join('\n')).toEqual([])
+        // 可达性自检：确实存在被审计的调用点（防扫描器静默失效）
+        const callSites = files.flatMap(f => f.content.split('\n').filter(l => ISOLATE_CALL_RE.test(l)))
+        expect(callSites.length).toBeGreaterThanOrEqual(5)
+    })
+
+    test('扫描器自检：能检出缺少恢复的形态、能放过合法形态', () => {
+        const ok = [
+            '        const isolated = isolateTeardown()',
+            '        let i = 0',
+            '        try {',
+            '            run()',
+            '        } catch (error) {',
+            '            report(error)',
+            '        } finally {',
+            '            if (isolated) notifier.resetTracking()',
+            '        }',
+        ].join('\n')
+        expect(findUnrestoredIsolation(ok, 'x.ts')).toEqual([])
+
+        const noTry = [
+            '        const isolated = isolateTeardown()',
+            '        run()',
+            '        if (isolated) notifier.resetTracking()',
+        ].join('\n')
+        expect(findUnrestoredIsolation(noTry, 'x.ts').length).toBe(1)
+
+        const callBeforeTry = [
+            '        const isolated = isolateTeardown()',
+            '        let i = compute()',
+            '        try {',
+            '        } finally {',
+            '            if (isolated) notifier.resetTracking()',
+            '        }',
+        ].join('\n')
+        expect(findUnrestoredIsolation(callBeforeTry, 'x.ts').length).toBe(1)
+
+        const resetOutsideFinally = [
+            '        const isolated = isolateTeardown()',
+            '        try {',
+            '            run()',
+            '        } catch (error) {',
+            '            if (isolated) notifier.resetTracking()',
+            '            throw error',
+            '        }',
+        ].join('\n')
+        expect(findUnrestoredIsolation(resetOutsideFinally, 'x.ts').length).toBe(1)
+
+        const discarded = '        isolateTeardown()'
+        expect(findUnrestoredIsolation(discarded, 'x.ts').length).toBe(1)
+
+        const definition = 'export function isolateTeardown(): boolean {'
+        expect(findUnrestoredIsolation(definition, 'x.ts')).toEqual([])
+    })
+})

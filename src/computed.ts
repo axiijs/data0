@@ -2,7 +2,7 @@ import {getDebugName,} from "./debug";
 import {InputTriggerInfo, Notifier, notifier, TriggerInfo} from './notify'
 import {assert, isAsync, isAsyncGenerator, isGenerator, nextTick, warn} from "./util";
 import {Atom, atom, isAtom, isPrimitiveAtom} from "./atom";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {isolateTeardown, ReactiveEffect} from "./reactiveEffect.js";
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {
     markRetainedReactiveEffectKind,
@@ -57,7 +57,13 @@ export function destroyComputed(computedItem: ComputedData) {
     const internal = resolveComputedInternal(computedItem)!
     // CAUTION 走实例方法而不是静态 ReactiveEffect.destroy：子类（RxList/RxMap/RxSet）
     //  可能覆写 destroy 附加行为，绕过实例方法会跳过它们。
-    internal.destroy()
+    //  覆写里的代码先于静态核心执行，在这里一并隔离（与 destroyChildren 一致）。
+    const isolated = isolateTeardown()
+    try {
+        internal.destroy()
+    } finally {
+        if (isolated) notifier.resetTracking()
+    }
 }
 
 export function getComputedInternal(computedItem: ComputedData) {
@@ -408,7 +414,14 @@ export class Computed extends ReactiveEffect {
             this._asyncGetterWarned = true
             warn('async getter can only track reactive data before first await. If you want to track more data, please use generator getter.')
         }
-        this.prepareTracking(true)
+        // 与 generator getter 同一通道：销毁上一轮子 effect 时的清理抛错走 rejection，
+        // 由 fullRecompute 的错误恢复复位 asyncStatus/status 并 settle cleanPromise。
+        // 同步抛出会让状态停在 RECOMPUTING、asyncStatus 恒为 true、cleanPromise 永不结束。
+        try {
+            this.prepareTracking(true)
+        } catch (err) {
+            return Promise.reject(err)
+        }
         this.manualTracking ? notifier.pauseTracking() : notifier.enableTracking()
         try {
             return this.getter!.call(this, getterContext!)
@@ -655,19 +668,28 @@ export class Computed extends ReactiveEffect {
 
     prepareRecompute() {
         this.setStatus(STATUS_RECOMPUTING)
-        // 可以用于清理一些用户自己的副作用。
-        // 这里用了两个名字，onCleanup 是为了和 rxList 中的 api 一致。
-        // onRecompute 可以用作 log 等其他副作用
-        this.dispatch('recompute', this.data)
-        this.dispatch('cleanup', this.data)
-        // 使用 context 注册的 cleanup
-        // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
-        //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
-        //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
-        if (this.lastCleanupFn) {
-            const cleanup = this.lastCleanupFn
-            this.lastCleanupFn = undefined
-            cleanup()
+        // 没有钩子就没有用户代码要执行（绝大多数重算）：不付隔离的成本
+        if (this.lastCleanupFn === undefined && !this.hasListener('recompute') && !this.hasListener('cleanup')) return
+        // CAUTION 本 computed 此刻还没有入栈：它在别的 effect 执行中被重算时，钩子跑在
+        //  外层 effect 的帧里，读取不得被外层追踪。
+        const isolated = isolateTeardown()
+        try {
+            // 可以用于清理一些用户自己的副作用。
+            // 这里用了两个名字，onCleanup 是为了和 rxList 中的 api 一致。
+            // onRecompute 可以用作 log 等其他副作用
+            this.dispatch('recompute', this.data)
+            this.dispatch('cleanup', this.data)
+            // 使用 context 注册的 cleanup
+            // CAUTION 必须先复位再调用：cleanup 只该执行一次。若本轮 getter 不再注册新的
+            //  onCleanup（条件注册的场景），复位失败会导致同一个 cleanup 在后续每轮重算
+            //  被重复调用（对连接关闭/引用计数类资源是 double-free）。
+            if (this.lastCleanupFn) {
+                const cleanup = this.lastCleanupFn
+                this.lastCleanupFn = undefined
+                cleanup()
+            }
+        } finally {
+            if (isolated) notifier.resetTracking()
         }
     }
 

@@ -122,4 +122,16 @@ describe('身份式 scope 出栈(completeTracking)', () => {
             other.destroy()
         }
     })
+
+    test('completeTracking 没有配对的 prepareTracking 时当场检出(子类把 prepareTracking 放进自己的 try)', () => {
+        const self = new Computed(function (this: Computed) { return 1 })
+        const depthBefore = notifier.effectTrackDepth
+        try {
+            // prepareTracking 失败时会自己撤销;调用方在 finally 里再 completeTracking 就是多完成一次
+            expect(() => self.completeTracking()).toThrow('completeTracking without a matching prepareTracking')
+            expect(notifier.effectTrackDepth).toBe(depthBefore)
+        } finally {
+            self.destroy()
+        }
+    })
 })

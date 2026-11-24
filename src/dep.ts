@@ -165,6 +165,14 @@ export const initDepMarkers = ({ deps }: ReactiveEffect) => {
   }
 }
 
+// prepareTracking 中途失败时使用：上一轮的依赖全部标记为本轮已收集，
+// 随后的 finalizeDepMarkers 保留它们并复位位标记。
+export const retainDepMarkers = ({ deps }: ReactiveEffect) => {
+  for (let i = 0; i < deps.length; i++) {
+    deps[i].n |= Notifier.trackOpBit
+  }
+}
+
 export const finalizeDepMarkers = (effect: ReactiveEffect) => {
   const { deps } = effect
   if (deps.length) {

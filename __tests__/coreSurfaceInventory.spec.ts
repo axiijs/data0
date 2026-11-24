@@ -142,16 +142,16 @@ export const CORE_INVENTORY: Record<string, Row> = {
     // (同步:误导性断言;async patch:静默冻结)。注入用例必须附 recovery probe
     // (再触发一次并断言自愈)——冻结类缺陷在抛错当步不可见。
     'computed.lifecycleHooks(onRecompute/onCleanup/context.onCleanup/dirty/clean)': row(
-        'computed.spec.ts(callbacks/onCleanup 语义)+coverage.spec.ts',
-        'deepReview2026H3Round7.spec.ts(R7-3 全形态横扫:sync full/sync patch/async getter/async patch × 钩子抛错→自愈)',
-        'destroySemantics.spec.ts(onDestroy 派发)+verifiedReviewFixes.spec.ts(F4)',
+        'computed.spec.ts(callbacks/onCleanup 语义)+coverage.spec.ts+teardownTracking.spec.ts(钩子读取不订阅正在执行的 effect)',
+        'deepReview2026H3Round7.spec.ts(R7-3 全形态横扫:sync full/sync patch/async getter/async patch × 钩子抛错→自愈)+teardownTracking.spec.ts(抛错后追踪状态复原)',
+        'destroySemantics.spec.ts(onDestroy 派发)+verifiedReviewFixes.spec.ts(F4)+teardownTracking.spec.ts(effect 执行中的显式/延迟销毁)',
         'NA:钩子同步执行,交错由宿主计算形态承载',
         'deepReview2026H3Round7.spec.ts(dirty 监听者抛错×标脏先行)',
         'deepReview2026H3Round7.spec.ts(async 调度路径钩子抛错 console 兜底后自愈)'),
     'reactiveEffect.children': row(
         'computed.spec.ts(inner destroy/惰性集合)+common.spec.ts(uncontrolled child)',
-        'reduceOperator.spec.ts+rxList.spec.ts(行级 effect 回收,间接)',
-        'lifecycleAndReplayFixes.spec.ts(统一资源清理链)+reproducedIssuesFixes.spec.ts(F9 孤儿 child)',
+        'reduceOperator.spec.ts+rxList.spec.ts(行级 effect 回收,间接)+throwingTeardown.spec.ts(父重算时子清理抛错:宿主 × 顶层/嵌套,栈复原+依赖保留+恢复)',
+        'lifecycleAndReplayFixes.spec.ts(统一资源清理链)+reproducedIssuesFixes.spec.ts(F9 孤儿 child)+teardownTracking.spec.ts(父重算销毁子 effect 时的追踪/收集隔离)',
         'NA:同步构造',
         'coreLedgerBurndown.spec.ts(batch 内宿主重算一次,子销毁重建恰一次)',
         'NA:无调度'),

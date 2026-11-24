@@ -15,7 +15,7 @@ import {InputTriggerInfo, ITERATE_KEY, notifier, TriggerInfo} from "./notify.js"
 import {TrackOpTypes, TriggerOpTypes} from "./operations.js";
 import {assert, normalizeSpliceDeleteCount, normalizeSpliceStart, spliceMany, toIntegerOrInfinity, toProtocolPayload, warn} from "./util.js";
 import {reconstructDigestStates} from "./digestReplay.js";
-import {ReactiveEffect} from "./reactiveEffect.js";
+import {isolateTeardown, ReactiveEffect} from "./reactiveEffect.js";
 import {RxMap} from "./RxMap.js";
 import {RxSet} from "./RxSet";
 // selection 家族(2026-H3 round6 拆分):实现在 rxListSelection.ts,类方法委托
@@ -963,11 +963,17 @@ export class RxList<T> extends Computed {
             //  订阅)随重跑逐轮泄漏,只有最后一轮的 cleanup 在行删除时执行。
             //  同名 API 的兄弟实现点语义必须一致(R6-1 规则的 onCleanup 实例)。
             //  与 prepareRecompute 同款"先复位再调用":cleanup 只执行一次。
+            //  它跑在行 effect 自己的 getter 里,读取同样不得建立依赖。
             const runRowCleanup = slot === undefined ? undefined : () => {
                 const fn = slot.fn
                 if (fn) {
                     slot.fn = undefined
-                    fn()
+                    const isolated = isolateTeardown()
+                    try {
+                        fn()
+                    } finally {
+                        if (isolated) notifier.resetTracking()
+                    }
                 }
             }
             const rowComputed: Computed = new Computed(() => {

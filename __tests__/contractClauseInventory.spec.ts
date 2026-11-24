@@ -282,7 +282,24 @@ export const CONTRACT_CLAUSES: Record<string, Clause> = {
     'C6.8 用户回调抛错不冻结状态机': {
         section: '6.', kind: 'grant',
         quote: '**用户回调抛错不冻结状态机**',
-        assets: ['deepReview2026H3Round7.spec.ts'],
+        assets: ['deepReview2026H3Round7.spec.ts', 'throwingTeardown.spec.ts'],
+    },
+    // 行使空间 = 触发清理的入口(父重算/嵌套重算/行重算/显式与延迟销毁)× 清理形态 × 正在执行的 effect 形态,
+    // 外加「清理里的追踪读取 ≡ .raw 读取」差分 fuzz;对侧(清理触发/创建的 effect 照常追踪)同文件钉扎。
+    'C6.11 清理抛错,销毁照常做完': {
+        section: '6.', kind: 'behavior',
+        quote: '**清理抛错,销毁照常做完**',
+        assets: ['throwingTeardown.spec.ts'],
+    },
+    'C6.9 清理不建立依赖': {
+        section: '6.', kind: 'grant',
+        quote: '**清理不建立依赖**',
+        assets: ['teardownTracking.spec.ts'],
+    },
+    'C6.10 子 effect 清理里创建的对象不被父 effect 收集': {
+        section: '6.', kind: 'behavior',
+        quote: '子 effect 的清理里创建的响应式对象不会被父 effect 收集',
+        assets: ['teardownTracking.spec.ts'],
     },
     // ── 支持矩阵章 ──
     'CM.1 增量格子双向可执行(零回退/必回退)': {

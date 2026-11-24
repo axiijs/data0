@@ -105,8 +105,10 @@ doubled.destroy(); evens.destroy(); list.destroy()
 - **谁创建,谁销毁**:派生结构不随 source 自动销毁,需调用 `.destroy()`(或 `destroyComputed`)。派生结构销毁时负责清理自己创建的行级 effect 与惰性 meta(`length`/`keys`/`size` 等)。
 - **destroy 对源模式与计算模式一视同仁**:`new RxList(arr)` 这类无 getter 的源结构同样派发 `destroy` 事件、清理 children 与惰性 meta。destroy 幂等,重复调用安全。
 - **destroy 后结构只读**:已销毁实例的变更方法(`splice`/`set`/`add`/`replace` 等)一律 no-op(dev 构建打印警告),数据保持销毁当刻的快照;destroy 也会取消在途 async patch 的后续应用。销毁的派生结构从此不再接收 source 的任何更新。销毁后读取惰性 meta(`length`/`keys`/`size` 等)返回快照值,且不会留下常驻的活 effect。
-- **用户回调抛错不冻结状态机**:`onRecompute`/`onCleanup`/`context.onCleanup` 注册的清理在重算生命周期内抛错时,与 getter 抛错同一处置——错误同步抛给触发变更的调用方(async 路径 `console.error` 兜底),computed 复位为脏,后续任何触发都会全量重算追平终态,不会停留在"永久陈旧/每次写入抛误导性断言"的卡死状态。
+- **用户回调抛错不冻结状态机**:`onRecompute`/`onCleanup`/`context.onCleanup` 注册的清理在重算生命周期内抛错时,与 getter 抛错同一处置——错误同步抛给触发变更的调用方(async 路径 `console.error` 兜底),computed 复位为脏,后续任何触发都会全量重算追平终态,不会停留在"永久陈旧/每次写入抛误导性断言"的卡死状态。父 effect 重算时上一轮子 effect 的清理抛错同理:作用域栈与追踪状态完整复原,父 effect 保留上一轮的依赖,上一轮的子 effect 全部照常销毁;async getter 与 generator getter 一样经 `cleanPromise` reject 与 `console.error` 兜底。
 - 在 `autorun`/`computed` getter 内创建的响应式对象会被收集为 child,随宿主重算/销毁自动清理(包括其 `context.onCleanup` 注册的清理与惰性 meta);不希望被收集时用 `ReactiveEffect.createDetached`。
+- **清理抛错,销毁照常做完**:销毁过程中用户清理(`context.onCleanup` 注册的清理、`destroy()` 覆写与 `destroyResources`、`destroy` 监听者)抛错时,该 effect 的订阅照常摘除、子 effect 照常销毁、`destroy` 事件照常派发(其中一个监听者抛错,其余监听者照常收到),排在它后面的兄弟 effect 也照常销毁;第一个错误抛给调用方,收尾中再出现的错误走 `console.error`。不会留下「已失活、却还订阅着依赖、子 effect 还活着」的半销毁对象。
+- **清理不建立依赖**:清理代码(`context.onCleanup` 注册的清理、`map` 的行级清理、`onCleanup`/`onRecompute`/`onDestroy` 回调与 `destroy` 监听者)里的读取不会让恰好正在执行的 effect 订阅,无论清理由父 effect 重算、嵌套重算、行级重算还是 effect 执行中的显式销毁触发。`destroy()` 覆写里的代码在经父 effect 重算或 `destroyComputed` 销毁时同样被隔离;直接调用被覆写的 `x.destroy()` 时,覆写自己的代码先于 data0 执行,不在此列(清理应放在 `destroyResources`)。清理里的写入照常触发订阅者,清理触发或创建的 effect 照常追踪自己的依赖。父 effect 重算销毁上一轮子 effect 时,**子 effect 的清理里创建的响应式对象不会被父 effect 收集**,由创建者销毁。
 - `map` 的 `context.onCleanup` 注册行级清理,随行移动,行删除/替换/整体销毁时各执行一次;`map` 回退全量重算时,旧行的 cleanup 同样各执行一次。行含响应式依赖而发生**行级重算**时,重算前先执行上一轮注册的清理(与 computed 的 `context.onCleanup`"每轮重算前执行"语义一致)——每轮注册恰好执行一次,行删除时执行的是最后一轮的注册。
 
 ## 派生结构 × 源操作支持矩阵

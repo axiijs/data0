@@ -122,6 +122,10 @@ Review 结论必须分为三类，不得混写：
   资产：dev 不变量断言（`batch`/effect run 的栈深复原、digest 静止态、`RxList` 行级记账对齐——违约当场抛错，被全套测试被动执行）、`__tests__/invariantAssertions.spec.ts`（断言开火自检）。
 - destroy 语义必须对称：destroy 后不再接收更新（僵尸检查）、create+destroy 后活跃 effect 计数回到基线（泄漏检查）、源模式结构与计算模式一视同仁（destroy 事件、children、惰性 meta、`context.onCleanup`）。子类的销毁清理必须放进 `destroyResources` 钩子（唯一会被所有销毁入口——实例 `destroy()`、`destroyChildren`、`destroyComputed`——执行的位置），不得放在 `destroy()` 覆写里。已销毁结构的变更方法是 no-op。
   资产：`__tests__/destroySemantics.spec.ts`（全派生族僵尸/泄漏横扫）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy 取消在途 async patch、no-op 变更）。
+- 清理代码的读取不属于恰好正在执行的 effect：库在重算或销毁中调用用户清理的位置（静态 `ReactiveEffect.destroy`、`destroyChildren`、`prepareRecompute`、`destroyComputed`、map 的行级清理）必须经 `isolateTeardown()` 隔离并在 `finally` 恢复（形状由 `sourceInvariants.spec.ts` 静态执法）；`destroyChildren` 期间本 effect 同时不收集子 effect，否则清理里创建的 effect 会带着上一代 children 的 index 留下来，之后销毁时 swap-pop 删错兄弟。新增这类位置时同规则处理，并在矩阵里加入口。
+  资产：`__tests__/teardownTracking.spec.ts`（入口 × 清理形态 × 宿主矩阵 + 「清理里的追踪读取 ≡ .raw 读取」差分 fuzz）、`__tests__/sourceInvariants.spec.ts`（调用点必须 try/finally 恢复）。销毁快路径只适用于没有覆写销毁协议方法（`destroyResources`/`cleanup`/`destroyChildren`/`dispatch`）的 effect：覆写即用户代码，照旧调用并隔离。
+- 销毁必须做完:静态 `ReactiveEffect.destroy` 先置 `active = false` 再执行用户清理,之后任何销毁入口都会跳过它——清理抛错若中断收尾,没摘的订阅和没销毁的子 effect 就永久残留。销毁核心与 `destroyChildren` 在用户代码抛错后必须把剩余步骤做完(摘订阅、断父链、销毁子 effect 与其后的兄弟、派发 `destroy`),第一个错误抛给调用方,其余走 `console.error`;子 effect 的 `destroy()` 覆写在调用 `super.destroy()` 之前抛错时,由静态核心把它销毁完(否则它带着陈旧 index 成为活着的孤儿);`prepareTracking` 失败时撤销自己(出栈、深度与标记位复原、依赖保留),调用方必须把它放在自己的 try 之外(dev 断言:`completeTracking` 必须与仍在栈上的 `prepareTracking` 配对)。新增会执行用户清理的销毁步骤时同规则处理。
+  资产:`__tests__/throwingTeardown.spec.ts`(宿主形态 × 顶层/嵌套的抛错矩阵 + 半销毁残留、兄弟销毁、错误先后与 full cleanup 依赖恢复)。
 - async patch/getter 的并发行为必须经交错枚举验证，不允许只测"启动→等待→断言终值"的单一顺序；destroy 与在途 async patch 的交错也在此列。
   资产：`__tests__/asyncPatchInterleavings.spec.ts`（两个 async patch + 中途写入的全排列）、`__tests__/lifecycleAndReplayFixes.spec.ts`（destroy × 挂起 patch）。
 - 涉及 axii/axle 的 `triggerInfo.argv` 原始参数契约时，不得直接修改外部协议；内部消费者应独立归一化。
